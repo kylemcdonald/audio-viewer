@@ -10,7 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "fft.js": "^4.0.4"
+    "fft.js": "^4.0.4",
+    "mediabunny": "1.50.8"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.71",

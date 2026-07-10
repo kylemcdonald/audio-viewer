@@ -11,6 +11,7 @@ import type {
 } from './types';
 import { AudioVisualizer, formatClock, type PlaybackFollowMode } from './visualizer';
 import { decodeWavChunk, parseWavHeader, preferredWavChunkBytes, type WavHeader } from './wav-reader';
+import type { Mp4AudioSession } from './mp4-reader';
 
 const icon = (path: string, viewBox = '0 0 24 24') => `
   <svg viewBox="${viewBox}" aria-hidden="true" focusable="false">${path}</svg>
@@ -51,7 +52,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <label class="open-button icon-only" for="file-input" role="button" tabindex="0" aria-label="Open audio" title="Open audio">
           ${folderIcon}
         </label>
-        <input id="file-input" type="file" accept="audio/*,.wav,.wave,.mp3,.m4a,.aac,.flac,.ogg,.opus" hidden />
+        <input id="file-input" type="file" accept="audio/*,video/mp4,.wav,.wave,.mp3,.m4a,.mp4,.aac,.flac,.ogg,.opus" hidden />
       </div>
     </header>
 
@@ -146,7 +147,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <div class="drop-target">
             <div class="drop-icon">${folderIcon}</div>
             <strong>Drop audio to open</strong>
-            <span>WAV, MP3, M4A, FLAC, OGG and more</span>
+            <span>WAV, MP3, M4A, MP4, FLAC, OGG and more</span>
           </div>
         </div>
       </div>
@@ -217,6 +218,7 @@ let dragDepth = 0;
 let hasLoadedAudio = false;
 let isReadingFile = false;
 let fileLoadId = 0;
+let activeMp4Session: Mp4AudioSession | null = null;
 let wavePanelRatio = clampNumber(persistedSettings?.paneRatio, 0.25, 0.1, 0.75);
 let dividerPointer: number | null = null;
 let frequencyScaleBlend = clampNumber(persistedSettings?.frequencyScale, 1, 0, 1);
@@ -438,9 +440,14 @@ window.addEventListener('resize', () => {
 window.addEventListener('pagehide', persistSettings);
 
 async function togglePlayback(): Promise<void> {
-  if (!engine.buffer) return;
-  await engine.toggle();
-  updateTransportState();
+  if (!engine.hasAudio) return;
+  try {
+    await engine.toggle();
+    updateTransportState();
+  } catch (error) {
+    updateTransportState();
+    showToast(error instanceof Error ? `Could not start playback: ${error.message}` : 'Could not start playback.');
+  }
 }
 
 function updateTransportState(): void {
@@ -471,7 +478,12 @@ function animationLoop(): void {
 }
 
 async function loadFile(file: File): Promise<void> {
-  if (!file.type.startsWith('audio/') && !/\.(wav|wave|mp3|m4a|aac|flac|ogg|opus|webm)$/i.test(file.name)) {
+  if (
+    !file.type.startsWith('audio/') &&
+    file.type !== 'video/mp4' &&
+    file.type !== 'application/mp4' &&
+    !/\.(wav|wave|mp3|m4a|mp4|aac|flac|ogg|opus|webm)$/i.test(file.name)
+  ) {
     showToast('That file does not look like browser-decodable audio.');
     return;
   }
@@ -481,13 +493,42 @@ async function loadFile(file: File): Promise<void> {
 
   try {
     const likelyWav = /\.wave?$/i.test(file.name) || /(?:audio\/(?:wav|wave|x-wav))/i.test(file.type);
+    const likelyMp4 = /\.mp4$/i.test(file.name) || /^(?:audio|video|application)\/mp4/i.test(file.type);
     const headerPromise = likelyWav ? parseWavHeader(file) : Promise.resolve(null);
+    const mp4ModulePromise = likelyMp4 ? import('./mp4-reader') : null;
+    const mp4SessionPromise = mp4ModulePromise
+      ?.then(({ openMp4Audio }) => openMp4Audio(file))
+      .then(
+        (session) => ({ ok: true as const, session }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
     await nextPaint();
     const header = await headerPromise;
     if (loadId !== fileLoadId) return;
 
-    if (header) await loadProgressiveWav(file, header, loadId);
-    else await loadWithBrowserDecoder(file, loadId);
+    if (header) {
+      await loadProgressiveWav(file, header, loadId);
+    } else if (mp4SessionPromise && mp4ModulePromise) {
+      const result = await mp4SessionPromise;
+      if (!result.ok) {
+        const error = result.error;
+        const { Mp4AudioDecodeUnsupportedError } = await mp4ModulePromise;
+        if (error instanceof Mp4AudioDecodeUnsupportedError) {
+          if (loadId !== fileLoadId) return;
+          await loadWithBrowserDecoder(file, loadId);
+          return;
+        }
+        throw error;
+      }
+      const session = result.session;
+      if (loadId !== fileLoadId) {
+        session.dispose();
+        return;
+      }
+      await loadProgressiveMp4(file, session, loadId);
+    } else {
+      await loadWithBrowserDecoder(file, loadId);
+    }
   } catch (error) {
     if (loadId !== fileLoadId) return;
     isReadingFile = false;
@@ -495,8 +536,17 @@ async function loadFile(file: File): Promise<void> {
     audioDuration = 0;
     availableAudioSamples = 0;
     monoSamples = null;
+    activeMp4Session?.dispose();
+    activeMp4Session = null;
+    engine.clear();
+    analysisWorker?.terminate();
+    analysisWorker = null;
+    latestSpectrogram = null;
+    activeAnalysisRequest = null;
+    visualizer.clearAudio();
     hideAnalysisOverlay();
     clearFileHeader();
+    updateTransportState();
     updateDropOverlayState();
     showToast(error instanceof Error ? `Could not decode audio: ${error.message}` : 'Could not decode that audio file.');
   }
@@ -510,6 +560,8 @@ function prepareFileLoad(file: File): void {
   monoSamples = null;
   latestSpectrogram = null;
   activeAnalysisRequest = null;
+  activeMp4Session?.dispose();
+  activeMp4Session = null;
   engine.clear();
   analysisWorker?.terminate();
   analysisWorker = null;
@@ -582,6 +634,94 @@ async function loadProgressiveWav(file: File, header: WavHeader, loadId: number)
   fileSizeElement.textContent = formatFileSize(file.size);
   updateTransportState();
   analyzeCurrentAudio({ stableUpdate: true, force: true });
+}
+
+async function loadProgressiveMp4(file: File, session: Mp4AudioSession, loadId: number): Promise<void> {
+  activeMp4Session = session;
+  audioSampleRate = session.sampleRate;
+  audioDuration = session.duration;
+  availableAudioSamples = 0;
+  setFileFormat(session.sampleRate, session.channels);
+  totalTimeElement.textContent = formatClock(session.duration);
+
+  monoSamples = new Float32Array(session.frameCount);
+  visualizer.beginProgressiveAudio(monoSamples, session.sampleRate, session.duration);
+  initializeStreamingAnalysisWorker(session.frameCount, session.sampleRate);
+  engine.setMediaFile(file, session.duration);
+  updateTransportState();
+  await nextPaint();
+  if (loadId !== fileLoadId) return;
+
+  const publishFrames = Math.max(4096, Math.round(session.sampleRate * 2));
+  let publishedEnd = 0;
+  let decodedEnd = 0;
+  let decodedSamples = false;
+  let lastYield = performance.now();
+
+  try {
+    for await (const block of session.blocks()) {
+      if (loadId !== fileLoadId) return;
+      const sourceStart = Math.max(0, -block.startFrame);
+      const destinationStart = Math.max(0, block.startFrame);
+      const count = Math.min(
+        block.samples.length - sourceStart,
+        session.frameCount - destinationStart,
+      );
+      if (count <= 0) continue;
+
+      monoSamples.set(block.samples.subarray(sourceStart, sourceStart + count), destinationStart);
+      decodedSamples = true;
+      decodedEnd = Math.max(decodedEnd, destinationStart + count);
+
+      if (decodedEnd - publishedEnd >= publishFrames) {
+        publishProgressiveMp4Frames(file, publishedEnd, decodedEnd, session.frameCount);
+        publishedEnd = decodedEnd;
+      }
+
+      if (performance.now() - lastYield >= 32) {
+        await nextPaint();
+        lastYield = performance.now();
+      }
+    }
+
+    if (loadId !== fileLoadId) return;
+    if (!decodedSamples) throw new Error('The MP4 audio track did not produce any decoded samples.');
+    if (decodedEnd > publishedEnd) {
+      publishProgressiveMp4Frames(file, publishedEnd, decodedEnd, session.frameCount);
+    }
+
+    // The arrays are zero-initialized, so any trailing edit-list gap is already represented.
+    // An empty append at the final frame marks the worker stream complete without copying it.
+    visualizer.updateProgressiveAudio(session.frameCount, session.frameCount);
+    availableAudioSamples = session.frameCount;
+    const complete: AnalysisAppend = {
+      type: 'append',
+      startSample: session.frameCount,
+      samples: new ArrayBuffer(0),
+    };
+    analysisWorker?.postMessage(complete, [complete.samples]);
+    isReadingFile = false;
+    fileSizeElement.textContent = formatFileSize(file.size);
+    analyzeCurrentAudio({ stableUpdate: true, force: true });
+  } finally {
+    session.dispose();
+    if (activeMp4Session === session) activeMp4Session = null;
+  }
+}
+
+function publishProgressiveMp4Frames(file: File, start: number, end: number, total: number): void {
+  if (!monoSamples || end <= start) return;
+  visualizer.updateProgressiveAudio(start, end);
+  availableAudioSamples = Math.max(availableAudioSamples, end);
+  const samples = monoSamples.slice(start, end);
+  const append: AnalysisAppend = {
+    type: 'append',
+    startSample: start,
+    samples: samples.buffer,
+  };
+  analysisWorker?.postMessage(append, [append.samples]);
+  updateFileReadProgress(file, end / Math.max(1, total));
+  scheduleViewportAnalysis(90);
 }
 
 async function loadWithBrowserDecoder(file: File, loadId: number): Promise<void> {

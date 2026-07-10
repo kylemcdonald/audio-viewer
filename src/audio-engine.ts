@@ -2,6 +2,9 @@ export class AudioEngine {
   private context: AudioContext | null = null;
   private source: AudioBufferSourceNode | null = null;
   private gain: GainNode | null = null;
+  private media: HTMLAudioElement | null = null;
+  private mediaUrl: string | null = null;
+  private mediaDuration = 0;
   private startedAt = 0;
   private offset = 0;
   private playing = false;
@@ -31,18 +34,46 @@ export class AudioEngine {
   setBuffer(buffer: AudioBuffer): void {
     this.playing = false;
     this.stopSource();
+    this.clearMedia();
     this.buffer = buffer;
     this.offset = 0;
+  }
+
+  setMediaFile(file: File, duration: number): void {
+    this.clear();
+    const media = document.createElement('audio');
+    const url = URL.createObjectURL(file);
+    media.preload = 'auto';
+    media.src = url;
+    media.onended = () => {
+      if (this.media !== media) return;
+      this.playing = false;
+      this.onEnded?.();
+    };
+    this.media = media;
+    this.mediaUrl = url;
+    this.mediaDuration = Math.max(0, duration);
+    media.load();
   }
 
   clear(): void {
     this.playing = false;
     this.stopSource();
+    this.clearMedia();
     this.buffer = null;
     this.offset = 0;
   }
 
   async play(): Promise<void> {
+    if (this.media) {
+      if (this.playing) return;
+      const media = this.media;
+      if (this.currentTime >= this.mediaDuration - 0.001) media.currentTime = 0;
+      await media.play();
+      if (this.media !== media) return;
+      this.playing = true;
+      return;
+    }
     if (!this.buffer || this.playing) return;
     const context = this.getContext();
     await context.resume();
@@ -68,6 +99,11 @@ export class AudioEngine {
 
   pause(): void {
     if (!this.playing) return;
+    if (this.media) {
+      this.media.pause();
+      this.playing = false;
+      return;
+    }
     this.offset = this.currentTime;
     this.playing = false;
     this.stopSource();
@@ -79,8 +115,12 @@ export class AudioEngine {
   }
 
   seek(time: number): void {
-    const duration = this.buffer?.duration ?? 0;
+    const duration = this.media ? this.mediaDuration : this.buffer?.duration ?? 0;
     const next = Math.max(0, Math.min(duration, time));
+    if (this.media) {
+      this.media.currentTime = next;
+      return;
+    }
     const wasPlaying = this.playing;
     this.playing = false;
     this.stopSource();
@@ -89,13 +129,18 @@ export class AudioEngine {
   }
 
   get currentTime(): number {
+    if (this.media) return Math.min(this.mediaDuration, Math.max(0, this.media.currentTime || 0));
     if (!this.buffer) return 0;
     if (!this.playing || !this.context) return this.offset;
     return Math.min(this.buffer.duration, this.offset + this.context.currentTime - this.startedAt);
   }
 
   get isPlaying(): boolean {
-    return this.playing;
+    return this.media ? this.playing && !this.media.paused && !this.media.ended : this.playing;
+  }
+
+  get hasAudio(): boolean {
+    return Boolean(this.media || this.buffer);
   }
 
   private stopSource(): void {
@@ -109,6 +154,21 @@ export class AudioEngine {
       // The source may already have completed naturally.
     }
     source.disconnect();
+  }
+
+  private clearMedia(): void {
+    if (this.media) {
+      this.media.onended = null;
+      this.media.pause();
+      this.media.removeAttribute('src');
+      this.media.load();
+      this.media = null;
+    }
+    if (this.mediaUrl) {
+      URL.revokeObjectURL(this.mediaUrl);
+      this.mediaUrl = null;
+    }
+    this.mediaDuration = 0;
   }
 }
 
