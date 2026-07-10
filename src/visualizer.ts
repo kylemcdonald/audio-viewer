@@ -43,6 +43,36 @@ type CanvasSurface = {
   scaleY: number;
 };
 
+type SpectrumHover = {
+  x: number;
+  y: number;
+};
+
+type SpectrumHoverReadout = {
+  bin: number;
+  frequency: number;
+  db: number;
+  x: number;
+  y: number;
+};
+
+type TextBounds = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
+
+type SpectrumAxisLabel = {
+  label: string;
+  x: number;
+  y: number;
+  align: CanvasTextAlign;
+  baseline: CanvasTextBaseline;
+  font: string;
+  bounds: TextBounds;
+};
+
 export type VisualizerOptions = {
   editor: HTMLElement;
   waveCanvas: HTMLCanvasElement;
@@ -169,6 +199,7 @@ export class AudioVisualizer {
   private spectrumFftSize = 2048;
   private spectrumDrawStyle: SpectrumDrawStyle = 'filled';
   private spectrumInterpolation: SpectrumInterpolation = 'linear';
+  private spectrumHover: SpectrumHover | null = null;
   private theme: ThemeMode = 'dark';
   private realtimeFft: FFT | null = null;
   private realtimeInput = new Float64Array(0);
@@ -200,6 +231,8 @@ export class AudioVisualizer {
     this.resizeObserver.observe(this.spectralCanvas);
     this.resizeObserver.observe(this.spectrumCanvas);
     this.bindInteractions();
+    this.spectrumCanvas.addEventListener('pointermove', (event) => this.updateSpectrumHover(event));
+    this.spectrumCanvas.addEventListener('pointerleave', () => this.setSpectrumHover(null));
     this.requestRender();
   }
 
@@ -269,6 +302,7 @@ export class AudioVisualizer {
 
   setSpectrumAnalyzerOpen(open: boolean): void {
     this.spectrumAnalyzerOpen = open;
+    if (!open) this.setSpectrumHover(null);
     this.requestAnalyzerRender();
   }
 
@@ -498,6 +532,30 @@ export class AudioVisualizer {
       this.wasPinching = true;
     }
     if (this.pointers.size === 0) this.wasPinching = false;
+  }
+
+  private updateSpectrumHover(event: PointerEvent): void {
+    if (!this.spectrumAnalyzerOpen) return;
+    const rect = this.spectrumCanvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    if (x < 0 || x > rect.width || y < SPECTRAL_RULER || y > rect.height) {
+      this.setSpectrumHover(null);
+      return;
+    }
+    const previous = this.spectrumHover;
+    if (previous && Math.abs(previous.y - y) < 0.25) return;
+    this.spectrumHover = { x, y };
+    this.requestAnalyzerRender();
+  }
+
+  private setSpectrumHover(hover: SpectrumHover | null): void {
+    if (
+      this.spectrumHover === hover ||
+      (!this.spectrumHover && !hover)
+    ) return;
+    this.spectrumHover = hover;
+    this.requestAnalyzerRender();
   }
 
   private wheel(event: WheelEvent): void {
@@ -742,8 +800,8 @@ export class AudioVisualizer {
           }
           const db = values[column * rows + row] / 10;
           const normalized = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
-          const color = this.colorLut[Math.round(normalized * 255)];
-          packed[offset + x] = this.isLightTheme ? invertPackedColor(color) : color;
+          const paletteIndex = Math.round(normalized * 255);
+          packed[offset + x] = this.colorLut[this.isLightTheme ? 255 - paletteIndex : paletteIndex];
         }
       }
       context.setTransform(1, 0, 0, 1, 0, 0);
@@ -772,7 +830,16 @@ export class AudioVisualizer {
     context.fillStyle = light ? '#fff' : '#000';
     context.fillRect(0, 0, width, SPECTRAL_RULER);
 
+    const plotTop = Math.min(physicalHeight - 1, Math.round(SPECTRAL_RULER * scaleY));
+    const plotHeight = Math.max(1, physicalHeight - plotTop);
+    const spectrum = this.computeRealtimeSpectrum();
+    const hover = spectrum
+      ? this.spectrumHoverReadout(spectrum, physicalWidth, plotTop, plotHeight, scaleY)
+      : null;
     const amplitudeTicks = this.spectrumAmplitudeTicks(width);
+    const hoverLabels = hover
+      ? this.spectrumHoverAxisLabels(context, hover, width, height, scaleX, scaleY)
+      : [];
     this.drawSpectrumAnalyzerGrid(context, width, height, amplitudeTicks, scaleX, scaleY);
 
     context.strokeStyle = light ? 'rgba(48, 59, 67, .23)' : 'rgba(196, 216, 230, .15)';
@@ -782,18 +849,9 @@ export class AudioVisualizer {
     context.lineTo(width, SPECTRAL_RULER - 0.5);
     context.stroke();
 
-    context.fillStyle = '#65727d';
-    context.font = '9px "Chivo Mono", ui-monospace, monospace';
-    context.textBaseline = 'middle';
-    for (const tick of amplitudeTicks) {
-      context.textAlign = tick.align;
-      context.fillText(tick.label, tick.x, SPECTRAL_RULER / 2 + 0.5);
-    }
+    this.drawSpectrumAmplitudeLabels(context, amplitudeTicks, hoverLabels);
 
-    const spectrum = this.computeRealtimeSpectrum();
     if (!spectrum || width <= 0 || height <= SPECTRAL_RULER) return;
-    const plotTop = Math.min(physicalHeight - 1, Math.round(SPECTRAL_RULER * scaleY));
-    const plotHeight = Math.max(1, physicalHeight - plotTop);
     const trace = this.spectrumDrawStyle === 'filled' || this.spectrumDrawStyle === 'outline'
       ? this.spectrumTrace(spectrum, physicalWidth, plotHeight)
       : null;
@@ -826,6 +884,147 @@ export class AudioVisualizer {
       this.drawSpectrumOutline(context, spectrum, trace!, physicalWidth, plotTop, plotHeight);
     }
     context.restore();
+
+    if (hover) this.drawSpectrumHoverGuides(context, hover, plotTop);
+    this.drawSpectrumHoverLabels(context, hoverLabels);
+  }
+
+  private spectrumHoverReadout(
+    spectrum: Float32Array,
+    physicalWidth: number,
+    plotTop: number,
+    plotHeight: number,
+    scaleY: number,
+  ): SpectrumHoverReadout | null {
+    const hover = this.spectrumHover;
+    if (!hover || !spectrum.length) return null;
+
+    const hoverY = hover.y * scaleY;
+    if (hoverY < plotTop || hoverY > plotTop + plotHeight - 1) return null;
+
+    const maxFrequency = this.sampleRate / 2;
+    const minFrequency = this.minimumFrequency;
+    const minNormalized = minFrequency / maxFrequency;
+    const scaled = Math.max(0, Math.min(1, 1 - (hoverY - plotTop) / Math.max(1, plotHeight - 1)));
+    const normalizedFrequency = invertFrequencyScale(
+      scaled,
+      this.scaleBlend,
+      maxFrequency,
+      minFrequency,
+    );
+    const binPosition = ((normalizedFrequency - minNormalized) / Math.max(1e-9, 1 - minNormalized))
+      * Math.max(0, spectrum.length - 1);
+    const bin = Math.max(0, Math.min(spectrum.length - 1, Math.round(binPosition)));
+    const normalizedBin = bin / Math.max(1, spectrum.length - 1);
+    const binScaled = scaleFrequency(normalizedBin, this.scaleBlend, maxFrequency, minFrequency);
+    const y = plotTop + plotHeight - 1 - Math.round(binScaled * Math.max(1, plotHeight - 1));
+    const db = spectrum[bin];
+
+    return {
+      bin,
+      // The display uses the existing scaled-bin geometry; the readout itself reports
+      // the true real-FFT bin center frequency.
+      frequency: (bin * this.sampleRate) / this.spectrumFftSize,
+      db,
+      x: spectrumPhysicalX(db, this.spectralRangeDb, physicalWidth),
+      y,
+    };
+  }
+
+  private spectrumHoverAxisLabels(
+    context: CanvasRenderingContext2D,
+    hover: SpectrumHoverReadout,
+    width: number,
+    height: number,
+    scaleX: number,
+    scaleY: number,
+  ): SpectrumAxisLabel[] {
+    const dbX = hover.x / scaleX;
+    const dbLabelX = dbX < 24 ? 5 : dbX > width - 24 ? width - 5 : dbX;
+    const dbLabel: SpectrumAxisLabel = {
+      label: formatSpectrumDb(hover.db),
+      x: dbLabelX,
+      y: SPECTRAL_RULER / 2 + 0.5,
+      align: dbX < 24 ? 'left' : dbX > width - 24 ? 'right' : 'center',
+      baseline: 'middle',
+      font: '9px "Chivo Mono", ui-monospace, monospace',
+      bounds: { left: 0, top: 0, right: 0, bottom: 0 },
+    };
+    context.font = dbLabel.font;
+    dbLabel.bounds = labelBounds(context, dbLabel);
+
+    const frequencyY = hover.y / scaleY;
+    const frequencyLabel: SpectrumAxisLabel = {
+      label: formatFrequency(hover.frequency),
+      x: 5,
+      y: frequencyY,
+      align: 'left',
+      baseline: frequencyY <= SPECTRAL_RULER + 5
+        ? 'top'
+        : frequencyY >= height - 5
+          ? 'bottom'
+          : 'middle',
+      font: '10px "Chivo Mono", ui-monospace, monospace',
+      bounds: { left: 0, top: 0, right: 0, bottom: 0 },
+    };
+    context.font = frequencyLabel.font;
+    frequencyLabel.bounds = labelBounds(context, frequencyLabel);
+
+    return [dbLabel, frequencyLabel];
+  }
+
+  private drawSpectrumAmplitudeLabels(
+    context: CanvasRenderingContext2D,
+    amplitudeTicks: Array<{ x: number; align: CanvasTextAlign; label: string }>,
+    hoverLabels: SpectrumAxisLabel[],
+  ): void {
+    context.fillStyle = '#65727d';
+    context.font = '9px "Chivo Mono", ui-monospace, monospace';
+    context.textBaseline = 'middle';
+    for (const tick of amplitudeTicks) {
+      const label: SpectrumAxisLabel = {
+        label: tick.label,
+        x: tick.x,
+        y: SPECTRAL_RULER / 2 + 0.5,
+        align: tick.align,
+        baseline: 'middle',
+        font: context.font,
+        bounds: { left: 0, top: 0, right: 0, bottom: 0 },
+      };
+      label.bounds = labelBounds(context, label);
+      if (hoverLabels.some((hoverLabel) => labelsIntersect(label.bounds, hoverLabel.bounds))) continue;
+      context.textAlign = tick.align;
+      context.fillText(tick.label, tick.x, label.y);
+    }
+  }
+
+  private drawSpectrumHoverGuides(
+    context: CanvasRenderingContext2D,
+    hover: SpectrumHoverReadout,
+    plotTop: number,
+  ): void {
+    context.save();
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.fillStyle = this.isLightTheme ? '#53636c' : '#a7b6bf';
+    // Both guides terminate at the rendered FFT-bin point rather than at the raw pointer.
+    context.fillRect(0, hover.y, hover.x + 1, 1);
+    context.fillRect(hover.x, plotTop, 1, hover.y - plotTop + 1);
+    context.restore();
+  }
+
+  private drawSpectrumHoverLabels(
+    context: CanvasRenderingContext2D,
+    labels: SpectrumAxisLabel[],
+  ): void {
+    if (!labels.length) return;
+    context.fillStyle = '#65727d';
+    for (const label of labels) {
+      context.font = label.font;
+      context.textAlign = label.align;
+      context.textBaseline = label.baseline;
+      context.fillText(label.label, label.x, label.y);
+    }
   }
 
   private drawSpectrumBins(
@@ -937,7 +1136,7 @@ export class AudioVisualizer {
         gridX,
         x: atMinimum ? 5 : atMaximum ? width - 5 : gridX,
         align: atMinimum ? 'left' : atMaximum ? 'right' : 'center',
-        label: db === 0 ? '0' : `${Math.round(db)}`,
+        label: formatSpectrumDb(db),
       };
     });
   }
@@ -1253,6 +1452,46 @@ function formatFrequency(frequency: number): string {
   return `${Math.round(frequency)}`;
 }
 
+function formatSpectrumDb(value: number): string {
+  const rounded = Math.round(value);
+  return rounded === 0 ? '0' : `${rounded}`;
+}
+
+function labelBounds(context: CanvasRenderingContext2D, label: SpectrumAxisLabel): TextBounds {
+  const metrics = context.measureText(label.label);
+  const width = metrics.width;
+  const ascent = metrics.actualBoundingBoxAscent || fontPixelSize(label.font) * 0.72;
+  const descent = metrics.actualBoundingBoxDescent || fontPixelSize(label.font) * 0.28;
+  let left = label.x;
+  if (label.align === 'center') left -= width / 2;
+  else if (label.align === 'right' || label.align === 'end') left -= width;
+  const right = left + width;
+
+  let top = label.y - ascent;
+  let bottom = label.y + descent;
+  if (label.baseline === 'top' || label.baseline === 'hanging') {
+    top = label.y;
+    bottom = top + ascent + descent;
+  } else if (label.baseline === 'bottom' || label.baseline === 'ideographic') {
+    bottom = label.y;
+    top = bottom - ascent - descent;
+  } else if (label.baseline === 'middle') {
+    top = label.y - (ascent + descent) / 2;
+    bottom = label.y + (ascent + descent) / 2;
+  }
+  return { left, top, right, bottom };
+}
+
+function labelsIntersect(a: TextBounds, b: TextBounds): boolean {
+  const inset = 1;
+  return a.left - inset < b.right && a.right + inset > b.left && a.top - inset < b.bottom && a.bottom + inset > b.top;
+}
+
+function fontPixelSize(font: string): number {
+  const match = /([0-9.]+)px/.exec(font);
+  return match ? Number(match[1]) : 10;
+}
+
 function selectWaveformDbTicks(halfHeight: number): number[] {
   const minimumSpacing = 13;
   const selected: Array<{ db: number; position: number }> = [
@@ -1329,10 +1568,6 @@ function drawPixelLine(
 function spectrumPhysicalX(db: number, rangeDb: number, physicalWidth: number): number {
   const normalized = Math.max(0, Math.min(1, (db + rangeDb) / rangeDb));
   return Math.round(normalized * Math.max(0, physicalWidth - 1));
-}
-
-function invertPackedColor(color: number): number {
-  return (color & 0xff000000) | ((~color) & 0x00ffffff);
 }
 
 function snap(value: number, scale = window.devicePixelRatio || 1): number {
