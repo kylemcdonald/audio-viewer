@@ -112,6 +112,18 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
         </div>
         <div class="settings-divider" aria-hidden="true"></div>
+        <div class="control-group frequency-scale-control">
+          <div class="control-heading">
+            <label for="frequency-scale-slider">Frequency scale</label>
+            <output id="frequency-scale-output" for="frequency-scale-slider">Logarithmic</output>
+          </div>
+          <div class="slider-row">
+            <span>LIN</span>
+            <input id="frequency-scale-slider" class="range-input" type="range" min="0" max="100" step="1" value="100" aria-label="Linear to logarithmic frequency scale" />
+            <span>LOG</span>
+          </div>
+        </div>
+        <div class="settings-divider" aria-hidden="true"></div>
         <div class="control-group spectrum-style-control">
           <div class="control-heading">
             <label for="spectrum-style-select">Spectrum draw style</label>
@@ -189,6 +201,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <div class="panel-divider" id="panel-divider" role="separator" aria-label="Resize waveform and spectrogram panels" aria-orientation="horizontal" aria-valuemin="10" aria-valuemax="75" tabindex="0"><span></span></div>
         <section class="editor-panel spectral-panel" aria-label="Spectrogram view">
           <canvas id="spectral-canvas"></canvas>
+          <div class="spectrum-hover-frequency" id="spectrum-hover-frequency" aria-hidden="true"></div>
           <div class="frequency-axis-control" id="frequency-axis-control" role="slider" aria-label="Frequency scale blend" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100" aria-valuetext="Logarithmic" tabindex="0"></div>
           <div class="analysis-overlay" id="analysis-overlay" aria-live="polite">
             <div class="analysis-card">
@@ -249,6 +262,8 @@ const spectrumFftSlider = get<HTMLInputElement>('spectrum-fft-slider');
 const spectrumFftOutput = get<HTMLOutputElement>('spectrum-fft-output');
 const dbRangeSlider = get<HTMLInputElement>('db-range-slider');
 const dbRangeOutput = get<HTMLOutputElement>('db-range-output');
+const frequencyScaleSlider = get<HTMLInputElement>('frequency-scale-slider');
+const frequencyScaleOutput = get<HTMLOutputElement>('frequency-scale-output');
 const spectrumStyleSelect = get<HTMLSelectElement>('spectrum-style-select');
 const spectrumInterpolationSelect = get<HTMLSelectElement>('spectrum-interpolation-select');
 const paletteSelect = get<HTMLSelectElement>('palette-select');
@@ -266,6 +281,7 @@ const toast = get<HTMLElement>('toast');
 const toastMessage = get<HTMLElement>('toast-message');
 const panelDivider = get<HTMLElement>('panel-divider');
 const frequencyAxisControl = get<HTMLElement>('frequency-axis-control');
+const spectrumHoverFrequencyLabel = get<HTMLElement>('spectrum-hover-frequency');
 const settingsModal = get<HTMLDialogElement>('settings-modal');
 const settingsButton = get<HTMLButtonElement>('settings-button');
 const settingsClose = get<HTMLButtonElement>('settings-close');
@@ -341,6 +357,7 @@ const visualizer = new AudioVisualizer({
   waveCanvas,
   spectralCanvas,
   spectrumCanvas,
+  spectrumHoverFrequencyLabel,
   playhead: get<HTMLElement>('playhead'),
   onSeek: (time) => {
     engine.seek(time);
@@ -405,6 +422,10 @@ dbRangeSlider.addEventListener('input', () => {
   updateDbRangeControl();
   scheduleSettingsSave();
   visualizer.setSpectralRange(Number(dbRangeSlider.value));
+});
+
+frequencyScaleSlider.addEventListener('input', () => {
+  setFrequencyScale(Number(frequencyScaleSlider.value) / 100);
 });
 
 spectrumStyleSelect.addEventListener('change', () => {
@@ -1198,6 +1219,11 @@ function setFrequencyScale(value: number): void {
   visualizer.setScaleBlend(frequencyScaleBlend);
   const percent = Math.round(frequencyScaleBlend * 100);
   const label = percent === 0 ? 'Linear' : percent === 100 ? 'Logarithmic' : `${percent}% logarithmic`;
+  frequencyScaleSlider.value = percent.toString();
+  frequencyScaleOutput.value = label;
+  frequencyScaleSlider.setAttribute('aria-valuenow', percent.toString());
+  frequencyScaleSlider.setAttribute('aria-valuetext', label);
+  updateRangeFill(frequencyScaleSlider);
   frequencyAxisControl.setAttribute('aria-valuenow', percent.toString());
   frequencyAxisControl.setAttribute('aria-valuetext', label);
   scheduleSettingsSave();

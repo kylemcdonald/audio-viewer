@@ -78,6 +78,7 @@ export type VisualizerOptions = {
   waveCanvas: HTMLCanvasElement;
   spectralCanvas: HTMLCanvasElement;
   spectrumCanvas: HTMLCanvasElement;
+  spectrumHoverFrequencyLabel: HTMLElement;
   playhead: HTMLElement;
   onSeek: (time: number) => void;
   onViewChange: (start: number, duration: number) => void;
@@ -176,6 +177,7 @@ export class AudioVisualizer {
   private readonly waveCanvas: HTMLCanvasElement;
   private readonly spectralCanvas: HTMLCanvasElement;
   private readonly spectrumCanvas: HTMLCanvasElement;
+  private readonly spectrumHoverFrequencyLabel: HTMLElement;
   private readonly playhead: HTMLElement;
   private readonly onSeek: (time: number) => void;
   private readonly onViewChange: (start: number, duration: number) => void;
@@ -219,6 +221,7 @@ export class AudioVisualizer {
     this.waveCanvas = options.waveCanvas;
     this.spectralCanvas = options.spectralCanvas;
     this.spectrumCanvas = options.spectrumCanvas;
+    this.spectrumHoverFrequencyLabel = options.spectrumHoverFrequencyLabel;
     this.playhead = options.playhead;
     this.onSeek = options.onSeek;
     this.onViewChange = options.onViewChange;
@@ -256,6 +259,7 @@ export class AudioVisualizer {
     this.viewStart = 0;
     this.viewDuration = 1;
     this.availableSamples = 0;
+    this.hideSpectrumHoverFrequencyLabel();
     this.requestRender();
   }
 
@@ -302,7 +306,10 @@ export class AudioVisualizer {
 
   setSpectrumAnalyzerOpen(open: boolean): void {
     this.spectrumAnalyzerOpen = open;
-    if (!open) this.setSpectrumHover(null);
+    if (!open) {
+      this.setSpectrumHover(null);
+      this.hideSpectrumHoverFrequencyLabel();
+    }
     this.requestAnalyzerRender();
   }
 
@@ -544,7 +551,7 @@ export class AudioVisualizer {
       return;
     }
     const previous = this.spectrumHover;
-    if (previous && Math.abs(previous.y - y) < 0.25) return;
+    if (previous && Math.abs(previous.x - x) < 0.25 && Math.abs(previous.y - y) < 0.25) return;
     this.spectrumHover = { x, y };
     this.requestAnalyzerRender();
   }
@@ -555,6 +562,7 @@ export class AudioVisualizer {
       (!this.spectrumHover && !hover)
     ) return;
     this.spectrumHover = hover;
+    if (!hover) this.hideSpectrumHoverFrequencyLabel();
     this.requestAnalyzerRender();
   }
 
@@ -834,11 +842,12 @@ export class AudioVisualizer {
     const plotHeight = Math.max(1, physicalHeight - plotTop);
     const spectrum = this.computeRealtimeSpectrum();
     const hover = spectrum
-      ? this.spectrumHoverReadout(spectrum, physicalWidth, plotTop, plotHeight, scaleY)
+      ? this.spectrumHoverReadout(spectrum, physicalWidth, plotTop, plotHeight, scaleX, scaleY)
       : null;
+    this.updateSpectrumHoverFrequencyLabel(hover, scaleY, height);
     const amplitudeTicks = this.spectrumAmplitudeTicks(width);
     const hoverLabels = hover
-      ? this.spectrumHoverAxisLabels(context, hover, width, height, scaleX, scaleY)
+      ? this.spectrumHoverAxisLabels(context, hover, width, scaleX)
       : [];
     this.drawSpectrumAnalyzerGrid(context, width, height, amplitudeTicks, scaleX, scaleY);
 
@@ -894,39 +903,49 @@ export class AudioVisualizer {
     physicalWidth: number,
     plotTop: number,
     plotHeight: number,
+    scaleX: number,
     scaleY: number,
   ): SpectrumHoverReadout | null {
     const hover = this.spectrumHover;
     if (!hover || !spectrum.length) return null;
 
+    const hoverX = hover.x * scaleX;
     const hoverY = hover.y * scaleY;
-    if (hoverY < plotTop || hoverY > plotTop + plotHeight - 1) return null;
+    if (
+      hoverX < 0 ||
+      hoverX > physicalWidth - 1 ||
+      hoverY < plotTop ||
+      hoverY > plotTop + plotHeight - 1
+    ) return null;
 
     const maxFrequency = this.sampleRate / 2;
     const minFrequency = this.minimumFrequency;
-    const minNormalized = minFrequency / maxFrequency;
-    const scaled = Math.max(0, Math.min(1, 1 - (hoverY - plotTop) / Math.max(1, plotHeight - 1)));
-    const normalizedFrequency = invertFrequencyScale(
-      scaled,
-      this.scaleBlend,
-      maxFrequency,
-      minFrequency,
-    );
-    const binPosition = ((normalizedFrequency - minNormalized) / Math.max(1e-9, 1 - minNormalized))
-      * Math.max(0, spectrum.length - 1);
-    const bin = Math.max(0, Math.min(spectrum.length - 1, Math.round(binPosition)));
-    const normalizedBin = bin / Math.max(1, spectrum.length - 1);
-    const binScaled = scaleFrequency(normalizedBin, this.scaleBlend, maxFrequency, minFrequency);
-    const y = plotTop + plotHeight - 1 - Math.round(binScaled * Math.max(1, plotHeight - 1));
-    const db = spectrum[bin];
+    let bin = 0;
+    let x = 0;
+    let y = plotTop + plotHeight - 1;
+    let db = spectrum[0];
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (let index = 0; index < spectrum.length; index += 1) {
+      const normalizedBin = index / Math.max(1, spectrum.length - 1);
+      const scaled = scaleFrequency(normalizedBin, this.scaleBlend, maxFrequency, minFrequency);
+      const pointY = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
+      const pointDb = spectrum[index];
+      const pointX = spectrumPhysicalX(pointDb, this.spectralRangeDb, physicalWidth);
+      const distance = (pointX - hoverX) ** 2 + (pointY - hoverY) ** 2;
+      if (distance >= nearestDistance) continue;
+      nearestDistance = distance;
+      bin = index;
+      x = pointX;
+      y = pointY;
+      db = pointDb;
+    }
 
     return {
       bin,
-      // The display uses the existing scaled-bin geometry; the readout itself reports
-      // the true real-FFT bin center frequency.
       frequency: (bin * this.sampleRate) / this.spectrumFftSize,
       db,
-      x: spectrumPhysicalX(db, this.spectralRangeDb, physicalWidth),
+      x,
       y,
     };
   }
@@ -935,9 +954,7 @@ export class AudioVisualizer {
     context: CanvasRenderingContext2D,
     hover: SpectrumHoverReadout,
     width: number,
-    height: number,
     scaleX: number,
-    scaleY: number,
   ): SpectrumAxisLabel[] {
     const dbX = hover.x / scaleX;
     const dbLabelX = dbX < 24 ? 5 : dbX > width - 24 ? width - 5 : dbX;
@@ -952,25 +969,34 @@ export class AudioVisualizer {
     };
     context.font = dbLabel.font;
     dbLabel.bounds = labelBounds(context, dbLabel);
+    return [dbLabel];
+  }
 
-    const frequencyY = hover.y / scaleY;
-    const frequencyLabel: SpectrumAxisLabel = {
-      label: formatFrequency(hover.frequency),
-      x: 5,
-      y: frequencyY,
-      align: 'left',
-      baseline: frequencyY <= SPECTRAL_RULER + 5
-        ? 'top'
-        : frequencyY >= height - 5
-          ? 'bottom'
-          : 'middle',
-      font: '10px "Chivo Mono", ui-monospace, monospace',
-      bounds: { left: 0, top: 0, right: 0, bottom: 0 },
-    };
-    context.font = frequencyLabel.font;
-    frequencyLabel.bounds = labelBounds(context, frequencyLabel);
+  private updateSpectrumHoverFrequencyLabel(
+    hover: SpectrumHoverReadout | null,
+    scaleY: number,
+    height: number,
+  ): void {
+    if (!hover) {
+      this.hideSpectrumHoverFrequencyLabel();
+      return;
+    }
+    const y = hover.y / scaleY;
+    const edge = y <= SPECTRAL_RULER + 5
+      ? 'top'
+      : y >= height - 5
+        ? 'bottom'
+        : 'middle';
+    const label = this.spectrumHoverFrequencyLabel;
+    label.textContent = formatFrequency(hover.frequency);
+    label.style.setProperty('--spectrum-hover-frequency-y', `${y}px`);
+    label.dataset.edge = edge;
+    label.classList.add('is-visible');
+  }
 
-    return [dbLabel, frequencyLabel];
+  private hideSpectrumHoverFrequencyLabel(): void {
+    this.spectrumHoverFrequencyLabel.classList.remove('is-visible');
+    delete this.spectrumHoverFrequencyLabel.dataset.edge;
   }
 
   private drawSpectrumAmplitudeLabels(
