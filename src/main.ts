@@ -9,7 +9,13 @@ import type {
   AnalysisStreamInitialize,
   SpectrogramData,
 } from './types';
-import { AudioVisualizer, formatClock, type PlaybackFollowMode } from './visualizer';
+import {
+  AudioVisualizer,
+  formatClock,
+  type PlaybackFollowMode,
+  type SpectrumDrawStyle,
+  type SpectrumInterpolation,
+} from './visualizer';
 import { decodeWavChunk, parseWavHeader, preferredWavChunkBytes, type WavHeader } from './wav-reader';
 import type { Mp4AudioSession } from './mp4-reader';
 
@@ -64,23 +70,31 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       </div>
     </header>
 
-    <dialog class="settings-modal" id="settings-modal" aria-labelledby="settings-title">
+    <dialog class="settings-modal" id="settings-modal" aria-label="Settings">
       <div class="settings-header">
-        <div>
-          <span class="settings-kicker">Spectrogram</span>
-          <h2 id="settings-title">Analysis settings</h2>
-        </div>
         <button class="settings-close" id="settings-close" type="button" aria-label="Close settings">${closeIcon}</button>
       </div>
       <div class="settings-controls">
         <div class="control-group fft-control">
           <div class="control-heading">
-            <label for="fft-slider">FFT resolution</label>
+            <label for="fft-slider">Spectrogram resolution</label>
             <output id="fft-output" for="fft-slider">1,024 bins</output>
           </div>
           <div class="slider-row">
             <span>TIME</span>
-            <input id="fft-slider" class="range-input stepped" type="range" min="0" max="4" step="1" value="2" aria-label="FFT resolution" />
+            <input id="fft-slider" class="range-input stepped" type="range" min="0" max="4" step="1" value="2" aria-label="Spectrogram resolution" />
+            <span>FREQ</span>
+          </div>
+        </div>
+        <div class="settings-divider" aria-hidden="true"></div>
+        <div class="control-group fft-control">
+          <div class="control-heading">
+            <label for="spectrum-fft-slider">Spectrum resolution</label>
+            <output id="spectrum-fft-output" for="spectrum-fft-slider">1,024 bins</output>
+          </div>
+          <div class="slider-row">
+            <span>TIME</span>
+            <input id="spectrum-fft-slider" class="range-input stepped" type="range" min="0" max="4" step="1" value="2" aria-label="Spectrum resolution" />
             <span>FREQ</span>
           </div>
         </div>
@@ -94,6 +108,31 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
             <span>60</span>
             <input id="db-range-slider" class="range-input" type="range" min="60" max="140" step="5" value="120" aria-label="Spectrogram dynamic range in decibels" />
             <span>140</span>
+          </div>
+        </div>
+        <div class="settings-divider" aria-hidden="true"></div>
+        <div class="control-group spectrum-style-control">
+          <div class="control-heading">
+            <label for="spectrum-style-select">Spectrum draw style</label>
+          </div>
+          <div class="palette-select-row">
+            <select id="spectrum-style-select" class="palette-select" aria-label="Spectrum draw style">
+              <option value="outline" selected>Outline</option>
+              <option value="filled">Filled</option>
+              <option value="bars">Bars</option>
+            </select>
+          </div>
+        </div>
+        <div class="settings-divider" aria-hidden="true"></div>
+        <div class="control-group spectrum-interpolation-control">
+          <div class="control-heading">
+            <label for="spectrum-interpolation-select">Spectrum interpolation</label>
+          </div>
+          <div class="palette-select-row">
+            <select id="spectrum-interpolation-select" class="palette-select" aria-label="Spectrum interpolation style">
+              <option value="nearest" selected>Nearest neighbor</option>
+              <option value="linear">Linear</option>
+            </select>
           </div>
         </div>
         <div class="settings-divider" aria-hidden="true"></div>
@@ -190,8 +229,12 @@ const fileSizeElement = get<HTMLElement>('file-size');
 const fileFormatElement = get<HTMLElement>('file-format');
 const fftSlider = get<HTMLInputElement>('fft-slider');
 const fftOutput = get<HTMLOutputElement>('fft-output');
+const spectrumFftSlider = get<HTMLInputElement>('spectrum-fft-slider');
+const spectrumFftOutput = get<HTMLOutputElement>('spectrum-fft-output');
 const dbRangeSlider = get<HTMLInputElement>('db-range-slider');
 const dbRangeOutput = get<HTMLOutputElement>('db-range-output');
+const spectrumStyleSelect = get<HTMLSelectElement>('spectrum-style-select');
+const spectrumInterpolationSelect = get<HTMLSelectElement>('spectrum-interpolation-select');
 const paletteSelect = get<HTMLSelectElement>('palette-select');
 const playbackFollowSelect = get<HTMLSelectElement>('playback-follow-select');
 const analysisOverlay = get<HTMLElement>('analysis-overlay');
@@ -217,7 +260,14 @@ const spectrumAnalyzer = get<HTMLElement>('spectrum-analyzer');
 const SETTINGS_STORAGE_KEY = 'audio-spectrogram.settings.v1';
 const persistedSettings = readPersistedSettings();
 fftSlider.value = Math.round(clampNumber(persistedSettings?.fftIndex, 2, 0, 4)).toString();
+spectrumFftSlider.value = Math.round(clampNumber(persistedSettings?.spectrumFftIndex, 2, 0, 4)).toString();
 dbRangeSlider.value = clampNumber(persistedSettings?.dbRange, 120, 60, 140).toString();
+spectrumStyleSelect.value = isSpectrumDrawStyle(persistedSettings?.spectrumDrawStyle)
+  ? persistedSettings.spectrumDrawStyle
+  : 'outline';
+spectrumInterpolationSelect.value = isSpectrumInterpolation(persistedSettings?.spectrumInterpolation)
+  ? persistedSettings.spectrumInterpolation
+  : 'nearest';
 paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSettings.palette : 'viridis';
 playbackFollowSelect.value = isPlaybackFollowMode(persistedSettings?.playbackFollowMode)
   ? persistedSettings.playbackFollowMode
@@ -317,16 +367,33 @@ settingsModal.addEventListener('click', (event) => {
 
 fftSlider.addEventListener('input', () => {
   updateFftControl();
-  visualizer.setSpectrumFftSize(fftBins[Number(fftSlider.value)] * 2);
   scheduleSettingsSave();
   window.clearTimeout(fftDebounce);
   fftDebounce = window.setTimeout(() => analyzeCurrentAudio(), 220);
+});
+
+spectrumFftSlider.addEventListener('input', () => {
+  updateSpectrumFftControl();
+  visualizer.setSpectrumFftSize(fftBins[Number(spectrumFftSlider.value)] * 2);
+  scheduleSettingsSave();
 });
 
 dbRangeSlider.addEventListener('input', () => {
   updateDbRangeControl();
   scheduleSettingsSave();
   visualizer.setSpectralRange(Number(dbRangeSlider.value));
+});
+
+spectrumStyleSelect.addEventListener('change', () => {
+  if (!isSpectrumDrawStyle(spectrumStyleSelect.value)) return;
+  visualizer.setSpectrumDrawStyle(spectrumStyleSelect.value);
+  scheduleSettingsSave();
+});
+
+spectrumInterpolationSelect.addEventListener('change', () => {
+  if (!isSpectrumInterpolation(spectrumInterpolationSelect.value)) return;
+  visualizer.setSpectrumInterpolation(spectrumInterpolationSelect.value);
+  scheduleSettingsSave();
 });
 
 paletteSelect.addEventListener('change', () => {
@@ -1073,6 +1140,13 @@ function updateFftControl(): void {
   updateRangeFill(fftSlider);
 }
 
+function updateSpectrumFftControl(): void {
+  const bins = fftBins[Number(spectrumFftSlider.value)];
+  spectrumFftOutput.value = `${bins.toLocaleString()} bins`;
+  spectrumFftSlider.setAttribute('aria-valuetext', spectrumFftOutput.value);
+  updateRangeFill(spectrumFftSlider);
+}
+
 function updateDbRangeControl(): void {
   dbRangeOutput.value = `${Number(dbRangeSlider.value)} dB`;
   dbRangeSlider.setAttribute('aria-valuetext', `${dbRangeOutput.value} dynamic range`);
@@ -1105,11 +1179,14 @@ type AnalysisCoverage = {
 };
 
 type PersistedSettings = {
-  version: 4;
+  version: 5;
   paneRatio: number;
   frequencyScale: number;
   fftIndex: number;
+  spectrumFftIndex: number;
   dbRange: number;
+  spectrumDrawStyle: SpectrumDrawStyle;
+  spectrumInterpolation: SpectrumInterpolation;
   palette: PaletteName;
   playbackFollowMode: PlaybackFollowMode;
   spectrumAnalyzerOpen: boolean;
@@ -1119,11 +1196,23 @@ type PersistedSettings = {
 function readPersistedSettings(): PersistedSettings | null {
   try {
     const value = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) ?? 'null') as Partial<PersistedSettings> | null;
-    if (value?.version === 4) return value as PersistedSettings;
+    if (value?.version === 5) return value as PersistedSettings;
+    if ((value?.version as number | undefined) === 4) {
+      return {
+        ...value,
+        version: 5,
+        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
+        spectrumDrawStyle: 'outline',
+        spectrumInterpolation: 'nearest',
+      } as PersistedSettings;
+    }
     if ((value?.version as number | undefined) === 3) {
       return {
         ...value,
-        version: 4,
+        version: 5,
+        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
+        spectrumDrawStyle: 'outline',
+        spectrumInterpolation: 'nearest',
         spectrumAnalyzerOpen: false,
         spectrumAnalyzerWidth: defaultSpectrumAnalyzerWidth(),
       } as PersistedSettings;
@@ -1131,7 +1220,10 @@ function readPersistedSettings(): PersistedSettings | null {
     if ((value?.version as number | undefined) === 2) {
       return {
         ...value,
-        version: 4,
+        version: 5,
+        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
+        spectrumDrawStyle: 'outline',
+        spectrumInterpolation: 'nearest',
         playbackFollowMode: 'page',
         spectrumAnalyzerOpen: false,
         spectrumAnalyzerWidth: defaultSpectrumAnalyzerWidth(),
@@ -1140,7 +1232,10 @@ function readPersistedSettings(): PersistedSettings | null {
     if ((value?.version as number | undefined) === 1) {
       return {
         ...value,
-        version: 4,
+        version: 5,
+        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
+        spectrumDrawStyle: 'outline',
+        spectrumInterpolation: 'nearest',
         palette: 'viridis',
         playbackFollowMode: 'page',
         spectrumAnalyzerOpen: false,
@@ -1161,11 +1256,16 @@ function scheduleSettingsSave(): void {
 function persistSettings(): void {
   window.clearTimeout(settingsSaveTimer);
   const settings: PersistedSettings = {
-    version: 4,
+    version: 5,
     paneRatio: wavePanelRatio,
     frequencyScale: frequencyScaleBlend,
     fftIndex: Number(fftSlider.value),
+    spectrumFftIndex: Number(spectrumFftSlider.value),
     dbRange: Number(dbRangeSlider.value),
+    spectrumDrawStyle: isSpectrumDrawStyle(spectrumStyleSelect.value) ? spectrumStyleSelect.value : 'outline',
+    spectrumInterpolation: isSpectrumInterpolation(spectrumInterpolationSelect.value)
+      ? spectrumInterpolationSelect.value
+      : 'nearest',
     palette: isPaletteName(paletteSelect.value) ? paletteSelect.value : 'viridis',
     playbackFollowMode,
     spectrumAnalyzerOpen,
@@ -1180,6 +1280,14 @@ function persistSettings(): void {
 
 function isPlaybackFollowMode(value: unknown): value is PlaybackFollowMode {
   return value === 'center' || value === 'right' || value === 'page';
+}
+
+function isSpectrumDrawStyle(value: unknown): value is SpectrumDrawStyle {
+  return value === 'outline' || value === 'filled' || value === 'bars';
+}
+
+function isSpectrumInterpolation(value: unknown): value is SpectrumInterpolation {
+  return value === 'nearest' || value === 'linear';
 }
 
 function clampNumber(value: unknown, fallback: number, minimum: number, maximum: number): number {
@@ -1324,7 +1432,14 @@ function downloadSpectrogramPng(): void {
 
 function initialize(): void {
   updateFftControl();
-  visualizer.setSpectrumFftSize(fftBins[Number(fftSlider.value)] * 2);
+  updateSpectrumFftControl();
+  visualizer.setSpectrumFftSize(fftBins[Number(spectrumFftSlider.value)] * 2);
+  visualizer.setSpectrumDrawStyle(
+    isSpectrumDrawStyle(spectrumStyleSelect.value) ? spectrumStyleSelect.value : 'outline',
+  );
+  visualizer.setSpectrumInterpolation(
+    isSpectrumInterpolation(spectrumInterpolationSelect.value) ? spectrumInterpolationSelect.value : 'nearest',
+  );
   updateDbRangeControl();
   visualizer.setSpectralRange(Number(dbRangeSlider.value));
   visualizer.setColorPalette(isPaletteName(paletteSelect.value) ? paletteSelect.value : 'viridis');

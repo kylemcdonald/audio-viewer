@@ -8,6 +8,8 @@ const SPECTRAL_RULER = 25;
 const UNLOADED_SPECTROGRAM_COLOR = 0xff000000;
 
 export type PlaybackFollowMode = 'center' | 'right' | 'page';
+export type SpectrumDrawStyle = 'outline' | 'filled' | 'bars';
+export type SpectrumInterpolation = 'nearest' | 'linear';
 
 type PeakLevel = {
   blockSize: number;
@@ -154,6 +156,8 @@ export class AudioVisualizer {
   private cursorTime = 0;
   private spectrumAnalyzerOpen = false;
   private spectrumFftSize = 2048;
+  private spectrumDrawStyle: SpectrumDrawStyle = 'outline';
+  private spectrumInterpolation: SpectrumInterpolation = 'nearest';
   private realtimeFft: FFT | null = null;
   private realtimeInput = new Float64Array(0);
   private realtimeWindow = new Float64Array(0);
@@ -261,6 +265,18 @@ export class AudioVisualizer {
     if (next === this.spectrumFftSize) return;
     this.spectrumFftSize = next;
     this.realtimeFft = null;
+    this.requestAnalyzerRender();
+  }
+
+  setSpectrumDrawStyle(style: SpectrumDrawStyle): void {
+    if (style === this.spectrumDrawStyle) return;
+    this.spectrumDrawStyle = style;
+    this.requestAnalyzerRender();
+  }
+
+  setSpectrumInterpolation(interpolation: SpectrumInterpolation): void {
+    if (interpolation === this.spectrumInterpolation) return;
+    this.spectrumInterpolation = interpolation;
     this.requestAnalyzerRender();
   }
 
@@ -611,7 +627,7 @@ export class AudioVisualizer {
       context.restore();
     }
 
-    this.drawAxisBorder(context, width, height);
+    this.drawWaveformBorder(context, width, height);
     context.fillStyle = '#74818d';
     context.font = '600 9px Inter, ui-sans-serif, system-ui, sans-serif';
     context.textAlign = 'left';
@@ -688,7 +704,6 @@ export class AudioVisualizer {
 
     this.drawTimeGrid(context, height, SPECTRAL_RULER, plotBottom, true);
     this.drawFrequencyGrid(context, plotRight, plotBottom, plotHeight);
-    this.drawAxisBorder(context, width, height);
   }
 
   private drawSpectrumAnalyzer(): void {
@@ -703,6 +718,8 @@ export class AudioVisualizer {
     context.fillRect(0, 0, width, height);
     context.fillStyle = '#0d1117';
     context.fillRect(0, 0, width, SPECTRAL_RULER);
+
+    this.drawSpectrumAnalyzerGrid(context, width, height);
 
     context.strokeStyle = 'rgba(196, 216, 230, .15)';
     context.lineWidth = 1;
@@ -730,30 +747,130 @@ export class AudioVisualizer {
     const physicalHeight = Math.max(1, Math.round(height * dpr));
     const plotTop = Math.min(physicalHeight - 1, Math.round(SPECTRAL_RULER * dpr));
     const plotHeight = Math.max(1, physicalHeight - plotTop);
-    const maxFrequency = this.sampleRate / 2;
-    const minFrequency = this.minimumFrequency;
-    const minNormalized = minFrequency / maxFrequency;
-    let previousX = 0;
-    let previousY = plotTop;
+    const trace = this.spectrumTrace(spectrum, physicalWidth, plotHeight);
 
     context.save();
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.imageSmoothingEnabled = false;
-    context.fillStyle = '#63efb4';
-    for (let y = plotTop; y < physicalHeight; y += 1) {
-      const scaled = 1 - (y - plotTop) / Math.max(1, plotHeight - 1);
+    if (this.spectrumDrawStyle === 'filled') {
+      context.fillStyle = 'rgba(99, 239, 180, .28)';
+      for (let row = 0; row < trace.length; row += 1) {
+        context.fillRect(0, plotTop + row, trace[row] + 1, 1);
+      }
+      context.fillStyle = '#63efb4';
+      this.drawSpectrumOutline(context, spectrum, trace, physicalWidth, plotTop, plotHeight);
+    } else if (this.spectrumDrawStyle === 'bars') {
+      context.fillStyle = '#63efb4';
+      const stride = Math.max(2, Math.round(2 * dpr));
+      for (let row = 0; row < trace.length; row += stride) {
+        context.fillRect(0, plotTop + row, trace[row] + 1, Math.max(1, Math.round(dpr)));
+      }
+    } else {
+      context.fillStyle = '#63efb4';
+      this.drawSpectrumOutline(context, spectrum, trace, physicalWidth, plotTop, plotHeight);
+    }
+    context.restore();
+  }
+
+  private drawSpectrumAnalyzerGrid(
+    context: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+  ): void {
+    if (width <= 0 || height <= SPECTRAL_RULER) return;
+    context.save();
+    context.lineWidth = 1;
+    context.strokeStyle = 'rgba(190, 211, 225, .11)';
+    context.beginPath();
+    for (const x of [0.5, width / 2, width - 0.5]) {
+      context.moveTo(snap(x), SPECTRAL_RULER);
+      context.lineTo(snap(x), height);
+    }
+
+    const maxFrequency = this.sampleRate / 2;
+    const minFrequency = this.minimumFrequency;
+    const plotHeight = height - SPECTRAL_RULER;
+    const candidates = frequencyTicks(maxFrequency, this.scaleBlend, minFrequency);
+    let lastY = Number.POSITIVE_INFINITY;
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      const frequency = candidates[index];
+      const scaled = scaleFrequency(frequency / maxFrequency, this.scaleBlend, maxFrequency, minFrequency);
+      const y = height - scaled * plotHeight;
+      if (frequency !== minFrequency && Math.abs(y - height) < 21) continue;
+      if (Math.abs(y - lastY) < 21 && frequency !== minFrequency && frequency !== maxFrequency) continue;
+      lastY = y;
+      const snappedY = Math.max(SPECTRAL_RULER + 0.5, Math.min(height - 0.5, snap(y)));
+      context.moveTo(0, snappedY);
+      context.lineTo(width, snappedY);
+    }
+    context.stroke();
+    context.restore();
+  }
+
+  private spectrumTrace(
+    spectrum: Float32Array,
+    physicalWidth: number,
+    plotHeight: number,
+  ): Int32Array {
+    const trace = new Int32Array(plotHeight);
+    const maxFrequency = this.sampleRate / 2;
+    const minFrequency = this.minimumFrequency;
+    const minNormalized = minFrequency / maxFrequency;
+    for (let row = 0; row < plotHeight; row += 1) {
+      const scaled = 1 - row / Math.max(1, plotHeight - 1);
       const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
       const normalizedBin = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
-      const bin = Math.max(0, Math.min(spectrum.length - 1, Math.round(normalizedBin * (spectrum.length - 1))));
-      const db = spectrum[bin];
-      const normalizedDb = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
-      const x = Math.round(normalizedDb * (physicalWidth - 1));
-      if (y === plotTop) context.fillRect(x, y, 1, 1);
-      else drawPixelLine(context, previousX, previousY, x, y);
+      const binPosition = Math.max(0, Math.min(spectrum.length - 1, normalizedBin * (spectrum.length - 1)));
+      let db: number;
+      if (this.spectrumInterpolation === 'linear') {
+        const lowBin = Math.floor(binPosition);
+        const highBin = Math.min(spectrum.length - 1, lowBin + 1);
+        const mix = binPosition - lowBin;
+        db = spectrum[lowBin] + (spectrum[highBin] - spectrum[lowBin]) * mix;
+      } else {
+        db = spectrum[Math.round(binPosition)];
+      }
+      trace[row] = spectrumPhysicalX(db, this.spectralRangeDb, physicalWidth);
+    }
+    return trace;
+  }
+
+  private drawSpectrumOutline(
+    context: CanvasRenderingContext2D,
+    spectrum: Float32Array,
+    trace: Int32Array,
+    physicalWidth: number,
+    plotTop: number,
+    plotHeight: number,
+  ): void {
+    if (this.spectrumInterpolation === 'nearest') {
+      let previousX = trace[0];
+      let previousY = plotTop;
+      context.fillRect(previousX, previousY, 1, 1);
+      for (let row = 1; row < trace.length; row += 1) {
+        const x = trace[row];
+        const y = plotTop + row;
+        drawPixelLine(context, previousX, previousY, x, y);
+        previousX = x;
+        previousY = y;
+      }
+      return;
+    }
+
+    const maxFrequency = this.sampleRate / 2;
+    const minFrequency = this.minimumFrequency;
+    let previousX = spectrumPhysicalX(spectrum[0], this.spectralRangeDb, physicalWidth);
+    let previousY = plotTop + plotHeight - 1;
+    context.fillRect(previousX, previousY, 1, 1);
+    for (let bin = 1; bin < spectrum.length; bin += 1) {
+      const normalized = bin / Math.max(1, spectrum.length - 1);
+      const scaled = scaleFrequency(normalized, this.scaleBlend, maxFrequency, minFrequency);
+      const x = spectrumPhysicalX(spectrum[bin], this.spectralRangeDb, physicalWidth);
+      const y = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
+      drawPixelLine(context, previousX, previousY, x, y);
       previousX = x;
       previousY = y;
     }
-    context.restore();
   }
 
   private computeRealtimeSpectrum(): Float32Array | null {
@@ -818,7 +935,7 @@ export class AudioVisualizer {
       context.beginPath();
       if (withLabels) {
         context.moveTo(snap(x), SPECTRAL_RULER - 4);
-        context.lineTo(snap(x), plotBottom);
+        context.lineTo(snap(x), SPECTRAL_RULER);
       } else {
         context.moveTo(snap(x), plotTop);
         context.lineTo(snap(x), plotBottom);
@@ -904,7 +1021,7 @@ export class AudioVisualizer {
       lastY = y;
       context.strokeStyle = 'rgba(190, 211, 225, .16)';
       context.beginPath();
-      context.moveTo(0, snap(y));
+      context.moveTo(plotRight, snap(y));
       context.lineTo(plotRight + 4, snap(y));
       context.stroke();
       context.fillStyle = '#75828e';
@@ -917,13 +1034,10 @@ export class AudioVisualizer {
     }
   }
 
-  private drawAxisBorder(context: CanvasRenderingContext2D, width: number, height: number): void {
+  private drawWaveformBorder(context: CanvasRenderingContext2D, width: number, height: number): void {
     context.strokeStyle = 'rgba(190, 210, 224, .16)';
     context.lineWidth = 1;
-    context.beginPath();
-    context.moveTo(width - AXIS_WIDTH + 0.5, 0);
-    context.lineTo(width - AXIS_WIDTH + 0.5, height);
-    context.stroke();
+    context.strokeRect(0.5, 0.5, Math.max(0, width - 1), Math.max(0, height - 1));
   }
 }
 
@@ -1057,6 +1171,11 @@ function drawPixelLine(
       y += stepY;
     }
   }
+}
+
+function spectrumPhysicalX(db: number, rangeDb: number, physicalWidth: number): number {
+  const normalized = Math.max(0, Math.min(1, (db + rangeDb) / rangeDb));
+  return Math.round(normalized * Math.max(0, physicalWidth - 1));
 }
 
 function snap(value: number): number {

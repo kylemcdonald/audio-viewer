@@ -433,9 +433,10 @@ select:focus-visible {
 
 .settings-modal {
   width: min(410px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
   margin: auto;
   padding: 0;
-  overflow: hidden;
+  overflow: auto;
   border: 1px solid rgba(180, 205, 219, 0.22);
   border-radius: 9px;
   color: var(--text);
@@ -449,26 +450,9 @@ select:focus-visible {
 }
 
 .settings-header {
-  justify-content: space-between;
-  padding: 18px 20px 16px;
+  justify-content: flex-end;
+  padding: 9px 11px;
   border-bottom: 1px solid rgba(183, 205, 219, 0.12);
-}
-
-.settings-kicker {
-  display: block;
-  margin-bottom: 4px;
-  color: #67d9ab;
-  font-size: 8px;
-  font-weight: 750;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}
-
-.settings-header h2 {
-  margin: 0;
-  color: #e5eaed;
-  font-size: 15px;
-  font-weight: 620;
 }
 
 .settings-close {
@@ -485,8 +469,8 @@ select:focus-visible {
 
 .settings-controls {
   display: grid;
-  gap: 18px;
-  padding: 21px 20px 18px;
+  gap: 13px;
+  padding: 16px 20px 18px;
 }
 
 .settings-divider {
