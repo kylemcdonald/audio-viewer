@@ -149,6 +149,10 @@ select:focus-visible {
   white-space: nowrap;
 }
 
+.file-format.is-empty {
+  display: none;
+}
+
 .file-format i {
   width: 2px;
   height: 2px;

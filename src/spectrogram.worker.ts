@@ -13,6 +13,8 @@ const MINIMUM_TEMPORAL_STEP_MS = 1;
 
 let audioSamples: Float32Array | null = null;
 let audioSampleRate = 48000;
+let audioAvailableSamples = 0;
+let audioComplete = true;
 let latestJobId = -1;
 let gpuContextPromise: Promise<GpuContext> | null = null;
 let cachedFftSize = 0;
@@ -46,7 +48,28 @@ worker.onmessage = (event: MessageEvent<AnalysisInput>) => {
     latestJobId = -1;
     audioSamples = new Float32Array(event.data.samples);
     audioSampleRate = event.data.sampleRate;
+    audioAvailableSamples = audioSamples.length;
+    audioComplete = true;
     clearFrameCache();
+    return;
+  }
+  if (event.data.type === 'initialize-stream') {
+    latestJobId = -1;
+    audioSamples = new Float32Array(event.data.sampleLength);
+    audioSampleRate = event.data.sampleRate;
+    audioAvailableSamples = 0;
+    audioComplete = audioSamples.length === 0;
+    clearFrameCache();
+    return;
+  }
+  if (event.data.type === 'append') {
+    if (!audioSamples) return;
+    const incoming = new Float32Array(event.data.samples);
+    const start = Math.max(0, Math.min(audioSamples.length, event.data.startSample));
+    const count = Math.min(incoming.length, audioSamples.length - start);
+    audioSamples.set(incoming.subarray(0, count), start);
+    audioAvailableSamples = Math.max(audioAvailableSamples, start + count);
+    audioComplete = audioAvailableSamples >= audioSamples.length;
     return;
   }
   latestJobId = event.data.id;
@@ -61,6 +84,7 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
   };
   prepareFrameCache(request.fftSize, layout.rows);
   const plan = createAnalysisPlan(request);
+  if (plan.targetTicks.length === 0) return;
   const fullyCached = plan.targetTicks.every((tick) => frameCache.has(tick));
 
   if (fullyCached) {
@@ -114,7 +138,8 @@ function createAnalysisPlan(request: AnalysisRequest): AnalysisPlan {
   );
   const exponent = Math.max(0, Math.floor(Math.log2(desiredStepMs / minimumStepMs)));
   const targetStepMs = minimumStepMs * 2 ** exponent;
-  const targetTicks = createAlignedTicks(request.startTime, request.viewDuration, targetStepMs);
+  const targetTicks = createAlignedTicks(request.startTime, request.viewDuration, targetStepMs)
+    .filter((tick) => isFrameAvailable(tick, request.fftSize));
   let initialStepMs = targetStepMs;
   while ((request.viewDuration * 1000) / initialStepMs + 1 > INITIAL_COLUMN_TARGET) {
     initialStepMs *= 2;
@@ -138,7 +163,8 @@ async function computeCachedViewport(
       if (request.id !== latestJobId) return;
       touchCachedFrames(plan.targetTicks);
       const stageStepMs = plan.stages[level];
-      const stageTicks = createAlignedTicks(request.startTime, request.viewDuration, stageStepMs);
+      const stageTicks = createAlignedTicks(request.startTime, request.viewDuration, stageStepMs)
+        .filter((tick) => isFrameAvailable(tick, request.fftSize));
       const missingTicks = stageTicks.filter((tick) => !frameCache.has(tick));
       const reusedColumns = countCachedFrames(plan.targetTicks);
 
@@ -197,7 +223,8 @@ async function prefetchFinerLevels(
 ): Promise<void> {
   for (let stepMs = targetStepMs / 2; stepMs >= MINIMUM_TEMPORAL_STEP_MS; stepMs /= 2) {
     if (request.id !== latestJobId) return;
-    const ticks = createAlignedTicks(request.startTime, request.viewDuration, stepMs);
+    const ticks = createAlignedTicks(request.startTime, request.viewDuration, stepMs)
+      .filter((tick) => isFrameAvailable(tick, request.fftSize));
     if (ticks.length > maximumCachedFrames) return;
     touchCachedFrames(ticks);
     const missingTicks = ticks.filter((tick) => !frameCache.has(tick));
@@ -264,6 +291,12 @@ function createAlignedTicks(startTime: number, viewDuration: number, stepMs: num
   const lastTick = Math.ceil(Math.max(0, (startTime + viewDuration) * 1000) / stepMs) * stepMs;
   const count = Math.max(1, Math.round((lastTick - firstTick) / stepMs) + 1);
   return Array.from({ length: count }, (_, index) => firstTick + index * stepMs);
+}
+
+function isFrameAvailable(tick: number, fftSize: number): boolean {
+  if (audioComplete) return true;
+  const centerSample = Math.round((tick / 1000) * audioSampleRate);
+  return centerSample + fftSize / 2 <= audioAvailableSamples;
 }
 
 function createFrameStarts(ticks: readonly number[], sampleRate: number, fftSize: number): Int32Array {

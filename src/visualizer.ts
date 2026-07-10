@@ -30,8 +30,45 @@ export type VisualizerOptions = {
 class PeakPyramid {
   private levels: PeakLevel[] = [];
 
-  constructor(private readonly samples: Float32Array) {
-    if (samples.length) this.build();
+  constructor(private readonly samples: Float32Array, initialize = true) {
+    if (!samples.length) return;
+    this.allocate();
+    if (initialize) this.update(0, samples.length);
+  }
+
+  update(start: number, end: number): void {
+    const from = Math.max(0, Math.floor(start));
+    const to = Math.min(this.samples.length, Math.ceil(end));
+    if (to <= from) return;
+
+    for (let levelIndex = 0; levelIndex < this.levels.length; levelIndex += 1) {
+      const level = this.levels[levelIndex];
+      const firstBlock = Math.floor(from / level.blockSize);
+      const lastBlock = Math.min(level.min.length, Math.ceil(to / level.blockSize));
+      const previous = levelIndex > 0 ? this.levels[levelIndex - 1] : null;
+
+      for (let block = firstBlock; block < lastBlock; block += 1) {
+        let low = 1;
+        let high = -1;
+        if (!previous) {
+          const sampleEnd = Math.min(this.samples.length, (block + 1) * level.blockSize);
+          for (let index = block * level.blockSize; index < sampleEnd; index += 1) {
+            const value = this.samples[index];
+            if (value < low) low = value;
+            if (value > high) high = value;
+          }
+        } else {
+          const previousStart = block * 4;
+          const previousEnd = Math.min(previous.min.length, previousStart + 4);
+          for (let index = previousStart; index < previousEnd; index += 1) {
+            if (previous.min[index] < low) low = previous.min[index];
+            if (previous.max[index] > high) high = previous.max[index];
+          }
+        }
+        level.min[block] = low <= high ? low : 0;
+        level.max[block] = low <= high ? high : 0;
+      }
+    }
   }
 
   range(start: number, end: number): [number, number] {
@@ -65,45 +102,15 @@ class PeakPyramid {
     return min <= max ? [min, max] : [0, 0];
   }
 
-  private build(): void {
+  private allocate(): void {
     let blockSize = 32;
     let count = Math.ceil(this.samples.length / blockSize);
-    let min = new Float32Array(count);
-    let max = new Float32Array(count);
-
-    for (let block = 0; block < count; block += 1) {
-      let low = 1;
-      let high = -1;
-      const end = Math.min(this.samples.length, (block + 1) * blockSize);
-      for (let i = block * blockSize; i < end; i += 1) {
-        const value = this.samples[i];
-        if (value < low) low = value;
-        if (value > high) high = value;
-      }
-      min[block] = low;
-      max[block] = high;
-    }
-    this.levels.push({ blockSize, min, max });
+    this.levels.push({ blockSize, min: new Float32Array(count), max: new Float32Array(count) });
 
     while (count > 4) {
-      const previousMin = min;
-      const previousMax = max;
       blockSize *= 4;
       count = Math.ceil(count / 4);
-      min = new Float32Array(count);
-      max = new Float32Array(count);
-      for (let block = 0; block < count; block += 1) {
-        let low = 1;
-        let high = -1;
-        const end = Math.min(previousMin.length, block * 4 + 4);
-        for (let i = block * 4; i < end; i += 1) {
-          if (previousMin[i] < low) low = previousMin[i];
-          if (previousMax[i] > high) high = previousMax[i];
-        }
-        min[block] = low;
-        max[block] = high;
-      }
-      this.levels.push({ blockSize, min, max });
+      this.levels.push({ blockSize, min: new Float32Array(count), max: new Float32Array(count) });
     }
   }
 }
@@ -119,6 +126,7 @@ export class AudioVisualizer {
   private colorLut = createPaletteLut('viridis');
   private resizeObserver: ResizeObserver;
   private samples: Float32Array | null = null;
+  private availableSamples = 0;
   private peaks: PeakPyramid | null = null;
   private spectrogram: SpectrogramData | null = null;
   private sampleRate = 48000;
@@ -153,9 +161,39 @@ export class AudioVisualizer {
     this.sampleRate = sampleRate;
     this.duration = duration;
     this.peaks = new PeakPyramid(samples);
+    this.availableSamples = samples.length;
     this.viewStart = 0;
     this.viewDuration = Math.max(duration, 0.01);
     this.emitView();
+    this.requestRender();
+  }
+
+  clearAudio(): void {
+    this.samples = null;
+    this.peaks = null;
+    this.spectrogram = null;
+    this.duration = 0;
+    this.viewStart = 0;
+    this.viewDuration = 1;
+    this.availableSamples = 0;
+    this.requestRender();
+  }
+
+  beginProgressiveAudio(samples: Float32Array, sampleRate: number, duration: number): void {
+    this.samples = samples;
+    this.sampleRate = sampleRate;
+    this.duration = duration;
+    this.peaks = new PeakPyramid(samples, false);
+    this.availableSamples = 0;
+    this.viewStart = 0;
+    this.viewDuration = Math.max(duration, 0.01);
+    this.emitView();
+    this.requestRender();
+  }
+
+  updateProgressiveAudio(start: number, end: number): void {
+    this.peaks?.update(start, end);
+    this.availableSamples = Math.max(this.availableSamples, Math.min(this.samples?.length ?? 0, end));
     this.requestRender();
   }
 
@@ -470,7 +508,11 @@ export class AudioVisualizer {
       context.fillStyle = '#63efb4';
       for (let pixel = 0; pixel < physicalWidth; pixel += 1) {
         const from = sampleStart + pixel * samplesPerPhysicalPixel;
-        const [min, max] = this.peaks.range(from, from + samplesPerPhysicalPixel);
+        if (from >= this.availableSamples) continue;
+        const [min, max] = this.peaks.range(
+          from,
+          Math.min(this.availableSamples, from + samplesPerPhysicalPixel),
+        );
         const top = Math.max(0, Math.min(physicalHeight - 1, Math.round(physicalMid - max * physicalHalfHeight)));
         const bottom = Math.max(top, Math.min(physicalHeight - 1, Math.round(physicalMid - min * physicalHalfHeight)));
         context.fillRect(pixel, top, 1, Math.max(1, bottom - top + 1));

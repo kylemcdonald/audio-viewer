@@ -1,8 +1,16 @@
 import './style.css';
 import { AudioEngine } from './audio-engine';
 import { isPaletteName, type PaletteName } from './palettes';
-import type { AnalysisInitialize, AnalysisMessage, AnalysisRequest, SpectrogramData } from './types';
+import type {
+  AnalysisAppend,
+  AnalysisInitialize,
+  AnalysisMessage,
+  AnalysisRequest,
+  AnalysisStreamInitialize,
+  SpectrogramData,
+} from './types';
 import { AudioVisualizer, formatClock } from './visualizer';
+import { decodeWavChunk, parseWavHeader, preferredWavChunkBytes, type WavHeader } from './wav-reader';
 
 const icon = (path: string, viewBox = '0 0 24 24') => `
   <svg viewBox="${viewBox}" aria-hidden="true" focusable="false">${path}</svg>
@@ -21,7 +29,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <div class="file-name-row">
           <strong id="file-name"></strong>
           <span class="file-size" id="file-size"></span>
-          <span class="file-format">
+          <span class="file-format is-empty" id="file-format">
             <span id="format-status"></span>
             <i></i>
             <span id="channel-status"></span>
@@ -46,7 +54,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <label class="open-button icon-only" for="file-input" role="button" tabindex="0" aria-label="Open audio" title="Open audio">
           ${folderIcon}
         </label>
-        <input id="file-input" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.flac,.ogg,.opus" hidden />
+        <input id="file-input" type="file" accept="audio/*,.wav,.wave,.mp3,.m4a,.aac,.flac,.ogg,.opus" hidden />
       </div>
     </header>
 
@@ -148,6 +156,7 @@ const totalTimeElement = get<HTMLSpanElement>('total-time');
 const fileIdentity = get<HTMLElement>('file-identity');
 const fileNameElement = get<HTMLElement>('file-name');
 const fileSizeElement = get<HTMLElement>('file-size');
+const fileFormatElement = get<HTMLElement>('file-format');
 const fftSlider = get<HTMLInputElement>('fft-slider');
 const fftOutput = get<HTMLOutputElement>('fft-output');
 const dbRangeSlider = get<HTMLInputElement>('db-range-slider');
@@ -176,6 +185,9 @@ dbRangeSlider.value = clampNumber(persistedSettings?.dbRange, 120, 60, 140).toSt
 paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSettings.palette : 'viridis';
 
 let monoSamples: Float32Array | null = null;
+let audioSampleRate = 48000;
+let audioDuration = 0;
+let availableAudioSamples = 0;
 let analysisWorker: Worker | null = null;
 let analysisId = 0;
 let fftDebounce = 0;
@@ -187,6 +199,8 @@ let toastTimer = 0;
 let settingsSaveTimer = 0;
 let dragDepth = 0;
 let hasLoadedAudio = false;
+let isReadingFile = false;
+let fileLoadId = 0;
 let wavePanelRatio = clampNumber(persistedSettings?.paneRatio, 0.25, 0.1, 0.75);
 let dividerPointer: number | null = null;
 let frequencyScaleBlend = clampNumber(persistedSettings?.frequencyScale, 1, 0, 1);
@@ -418,44 +432,205 @@ function animationLoop(): void {
 }
 
 async function loadFile(file: File): Promise<void> {
-  if (!file.type.startsWith('audio/') && !/\.(wav|mp3|m4a|aac|flac|ogg|opus|webm)$/i.test(file.name)) {
+  if (!file.type.startsWith('audio/') && !/\.(wav|wave|mp3|m4a|aac|flac|ogg|opus|webm)$/i.test(file.name)) {
     showToast('That file does not look like browser-decodable audio.');
     return;
   }
 
-  beginDelayedOverlay('Opening audio', `Decoding ${file.name}…`);
-  analysisProgress.style.width = '8%';
+  const loadId = ++fileLoadId;
+  prepareFileLoad(file);
+
   try {
-    const encoded = await file.arrayBuffer();
-    analysisProgress.style.width = '18%';
-    const buffer = await engine.decode(encoded);
-    engine.setBuffer(buffer);
-    monoSamples = downmix(buffer);
-    visualizer.setSpectrogram(null);
-    visualizer.setAudio(monoSamples, buffer.sampleRate, buffer.duration);
-    fileNameElement.textContent = file.name;
-    fileSizeElement.textContent = formatFileSize(file.size);
-    fileIdentity.classList.remove('is-empty');
-    formatStatus.textContent = `${buffer.sampleRate.toLocaleString()} Hz`;
-    channelStatus.textContent = buffer.numberOfChannels === 1
-      ? 'Mono'
-      : buffer.numberOfChannels === 2
-        ? 'Stereo'
-        : `${buffer.numberOfChannels}-channel`;
-    totalTimeElement.textContent = formatClock(buffer.duration);
-    updateTimecode(0);
-    updateTransportState();
-    hasLoadedAudio = true;
-    updateDropOverlayState();
-    initializeAnalysisWorker();
+    const likelyWav = /\.wave?$/i.test(file.name) || /(?:audio\/(?:wav|wave|x-wav))/i.test(file.type);
+    const headerPromise = likelyWav ? parseWavHeader(file) : Promise.resolve(null);
+    await nextPaint();
+    const header = await headerPromise;
+    if (loadId !== fileLoadId) return;
+
+    if (header) await loadProgressiveWav(file, header, loadId);
+    else await loadWithBrowserDecoder(file, loadId);
   } catch (error) {
+    if (loadId !== fileLoadId) return;
+    isReadingFile = false;
+    hasLoadedAudio = false;
+    audioDuration = 0;
+    availableAudioSamples = 0;
+    monoSamples = null;
     hideAnalysisOverlay();
+    clearFileHeader();
+    updateDropOverlayState();
     showToast(error instanceof Error ? `Could not decode audio: ${error.message}` : 'Could not decode that audio file.');
   }
 }
 
+function prepareFileLoad(file: File): void {
+  isReadingFile = true;
+  hasLoadedAudio = true;
+  availableAudioSamples = 0;
+  audioDuration = 0;
+  monoSamples = null;
+  engine.clear();
+  analysisWorker?.terminate();
+  analysisWorker = null;
+  hideAnalysisOverlay();
+  visualizer.clearAudio();
+  fileNameElement.textContent = file.name;
+  fileSizeElement.textContent = `${formatFileSize(file.size)} · 0%`;
+  fileIdentity.classList.remove('is-empty');
+  fileFormatElement.classList.add('is-empty');
+  formatStatus.textContent = '';
+  channelStatus.textContent = '';
+  currentTimeElement.textContent = formatClock(0);
+  totalTimeElement.textContent = formatClock(0);
+  updateTransportState();
+  updateDropOverlayState();
+}
+
+async function loadProgressiveWav(file: File, header: WavHeader, loadId: number): Promise<void> {
+  audioSampleRate = header.sampleRate;
+  audioDuration = header.duration;
+  availableAudioSamples = 0;
+  setFileFormat(header.sampleRate, header.channels);
+  totalTimeElement.textContent = formatClock(header.duration);
+
+  monoSamples = new Float32Array(header.frameCount);
+  visualizer.beginProgressiveAudio(monoSamples, header.sampleRate, header.duration);
+  initializeStreamingAnalysisWorker(header.frameCount, header.sampleRate);
+  await nextPaint();
+  if (loadId !== fileLoadId) return;
+
+  const playbackBuffer = engine.createBuffer(header.channels, header.frameCount, header.sampleRate);
+  const chunkBytes = preferredWavChunkBytes(header);
+  let processedBytes = 0;
+  let frameStart = 0;
+
+  while (processedBytes < header.dataSize) {
+    if (loadId !== fileLoadId) return;
+    const byteCount = Math.min(chunkBytes, header.dataSize - processedBytes);
+    const encoded = await file.slice(
+      header.dataOffset + processedBytes,
+      header.dataOffset + processedBytes + byteCount,
+    ).arrayBuffer();
+    if (loadId !== fileLoadId) return;
+
+    const decoded = decodeWavChunk(encoded, header);
+    monoSamples.set(decoded.mono, frameStart);
+    for (let channel = 0; channel < decoded.channels.length; channel += 1) {
+      playbackBuffer.copyToChannel(decoded.channels[channel], channel, frameStart);
+    }
+    visualizer.updateProgressiveAudio(frameStart, frameStart + decoded.frameCount);
+    availableAudioSamples = frameStart + decoded.frameCount;
+
+    const append: AnalysisAppend = {
+      type: 'append',
+      startSample: frameStart,
+      samples: decoded.mono.buffer,
+    };
+    analysisWorker?.postMessage(append, [append.samples]);
+
+    processedBytes += decoded.frameCount * header.blockAlign;
+    frameStart += decoded.frameCount;
+    updateFileReadProgress(file, processedBytes / header.dataSize);
+    scheduleViewportAnalysis(90);
+  }
+
+  if (loadId !== fileLoadId) return;
+  engine.setBuffer(playbackBuffer);
+  availableAudioSamples = header.frameCount;
+  isReadingFile = false;
+  fileSizeElement.textContent = formatFileSize(file.size);
+  updateTransportState();
+  analyzeCurrentAudio();
+}
+
+async function loadWithBrowserDecoder(file: File, loadId: number): Promise<void> {
+  const encoded = await readFileWithProgress(file, loadId);
+  if (loadId !== fileLoadId) return;
+  fileSizeElement.textContent = `${formatFileSize(file.size)} · Decoding`;
+  await nextPaint();
+  const buffer = await engine.decode(encoded);
+  if (loadId !== fileLoadId) return;
+
+  engine.setBuffer(buffer);
+  monoSamples = downmix(buffer);
+  audioSampleRate = buffer.sampleRate;
+  audioDuration = buffer.duration;
+  availableAudioSamples = monoSamples.length;
+  visualizer.setSpectrogram(null);
+  visualizer.setAudio(monoSamples, buffer.sampleRate, buffer.duration);
+  setFileFormat(buffer.sampleRate, buffer.numberOfChannels);
+  totalTimeElement.textContent = formatClock(buffer.duration);
+  updateTimecode(0);
+  updateTransportState();
+  isReadingFile = false;
+  fileSizeElement.textContent = formatFileSize(file.size);
+  initializeAnalysisWorker();
+}
+
+async function readFileWithProgress(file: File, loadId: number): Promise<ArrayBuffer> {
+  const reader = file.stream().getReader();
+  const encoded = new Uint8Array(file.size);
+  let bytesRead = 0;
+  while (true) {
+    const result = await reader.read();
+    if (loadId !== fileLoadId) {
+      await reader.cancel();
+      return new ArrayBuffer(0);
+    }
+    if (result.done) break;
+    encoded.set(result.value, bytesRead);
+    bytesRead += result.value.byteLength;
+    updateFileReadProgress(file, bytesRead / Math.max(1, file.size));
+  }
+  return encoded.buffer;
+}
+
+function updateFileReadProgress(file: File, progress: number): void {
+  const percent = Math.max(0, Math.min(100, Math.round(progress * 100)));
+  fileSizeElement.textContent = percent >= 100
+    ? `${formatFileSize(file.size)} · Parsing`
+    : `${formatFileSize(file.size)} · ${percent}%`;
+}
+
+function setFileFormat(sampleRate: number, channels: number): void {
+  formatStatus.textContent = `${sampleRate.toLocaleString()} Hz`;
+  channelStatus.textContent = channels === 1 ? 'Mono' : channels === 2 ? 'Stereo' : `${channels}-channel`;
+  fileFormatElement.classList.remove('is-empty');
+}
+
+function clearFileHeader(): void {
+  fileNameElement.textContent = '';
+  fileSizeElement.textContent = '';
+  formatStatus.textContent = '';
+  channelStatus.textContent = '';
+  fileIdentity.classList.add('is-empty');
+  fileFormatElement.classList.add('is-empty');
+}
+
 function initializeAnalysisWorker(): void {
-  if (!monoSamples || !engine.buffer) return;
+  if (!monoSamples || audioDuration <= 0) return;
+  const worker = resetAnalysisWorker();
+  const samplesCopy = monoSamples.slice();
+  const initialize: AnalysisInitialize = {
+    type: 'initialize',
+    samples: samplesCopy.buffer,
+    sampleRate: audioSampleRate,
+  };
+  worker.postMessage(initialize, [initialize.samples]);
+  analyzeCurrentAudio();
+}
+
+function initializeStreamingAnalysisWorker(sampleLength: number, sampleRate: number): void {
+  const worker = resetAnalysisWorker();
+  const initialize: AnalysisStreamInitialize = {
+    type: 'initialize-stream',
+    sampleLength,
+    sampleRate,
+  };
+  worker.postMessage(initialize);
+}
+
+function resetAnalysisWorker(): Worker {
   analysisWorker?.terminate();
   analysisId += 1;
   analysisWorker = new Worker(new URL('./spectrogram.worker.ts', import.meta.url), { type: 'module' });
@@ -464,14 +639,7 @@ function initializeAnalysisWorker(): void {
     hideAnalysisOverlay();
     showToast('The spectral analysis worker stopped unexpectedly.');
   };
-  const samplesCopy = monoSamples.slice();
-  const initialize: AnalysisInitialize = {
-    type: 'initialize',
-    samples: samplesCopy.buffer,
-    sampleRate: engine.buffer.sampleRate,
-  };
-  analysisWorker.postMessage(initialize, [initialize.samples]);
-  analyzeCurrentAudio();
+  return analysisWorker;
 }
 
 function scheduleViewportAnalysis(interval = 24): void {
@@ -491,22 +659,39 @@ function scheduleViewportAnalysis(interval = 24): void {
 }
 
 function analyzeCurrentAudio(): void {
-  if (!analysisWorker || !engine.buffer) return;
+  if (!analysisWorker || audioDuration <= 0) return;
   window.clearTimeout(fftDebounce);
   window.clearTimeout(viewportAnalysisTimer);
   viewportAnalysisTimer = 0;
   lastViewportAnalysisAt = performance.now();
   analysisId += 1;
-  beginDelayedOverlay('Preparing spectral map', 'Computing visible columns…');
-  analysisProgress.style.width = '2%';
   const bins = fftBins[Number(fftSlider.value)];
+  const fftSize = bins * 2;
+  let requestStart = analysisViewStart;
+  let requestDuration = analysisViewDuration;
+  let requestColumns = visualizer.analysisColumnCount;
+
+  if (isReadingFile) {
+    const safeEnd = Math.max(0, (availableAudioSamples - fftSize / 2) / audioSampleRate);
+    const availableEnd = Math.min(analysisViewStart + analysisViewDuration, safeEnd);
+    if (availableEnd <= requestStart) return;
+    requestDuration = availableEnd - requestStart;
+    requestColumns = Math.max(
+      1,
+      Math.round(requestColumns * (requestDuration / Math.max(0.001, analysisViewDuration))),
+    );
+  } else {
+    beginDelayedOverlay('Preparing spectral map', 'Computing visible columns…');
+    analysisProgress.style.width = '2%';
+  }
+
   const request: AnalysisRequest = {
     type: 'analyze',
     id: analysisId,
-    fftSize: bins * 2,
-    startTime: analysisViewStart,
-    viewDuration: analysisViewDuration,
-    columns: visualizer.analysisColumnCount,
+    fftSize,
+    startTime: requestStart,
+    viewDuration: requestDuration,
+    columns: requestColumns,
     minimumSecondsPerColumn: 0.001,
   };
   analysisWorker.postMessage(request);
@@ -655,6 +840,10 @@ function formatFileSize(bytes: number): string {
   }
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(bytes >= 102_400 ? 0 : 1)} KB`;
   return `${bytes.toLocaleString()} B`;
+}
+
+function nextPaint(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
 function showToast(message: string): void {

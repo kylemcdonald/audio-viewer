@@ -16,6 +16,18 @@ export type AnalysisInitialize = {
   sampleRate: number;
 };
 
+export type AnalysisStreamInitialize = {
+  type: 'initialize-stream';
+  sampleLength: number;
+  sampleRate: number;
+};
+
+export type AnalysisAppend = {
+  type: 'append';
+  startSample: number;
+  samples: ArrayBuffer;
+};
+
 export type AnalysisRequest = {
   type: 'analyze';
   id: number;
@@ -56,5 +68,5 @@ export type AnalysisFailure = {
   message: string;
 };
 
-export type AnalysisInput = AnalysisInitialize | AnalysisRequest;
+export type AnalysisInput = AnalysisInitialize | AnalysisStreamInitialize | AnalysisAppend | AnalysisRequest;
 export type AnalysisMessage = AnalysisBackend | AnalysisProgress | AnalysisPartial | AnalysisFailure;

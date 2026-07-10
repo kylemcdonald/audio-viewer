@@ -28,6 +28,8 @@ Open [http://vibecheck.local:5173/](http://vibecheck.local:5173/).
 
 The pane split, frequency scale, palette, and analysis settings persist in local storage. Spectral analysis uses a persistent, time-aligned multiresolution cache: a coarse full-width pass appears first, midpoint passes double the temporal detail, zoom levels reuse their shared columns, and pans compute only newly exposed time ranges. Finer cached levels are prepared in the background down to 1 ms spacing when memory permits. The canvases automatically use the current device pixel ratio. FFT analysis uses batched WebGPU compute shaders when WebGPU is available, with a CPU compatibility path for browsers that do not expose it. Palette tables come from the MIT-licensed [viridisLite project](https://github.com/sjmgarnier/viridisLite).
 
+Uncompressed PCM and IEEE-float WAV files use a header-first streaming path. The filename and read progress appear on the first frame, duration and format follow as soon as the RIFF header is parsed, and both the waveform and cached spectrogram fill progressively in 2 MiB chunks. Other browser-decodable formats show streamed read progress before the browser's whole-file audio decoder runs.
+
 ## License
 
 MIT © Kyle McDonald

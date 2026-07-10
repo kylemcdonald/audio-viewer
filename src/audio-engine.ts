@@ -24,9 +24,21 @@ export class AudioEngine {
     return context.decodeAudioData(encoded.slice(0));
   }
 
+  createBuffer(channels: number, length: number, sampleRate: number): AudioBuffer {
+    return this.getContext().createBuffer(channels, length, sampleRate);
+  }
+
   setBuffer(buffer: AudioBuffer): void {
+    this.playing = false;
     this.stopSource();
     this.buffer = buffer;
+    this.offset = 0;
+  }
+
+  clear(): void {
+    this.playing = false;
+    this.stopSource();
+    this.buffer = null;
     this.offset = 0;
   }
 
