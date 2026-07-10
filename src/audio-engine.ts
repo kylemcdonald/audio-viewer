@@ -8,6 +8,7 @@ export class AudioEngine {
   private startedAt = 0;
   private offset = 0;
   private playing = false;
+  private ended = false;
 
   buffer: AudioBuffer | null = null;
   onEnded: (() => void) | null = null;
@@ -37,6 +38,7 @@ export class AudioEngine {
     this.clearMedia();
     this.buffer = buffer;
     this.offset = 0;
+    this.ended = false;
   }
 
   setMediaFile(file: File, duration: number): void {
@@ -48,6 +50,7 @@ export class AudioEngine {
     media.onended = () => {
       if (this.media !== media) return;
       this.playing = false;
+      this.ended = true;
       this.onEnded?.();
     };
     this.media = media;
@@ -62,13 +65,17 @@ export class AudioEngine {
     this.clearMedia();
     this.buffer = null;
     this.offset = 0;
+    this.ended = false;
   }
 
   async play(): Promise<void> {
     if (this.media) {
       if (this.playing) return;
       const media = this.media;
-      if (this.currentTime >= this.mediaDuration - 0.001) media.currentTime = 0;
+      if (this.ended || this.currentTime >= this.mediaDuration - 0.001) {
+        media.currentTime = 0;
+        this.ended = false;
+      }
       await media.play();
       if (this.media !== media) return;
       this.playing = true;
@@ -78,7 +85,10 @@ export class AudioEngine {
     const context = this.getContext();
     await context.resume();
 
-    if (this.offset >= this.buffer.duration - 0.001) this.offset = 0;
+    if (this.ended || this.offset >= this.buffer.duration - 0.001) {
+      this.offset = 0;
+      this.ended = false;
+    }
 
     const source = context.createBufferSource();
     source.buffer = this.buffer;
@@ -89,6 +99,7 @@ export class AudioEngine {
       if (!this.playing) return;
       this.playing = false;
       this.offset = this.buffer?.duration ?? 0;
+      this.ended = true;
       this.onEnded?.();
     };
     this.source = source;
@@ -117,6 +128,7 @@ export class AudioEngine {
   seek(time: number): void {
     const duration = this.media ? this.mediaDuration : this.buffer?.duration ?? 0;
     const next = Math.max(0, Math.min(duration, time));
+    this.ended = duration > 0 && next >= duration - 0.0005;
     if (this.media) {
       this.media.currentTime = next;
       return;
@@ -129,6 +141,7 @@ export class AudioEngine {
   }
 
   get currentTime(): number {
+    if (this.ended) return this.media ? this.mediaDuration : this.buffer?.duration ?? this.offset;
     if (this.media) return Math.min(this.mediaDuration, Math.max(0, this.media.currentTime || 0));
     if (!this.buffer) return 0;
     if (!this.playing || !this.context) return this.offset;
@@ -141,6 +154,10 @@ export class AudioEngine {
 
   get hasAudio(): boolean {
     return Boolean(this.media || this.buffer);
+  }
+
+  get hasEnded(): boolean {
+    return this.ended;
   }
 
   private stopSource(): void {

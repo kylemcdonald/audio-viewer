@@ -296,6 +296,11 @@ export class AudioVisualizer {
     this.requestRender();
   }
 
+  moveViewportToStart(): void {
+    if (!this.duration) return;
+    this.setView(0, this.viewDuration);
+  }
+
   showPlayhead(time: number): void {
     const previousSpectrumColumn = this.spectrumColumnAtTime(this.cursorTime);
     this.cursorTime = time;

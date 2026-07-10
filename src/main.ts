@@ -282,6 +282,7 @@ const visualizer = new AudioVisualizer({
 });
 
 engine.onEnded = () => {
+  updateTimecode(engine.currentTime);
   updateTransportState();
 };
 
@@ -522,6 +523,15 @@ window.addEventListener('pagehide', persistSettings);
 
 async function togglePlayback(): Promise<void> {
   if (!engine.hasAudio) return;
+  const restartingFromEnd = !engine.isPlaying && (
+    engine.hasEnded ||
+    (audioDuration > 0 && engine.currentTime >= audioDuration - 0.001)
+  );
+  if (restartingFromEnd) {
+    engine.seek(0);
+    visualizer.moveViewportToStart();
+    updateTimecode(0);
+  }
   try {
     await engine.toggle();
     updateTransportState();
