@@ -7,8 +7,13 @@ export class AudioEngine {
   private mediaDuration = 0;
   private startedAt = 0;
   private offset = 0;
+  private sourceEndOffset = 0;
   private playing = false;
   private ended = false;
+  private progressiveBuffer = false;
+  private bufferComplete = true;
+  private availableBufferDuration = 0;
+  private waitingForBuffer = false;
 
   buffer: AudioBuffer | null = null;
   onEnded: (() => void) | null = null;
@@ -33,12 +38,46 @@ export class AudioEngine {
   }
 
   setBuffer(buffer: AudioBuffer): void {
-    this.playing = false;
-    this.stopSource();
-    this.clearMedia();
-    this.buffer = buffer;
-    this.offset = 0;
-    this.ended = false;
+    this.replaceBuffer(buffer, false, buffer.duration);
+  }
+
+  /**
+   * Installs a buffer whose tail is still being filled by the decoder.  The
+   * AudioBuffer has its final length from the WAV header, but sources are only
+   * ever scheduled through `availableDuration`, so the unfilled tail cannot be
+   * played as silence.
+   */
+  setProgressiveBuffer(buffer: AudioBuffer, availableDuration = 0): void {
+    this.replaceBuffer(buffer, true, availableDuration);
+  }
+
+  /**
+   * Extends the contiguous, decoded portion of a progressive buffer. If
+   * playback reached the previous frontier, it resumes automatically as soon
+   * as there is another sample to schedule.
+   */
+  updateProgressiveBufferAvailability(availableDuration: number, complete = false): void {
+    if (!this.buffer || !this.progressiveBuffer) return;
+
+    const next = this.clampBufferTime(availableDuration);
+    this.availableBufferDuration = Math.max(this.availableBufferDuration, next);
+    if (complete) {
+      this.availableBufferDuration = this.buffer.duration;
+      this.bufferComplete = true;
+      this.progressiveBuffer = false;
+    }
+
+    if (!this.playing || !this.waitingForBuffer) return;
+    if (this.offset < this.playableBufferDuration) {
+      this.startBufferSource();
+      return;
+    }
+    if (this.bufferComplete) this.finishBufferPlayback();
+  }
+
+  completeProgressiveBuffer(): void {
+    if (!this.buffer || !this.progressiveBuffer) return;
+    this.updateProgressiveBufferAvailability(this.buffer.duration, true);
   }
 
   setMediaFile(file: File, duration: number): void {
@@ -65,7 +104,12 @@ export class AudioEngine {
     this.clearMedia();
     this.buffer = null;
     this.offset = 0;
+    this.sourceEndOffset = 0;
     this.ended = false;
+    this.progressiveBuffer = false;
+    this.bufferComplete = true;
+    this.availableBufferDuration = 0;
+    this.waitingForBuffer = false;
   }
 
   async play(): Promise<void> {
@@ -89,23 +133,9 @@ export class AudioEngine {
       this.offset = 0;
       this.ended = false;
     }
-
-    const source = context.createBufferSource();
-    source.buffer = this.buffer;
-    source.connect(this.gain!);
-    source.onended = () => {
-      if (this.source !== source) return;
-      this.source = null;
-      if (!this.playing) return;
-      this.playing = false;
-      this.offset = this.buffer?.duration ?? 0;
-      this.ended = true;
-      this.onEnded?.();
-    };
-    this.source = source;
-    this.startedAt = context.currentTime;
     this.playing = true;
-    source.start(0, this.offset);
+    this.waitingForBuffer = false;
+    this.startBufferSource();
   }
 
   pause(): void {
@@ -117,6 +147,7 @@ export class AudioEngine {
     }
     this.offset = this.currentTime;
     this.playing = false;
+    this.waitingForBuffer = false;
     this.stopSource();
   }
 
@@ -125,27 +156,34 @@ export class AudioEngine {
     else return this.play();
   }
 
-  seek(time: number): void {
-    const duration = this.media ? this.mediaDuration : this.buffer?.duration ?? 0;
-    const next = Math.max(0, Math.min(duration, time));
-    this.ended = duration > 0 && next >= duration - 0.0005;
+  seek(time: number): number {
+    const duration = this.media ? this.mediaDuration : this.playableBufferDuration;
+    const next = Math.max(0, Math.min(duration, Number.isFinite(time) ? time : 0));
     if (this.media) {
+      this.ended = duration > 0 && next >= duration - 0.0005;
       this.media.currentTime = next;
-      return;
+      return next;
     }
     const wasPlaying = this.playing;
     this.playing = false;
+    this.waitingForBuffer = false;
     this.stopSource();
     this.offset = next;
-    if (wasPlaying) void this.play();
+    this.ended = this.bufferComplete && duration > 0 && next >= duration - 0.0005;
+    if (wasPlaying) {
+      this.playing = true;
+      this.ended = false;
+      this.startBufferSource();
+    }
+    return next;
   }
 
   get currentTime(): number {
     if (this.ended) return this.media ? this.mediaDuration : this.buffer?.duration ?? this.offset;
     if (this.media) return Math.min(this.mediaDuration, Math.max(0, this.media.currentTime || 0));
     if (!this.buffer) return 0;
-    if (!this.playing || !this.context) return this.offset;
-    return Math.min(this.buffer.duration, this.offset + this.context.currentTime - this.startedAt);
+    if (!this.playing || !this.context || this.waitingForBuffer || !this.source) return this.offset;
+    return Math.min(this.sourceEndOffset, this.offset + this.context.currentTime - this.startedAt);
   }
 
   get isPlaying(): boolean {
@@ -160,6 +198,86 @@ export class AudioEngine {
     return this.ended;
   }
 
+  get availableDuration(): number {
+    return this.media ? this.mediaDuration : this.playableBufferDuration;
+  }
+
+  private replaceBuffer(buffer: AudioBuffer, progressive: boolean, availableDuration: number): void {
+    this.playing = false;
+    this.stopSource();
+    this.clearMedia();
+    this.buffer = buffer;
+    this.offset = 0;
+    this.sourceEndOffset = 0;
+    this.ended = false;
+    this.progressiveBuffer = progressive;
+    this.bufferComplete = !progressive;
+    this.availableBufferDuration = this.clampBufferTime(availableDuration);
+    this.waitingForBuffer = false;
+  }
+
+  private startBufferSource(): void {
+    const buffer = this.buffer;
+    if (!buffer || !this.playing) return;
+
+    const playableEnd = this.playableBufferDuration;
+    if (this.offset >= playableEnd) {
+      this.sourceEndOffset = this.offset;
+      if (this.bufferComplete) this.finishBufferPlayback();
+      else this.waitingForBuffer = true;
+      return;
+    }
+
+    const context = this.getContext();
+    const source = context.createBufferSource();
+    const startOffset = Math.max(0, Math.min(playableEnd, this.offset));
+    const duration = playableEnd - startOffset;
+    const sourceEnd = Math.min(buffer.duration, startOffset + duration);
+    source.buffer = buffer;
+    source.connect(this.gain!);
+    source.onended = () => {
+      if (this.source !== source) return;
+      this.source = null;
+      if (!this.playing) return;
+
+      this.offset = sourceEnd;
+      this.sourceEndOffset = sourceEnd;
+      if (this.offset < this.playableBufferDuration) {
+        this.waitingForBuffer = false;
+        this.startBufferSource();
+      } else if (this.bufferComplete) {
+        this.finishBufferPlayback();
+      } else {
+        this.waitingForBuffer = true;
+      }
+    };
+    this.source = source;
+    this.sourceEndOffset = sourceEnd;
+    this.startedAt = context.currentTime;
+    this.waitingForBuffer = false;
+    source.start(0, startOffset, duration);
+  }
+
+  private finishBufferPlayback(): void {
+    if (!this.playing) return;
+    this.playing = false;
+    this.waitingForBuffer = false;
+    this.offset = this.buffer?.duration ?? this.offset;
+    this.sourceEndOffset = this.offset;
+    this.ended = true;
+    this.onEnded?.();
+  }
+
+  private get playableBufferDuration(): number {
+    if (!this.buffer) return 0;
+    return this.bufferComplete ? this.buffer.duration : this.availableBufferDuration;
+  }
+
+  private clampBufferTime(time: number): number {
+    if (!this.buffer) return 0;
+    return Math.max(0, Math.min(this.buffer.duration, Number.isFinite(time) ? time : 0));
+  }
+
   private stopSource(): void {
     if (!this.source) return;
     const source = this.source;
@@ -171,6 +289,7 @@ export class AudioEngine {
       // The source may already have completed naturally.
     }
     source.disconnect();
+    this.sourceEndOffset = this.offset;
   }
 
   private clearMedia(): void {

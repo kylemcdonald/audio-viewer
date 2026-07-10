@@ -664,10 +664,26 @@ select:focus-visible {
   outline-offset: -2px;
 }
 
+.spectrum-hover-frequency-mask {
+  position: absolute;
+  z-index: 7;
+  top: 0;
+  right: 0;
+  width: 38px;
+  height: 0;
+  background: #000;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.spectrum-hover-frequency-mask.is-visible {
+  opacity: 1;
+}
+
 .spectrum-hover-frequency {
   --spectrum-hover-frequency-y: 0px;
   position: absolute;
-  z-index: 7;
+  z-index: 8;
   top: 0;
   right: 0;
   box-sizing: border-box;
@@ -1221,6 +1237,10 @@ select:focus-visible {
 
 :root[data-theme="light"] .spectrum-hover-frequency {
   color: #68747d;
+  background: #fff;
+}
+
+:root[data-theme="light"] .spectrum-hover-frequency-mask {
   background: #fff;
 }
 

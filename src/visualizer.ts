@@ -73,12 +73,19 @@ type SpectrumAxisLabel = {
   bounds: TextBounds;
 };
 
+type FrequencyAxisTick = {
+  frequency: number;
+  y: number;
+  baseline: CanvasTextBaseline;
+};
+
 export type VisualizerOptions = {
   editor: HTMLElement;
   waveCanvas: HTMLCanvasElement;
   spectralCanvas: HTMLCanvasElement;
   spectrumCanvas: HTMLCanvasElement;
   spectrumHoverFrequencyLabel: HTMLElement;
+  spectrumHoverFrequencyMask: HTMLElement;
   playhead: HTMLElement;
   onSeek: (time: number) => void;
   onViewChange: (start: number, duration: number) => void;
@@ -178,6 +185,7 @@ export class AudioVisualizer {
   private readonly spectralCanvas: HTMLCanvasElement;
   private readonly spectrumCanvas: HTMLCanvasElement;
   private readonly spectrumHoverFrequencyLabel: HTMLElement;
+  private readonly spectrumHoverFrequencyMask: HTMLElement;
   private readonly playhead: HTMLElement;
   private readonly onSeek: (time: number) => void;
   private readonly onViewChange: (start: number, duration: number) => void;
@@ -215,6 +223,7 @@ export class AudioVisualizer {
   private playbackActive = false;
   private playbackFollowMode: PlaybackFollowMode = 'page';
   private rulerLock: RulerLock | null = null;
+  private frequencyAxisTicks: FrequencyAxisTick[] = [];
 
   constructor(options: VisualizerOptions) {
     this.editor = options.editor;
@@ -222,6 +231,7 @@ export class AudioVisualizer {
     this.spectralCanvas = options.spectralCanvas;
     this.spectrumCanvas = options.spectrumCanvas;
     this.spectrumHoverFrequencyLabel = options.spectrumHoverFrequencyLabel;
+    this.spectrumHoverFrequencyMask = options.spectrumHoverFrequencyMask;
     this.playhead = options.playhead;
     this.onSeek = options.onSeek;
     this.onViewChange = options.onViewChange;
@@ -673,6 +683,7 @@ export class AudioVisualizer {
       context,
       width,
       height,
+      pixelWidth: physicalWidth,
       pixelHeight: physicalHeight,
       scaleX,
       scaleY,
@@ -687,39 +698,78 @@ export class AudioVisualizer {
     context.fillStyle = light ? '#fff' : '#000';
     context.fillRect(plotRight, 0, AXIS_WIDTH, height);
 
-    this.drawTimeGrid(context, plotRight, height, 0, height, false, scaleX);
+    this.drawTimeGrid(
+      context,
+      plotRight,
+      height,
+      0,
+      height,
+      false,
+      scaleX,
+      scaleY,
+      physicalWidth,
+      physicalHeight,
+    );
 
     const dbTicks = selectWaveformDbTicks(waveHalfHeight);
-    context.font = '10px "Chivo Mono", ui-monospace, monospace';
-    context.textAlign = 'left';
-    context.textBaseline = 'middle';
+    const dbRules: Array<{ y: number; db: number; sign: number }> = [];
     for (const db of dbTicks) {
       const amplitude = 10 ** (db / 20);
       for (const sign of [-1, 1]) {
-        const y = mid + sign * amplitude * waveHalfHeight;
-        context.strokeStyle = db === 0
-          ? (light ? 'rgba(56, 67, 75, .26)' : 'rgba(158, 181, 196, .14)')
-          : (light ? 'rgba(56, 67, 75, .13)' : 'rgba(158, 181, 196, .08)');
-        context.lineWidth = 1;
-        context.beginPath();
-        context.moveTo(0, snap(y, scaleY));
-        context.lineTo(plotRight, snap(y, scaleY));
-        context.stroke();
-        if (sign < 0 || db !== 0) {
-          context.fillStyle = db === 0
-            ? (light ? '#56616a' : '#9aa6b2')
-            : (light ? '#76818a' : '#687581');
-          const labelY = Math.max(7, Math.min(height - 7, y));
-          context.fillText(db === 0 ? '0 dB' : `${db}`, plotRight + AXIS_LABEL_INSET, labelY);
-        }
+        dbRules.push({ y: mid + sign * amplitude * waveHalfHeight, db, sign });
       }
     }
 
-    context.strokeStyle = light ? 'rgba(49, 59, 67, .3)' : 'rgba(188, 210, 222, .22)';
-    context.beginPath();
-    context.moveTo(0, snap(mid, scaleY));
-    context.lineTo(plotRight, snap(mid, scaleY));
-    context.stroke();
+    // Rules are drawn in physical canvas coordinates. A one-CSS-pixel stroke
+    // becomes two device pixels on a retina canvas, and can land between them
+    // when the canvas has a fractional CSS size.
+    context.save();
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.imageSmoothingEnabled = false;
+    for (const rule of dbRules) {
+      context.fillStyle = rule.db === 0
+        ? (light ? 'rgba(56, 67, 75, .26)' : 'rgba(158, 181, 196, .14)')
+        : (light ? 'rgba(56, 67, 75, .13)' : 'rgba(158, 181, 196, .08)');
+      drawDeviceHorizontalLine(
+        context,
+        0,
+        plotRight,
+        rule.y,
+        scaleX,
+        scaleY,
+        physicalWidth,
+        physicalHeight,
+      );
+    }
+    context.fillStyle = light ? 'rgba(49, 59, 67, .3)' : 'rgba(188, 210, 222, .22)';
+    drawDeviceHorizontalLine(
+      context,
+      0,
+      plotRight,
+      mid,
+      scaleX,
+      scaleY,
+      physicalWidth,
+      physicalHeight,
+    );
+    context.restore();
+
+    context.font = '10px "Chivo Mono", ui-monospace, monospace';
+    context.textAlign = 'left';
+    context.textBaseline = 'middle';
+    for (const rule of dbRules) {
+      if (rule.sign < 0 || rule.db !== 0) {
+        context.fillStyle = rule.db === 0
+          ? (light ? '#56616a' : '#9aa6b2')
+          : (light ? '#76818a' : '#687581');
+        const labelY = Math.max(7, Math.min(height - 7, rule.y));
+        context.fillText(
+          rule.db === 0 ? '0 dB' : `${rule.db}`,
+          plotRight + AXIS_LABEL_INSET,
+          labelY,
+        );
+      }
+    }
     context.fillStyle = light ? '#65717a' : '#5d6974';
     context.fillText('-∞', plotRight + AXIS_LABEL_INSET, mid);
 
@@ -758,7 +808,7 @@ export class AudioVisualizer {
   private drawSpectrogram(): void {
     const canvas = this.spectralCanvas;
     const surface = this.prepareCanvas(canvas);
-    const { context, width, height, scaleX, scaleY } = surface;
+    const { context, width, height, pixelWidth, pixelHeight, scaleX, scaleY } = surface;
     const plotRight = width - AXIS_WIDTH;
     const plotBottom = height;
     const plotWidth = Math.max(1, plotRight);
@@ -822,8 +872,28 @@ export class AudioVisualizer {
     context.fillStyle = this.isLightTheme ? '#fff' : '#000';
     context.fillRect(0, 0, plotWidth, SPECTRAL_RULER);
 
-    this.drawTimeGrid(context, plotRight, height, SPECTRAL_RULER, plotBottom, true, scaleX);
-    this.drawFrequencyGrid(context, plotRight, plotBottom, plotHeight, scaleY);
+    this.drawTimeGrid(
+      context,
+      plotRight,
+      height,
+      SPECTRAL_RULER,
+      plotBottom,
+      true,
+      scaleX,
+      scaleY,
+      pixelWidth,
+      pixelHeight,
+    );
+    this.drawFrequencyGrid(
+      context,
+      plotRight,
+      plotBottom,
+      plotHeight,
+      scaleX,
+      scaleY,
+      pixelWidth,
+      pixelHeight,
+    );
   }
 
   private drawSpectrumAnalyzer(): void {
@@ -849,7 +919,16 @@ export class AudioVisualizer {
     const hoverLabels = hover
       ? this.spectrumHoverAxisLabels(context, hover, width, scaleX)
       : [];
-    this.drawSpectrumAnalyzerGrid(context, width, height, amplitudeTicks, scaleX, scaleY);
+    this.drawSpectrumAnalyzerGrid(
+      context,
+      width,
+      height,
+      amplitudeTicks,
+      scaleX,
+      scaleY,
+      physicalWidth,
+      physicalHeight,
+    );
 
     this.drawSpectrumAnalyzerRulerBorder(context, physicalWidth, plotTop);
 
@@ -987,11 +1066,42 @@ export class AudioVisualizer {
     label.style.setProperty('--spectrum-hover-frequency-y', `${y}px`);
     label.dataset.edge = edge;
     label.classList.add('is-visible');
+    this.updateSpectrumHoverFrequencyMask(y, edge);
   }
 
   private hideSpectrumHoverFrequencyLabel(): void {
     this.spectrumHoverFrequencyLabel.classList.remove('is-visible');
     delete this.spectrumHoverFrequencyLabel.dataset.edge;
+    this.spectrumHoverFrequencyMask.classList.remove('is-visible');
+  }
+
+  /**
+   * The hover readout lives in the same right-hand gutter as the spectrogram
+   * frequency labels.  The label itself covers an exact match, but a nearby
+   * tick can still peek out above or below it.  Cover just those colliding
+   * canvas labels so the hover readout replaces them cleanly without forcing
+   * an expensive spectrogram redraw on every pointer move.
+   */
+  private updateSpectrumHoverFrequencyMask(
+    hoverY: number,
+    edge: 'top' | 'bottom' | 'middle',
+  ): void {
+    const hoverBounds = frequencyLabelVerticalBounds(hoverY, edge);
+    const overlapping = this.frequencyAxisTicks
+      .map((tick) => frequencyLabelVerticalBounds(tick.y, tick.baseline))
+      .filter((bounds) => verticalBoundsIntersect(bounds, hoverBounds));
+
+    if (!overlapping.length) {
+      this.spectrumHoverFrequencyMask.classList.remove('is-visible');
+      return;
+    }
+
+    const top = Math.max(0, Math.min(...overlapping.map((bounds) => bounds.top)) - 1);
+    const bottom = Math.max(top + 1, Math.max(...overlapping.map((bounds) => bounds.bottom)) + 1);
+    const mask = this.spectrumHoverFrequencyMask;
+    mask.style.top = `${Math.floor(top)}px`;
+    mask.style.height = `${Math.ceil(bottom - top)}px`;
+    mask.classList.add('is-visible');
   }
 
   private drawSpectrumAmplitudeLabels(
@@ -1098,18 +1208,27 @@ export class AudioVisualizer {
     amplitudeTicks: Array<{ gridX: number }>,
     scaleX: number,
     scaleY: number,
+    pixelWidth: number,
+    pixelHeight: number,
   ): void {
     if (width <= 0 || height <= SPECTRAL_RULER) return;
     context.save();
-    context.lineWidth = 1;
-    context.strokeStyle = this.isLightTheme
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.fillStyle = this.isLightTheme
       ? 'rgba(48, 59, 67, .16)'
       : 'rgba(190, 211, 225, .11)';
-    context.beginPath();
     for (const tick of amplitudeTicks) {
-      const x = tick.gridX <= 0 ? 0.5 : tick.gridX >= width ? width - 0.5 : tick.gridX;
-      context.moveTo(snap(x, scaleX), SPECTRAL_RULER);
-      context.lineTo(snap(x, scaleX), height);
+      drawDeviceVerticalLine(
+        context,
+        tick.gridX,
+        SPECTRAL_RULER,
+        height,
+        scaleX,
+        scaleY,
+        pixelWidth,
+        pixelHeight,
+      );
     }
 
     const maxFrequency = this.sampleRate / 2;
@@ -1125,14 +1244,20 @@ export class AudioVisualizer {
       if (frequency !== minFrequency && Math.abs(y - height) < 21) continue;
       if (Math.abs(y - lastY) < 21 && frequency !== minFrequency && frequency !== maxFrequency) continue;
       lastY = y;
-      const snappedY = Math.max(
-        SPECTRAL_RULER + 0.5,
-        Math.min(height - 0.5, snap(y, scaleY)),
+      drawDeviceHorizontalLine(
+        context,
+        0,
+        width,
+        Math.max(
+          SPECTRAL_RULER,
+          Math.min(height, y),
+        ),
+        scaleX,
+        scaleY,
+        pixelWidth,
+        pixelHeight,
       );
-      context.moveTo(0, snappedY);
-      context.lineTo(width, snappedY);
     }
-    context.stroke();
     context.restore();
   }
 
@@ -1288,6 +1413,9 @@ export class AudioVisualizer {
     plotBottom: number,
     withLabels: boolean,
     scaleX: number,
+    scaleY: number,
+    pixelWidth: number,
+    pixelHeight: number,
   ): void {
     if (!this.duration) return;
     const plotWidth = plotRight;
@@ -1297,24 +1425,50 @@ export class AudioVisualizer {
     context.textAlign = 'center';
     context.textBaseline = 'middle';
 
+    context.save();
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.fillStyle = withLabels
+      ? (this.isLightTheme ? 'rgba(49, 59, 67, .2)' : 'rgba(183, 202, 219, .13)')
+      : (this.isLightTheme ? 'rgba(49, 59, 67, .13)' : 'rgba(183, 202, 219, .07)');
     for (const tick of ticks) {
-      const { time, x } = tick;
+      const { x } = tick;
       if (x < -1 || x > plotRight + 1) continue;
-      context.strokeStyle = withLabels
-        ? (this.isLightTheme ? 'rgba(49, 59, 67, .2)' : 'rgba(183, 202, 219, .13)')
-        : (this.isLightTheme ? 'rgba(49, 59, 67, .13)' : 'rgba(183, 202, 219, .07)');
-      context.lineWidth = 1;
-      context.beginPath();
       if (withLabels) {
-        context.moveTo(snap(x, scaleX), SPECTRAL_RULER - 4);
-        context.lineTo(snap(x, scaleX), SPECTRAL_RULER);
+        drawDeviceVerticalLine(
+          context,
+          x,
+          SPECTRAL_RULER - 4,
+          SPECTRAL_RULER,
+          scaleX,
+          scaleY,
+          pixelWidth,
+          pixelHeight,
+        );
       } else {
-        context.moveTo(snap(x, scaleX), plotTop);
-        context.lineTo(snap(x, scaleX), plotBottom);
+        // The waveform frame owns its outermost pixel. Rendering an endpoint
+        // tick beside it would make the right edge look like a two-pixel rule.
+        const tickPixel = clampDevicePixel(Math.round(x * scaleX), pixelWidth);
+        const frameRightPixel = clampDevicePixel(Math.round(plotRight * scaleX) - 1, pixelWidth);
+        if (tickPixel <= 0 || tickPixel >= frameRightPixel) continue;
+        drawDeviceVerticalLine(
+          context,
+          x,
+          plotTop,
+          plotBottom,
+          scaleX,
+          scaleY,
+          pixelWidth,
+          pixelHeight,
+        );
       }
-      context.stroke();
-      if (withLabels) {
-        context.fillStyle = this.isLightTheme ? '#68747d' : '#83909c';
+    }
+    context.restore();
+
+    if (withLabels) {
+      context.fillStyle = this.isLightTheme ? '#68747d' : '#83909c';
+      for (const { time, x } of ticks) {
+        if (x < -1 || x > plotRight + 1) continue;
         context.textAlign = x < 24 ? 'left' : x > plotRight - 24 ? 'right' : 'center';
         context.fillText(formatRuler(time, step), x, SPECTRAL_RULER / 2 + 0.5);
       }
@@ -1364,7 +1518,10 @@ export class AudioVisualizer {
     plotRight: number,
     plotBottom: number,
     plotHeight: number,
+    scaleX: number,
     scaleY: number,
+    pixelWidth: number,
+    pixelHeight: number,
   ): void {
     const maxFrequency = this.sampleRate / 2;
     const minFrequency = this.minimumFrequency;
@@ -1373,6 +1530,7 @@ export class AudioVisualizer {
     context.textAlign = 'left';
     context.textBaseline = 'middle';
     let lastY = Number.POSITIVE_INFINITY;
+    const ticks: FrequencyAxisTick[] = [];
 
     for (let i = candidates.length - 1; i >= 0; i -= 1) {
       const frequency = candidates[i];
@@ -1385,19 +1543,41 @@ export class AudioVisualizer {
         frequency !== maxFrequency
       ) continue;
       lastY = y;
-      context.strokeStyle = this.isLightTheme
-        ? 'rgba(49, 59, 67, .24)'
-        : 'rgba(190, 211, 225, .16)';
-      context.beginPath();
-      context.moveTo(plotRight, snap(y, scaleY));
-      context.lineTo(plotRight + 4, snap(y, scaleY));
-      context.stroke();
-      context.fillStyle = this.isLightTheme ? '#68747d' : '#75828e';
-      context.textBaseline = frequency === maxFrequency
-        ? 'top'
-        : frequency === minFrequency
-          ? 'bottom'
-          : 'middle';
+      ticks.push({
+        frequency,
+        y,
+        baseline: frequency === maxFrequency
+          ? 'top'
+          : frequency === minFrequency
+            ? 'bottom'
+            : 'middle',
+      });
+    }
+    this.frequencyAxisTicks = ticks;
+
+    context.save();
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.fillStyle = this.isLightTheme
+      ? 'rgba(49, 59, 67, .24)'
+      : 'rgba(190, 211, 225, .16)';
+    for (const tick of ticks) {
+      drawDeviceHorizontalLine(
+        context,
+        plotRight,
+        plotRight + 4,
+        tick.y,
+        scaleX,
+        scaleY,
+        pixelWidth,
+        pixelHeight,
+      );
+    }
+    context.restore();
+
+    context.fillStyle = this.isLightTheme ? '#68747d' : '#75828e';
+    for (const { frequency, y, baseline } of ticks) {
+      context.textBaseline = baseline;
       context.fillText(formatFrequency(frequency), plotRight + AXIS_LABEL_INSET, y);
     }
   }
@@ -1514,6 +1694,24 @@ function labelsIntersect(a: TextBounds, b: TextBounds): boolean {
   return a.left - inset < b.right && a.right + inset > b.left && a.top - inset < b.bottom && a.bottom + inset > b.top;
 }
 
+function frequencyLabelVerticalBounds(
+  y: number,
+  baseline: CanvasTextBaseline | 'top' | 'bottom' | 'middle',
+): { top: number; bottom: number } {
+  const labelHeight = 12;
+  if (baseline === 'top' || baseline === 'hanging') return { top: y, bottom: y + labelHeight };
+  if (baseline === 'bottom' || baseline === 'ideographic') return { top: y - labelHeight, bottom: y };
+  return { top: y - labelHeight / 2, bottom: y + labelHeight / 2 };
+}
+
+function verticalBoundsIntersect(
+  a: { top: number; bottom: number },
+  b: { top: number; bottom: number },
+): boolean {
+  const inset = 1;
+  return a.top - inset < b.bottom && a.bottom + inset > b.top;
+}
+
 function fontPixelSize(font: string): number {
   const match = /([0-9.]+)px/.exec(font);
   return match ? Number(match[1]) : 10;
@@ -1597,7 +1795,53 @@ function spectrumPhysicalX(db: number, rangeDb: number, physicalWidth: number): 
   return Math.round(normalized * Math.max(0, physicalWidth - 1));
 }
 
-function snap(value: number, scale = window.devicePixelRatio || 1): number {
-  const physicalWidth = Math.max(1, scale);
-  return (Math.round(value * scale - physicalWidth / 2) + physicalWidth / 2) / scale;
+function drawDeviceVerticalLine(
+  context: CanvasRenderingContext2D,
+  x: number,
+  top: number,
+  bottom: number,
+  scaleX: number,
+  scaleY: number,
+  pixelWidth: number,
+  pixelHeight: number,
+): void {
+  const physicalX = clampDevicePixel(Math.round(x * scaleX), pixelWidth);
+  const [physicalTop, physicalBottom] = deviceSpan(top, bottom, scaleY, pixelHeight);
+  context.fillRect(physicalX, physicalTop, 1, physicalBottom - physicalTop);
+}
+
+function drawDeviceHorizontalLine(
+  context: CanvasRenderingContext2D,
+  left: number,
+  right: number,
+  y: number,
+  scaleX: number,
+  scaleY: number,
+  pixelWidth: number,
+  pixelHeight: number,
+): void {
+  const [physicalLeft, physicalRight] = deviceSpan(left, right, scaleX, pixelWidth);
+  const physicalY = clampDevicePixel(Math.round(y * scaleY), pixelHeight);
+  context.fillRect(physicalLeft, physicalY, physicalRight - physicalLeft, 1);
+}
+
+function deviceSpan(
+  start: number,
+  end: number,
+  scale: number,
+  limit: number,
+): [number, number] {
+  const first = clampDeviceBoundary(Math.round(Math.min(start, end) * scale), limit);
+  const last = clampDeviceBoundary(Math.round(Math.max(start, end) * scale), limit);
+  if (last > first) return [first, last];
+  const pixel = clampDevicePixel(first, limit);
+  return [pixel, Math.min(limit, pixel + 1)];
+}
+
+function clampDeviceBoundary(value: number, limit: number): number {
+  return Math.max(0, Math.min(limit, value));
+}
+
+function clampDevicePixel(value: number, limit: number): number {
+  return Math.max(0, Math.min(Math.max(0, limit - 1), value));
 }

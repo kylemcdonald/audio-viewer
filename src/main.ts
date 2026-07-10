@@ -201,6 +201,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <div class="panel-divider" id="panel-divider" role="separator" aria-label="Resize waveform and spectrogram panels" aria-orientation="horizontal" aria-valuemin="10" aria-valuemax="75" tabindex="0"><span></span></div>
         <section class="editor-panel spectral-panel" aria-label="Spectrogram view">
           <canvas id="spectral-canvas"></canvas>
+          <div class="spectrum-hover-frequency-mask" id="spectrum-hover-frequency-mask" aria-hidden="true"></div>
           <div class="spectrum-hover-frequency" id="spectrum-hover-frequency" aria-hidden="true"></div>
           <div class="frequency-axis-control" id="frequency-axis-control" role="slider" aria-label="Frequency scale blend" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100" aria-valuetext="Logarithmic" tabindex="0"></div>
           <div class="analysis-overlay" id="analysis-overlay" aria-live="polite">
@@ -282,6 +283,7 @@ const toastMessage = get<HTMLElement>('toast-message');
 const panelDivider = get<HTMLElement>('panel-divider');
 const frequencyAxisControl = get<HTMLElement>('frequency-axis-control');
 const spectrumHoverFrequencyLabel = get<HTMLElement>('spectrum-hover-frequency');
+const spectrumHoverFrequencyMask = get<HTMLElement>('spectrum-hover-frequency-mask');
 const settingsModal = get<HTMLDialogElement>('settings-modal');
 const settingsButton = get<HTMLButtonElement>('settings-button');
 const settingsClose = get<HTMLButtonElement>('settings-close');
@@ -358,11 +360,15 @@ const visualizer = new AudioVisualizer({
   spectralCanvas,
   spectrumCanvas,
   spectrumHoverFrequencyLabel,
+  spectrumHoverFrequencyMask,
   playhead: get<HTMLElement>('playhead'),
   onSeek: (time) => {
-    engine.seek(time);
-    visualizer.showPlayhead(time);
-    updateTimecode(time);
+    // While a WAV is still decoding, its AudioBuffer has its final length but
+    // only the leading, contiguous section is safe to play. Keep the visual
+    // cursor synchronized with the engine's clamped seek position.
+    const availableTime = engine.seek(time);
+    visualizer.showPlayhead(availableTime);
+    updateTimecode(availableTime);
   },
   onViewChange: (start, duration) => {
     analysisViewStart = start;
@@ -805,6 +811,11 @@ async function loadProgressiveWav(file: File, header: WavHeader, loadId: number)
   if (loadId !== fileLoadId) return;
 
   const playbackBuffer = engine.createBuffer(header.channels, header.frameCount, header.sampleRate);
+  // Install the final-sized buffer immediately. Its unfilled tail is never
+  // scheduled by AudioEngine, allowing users to play (or queue playback for)
+  // the decoded prefix while the remainder streams in from disk.
+  engine.setProgressiveBuffer(playbackBuffer);
+  updateTransportState();
   const chunkBytes = preferredWavChunkBytes(header);
   let processedBytes = 0;
   let frameStart = 0;
@@ -825,6 +836,7 @@ async function loadProgressiveWav(file: File, header: WavHeader, loadId: number)
     }
     visualizer.updateProgressiveAudio(frameStart, frameStart + decoded.frameCount);
     availableAudioSamples = frameStart + decoded.frameCount;
+    engine.updateProgressiveBufferAvailability(availableAudioSamples / header.sampleRate);
 
     const append: AnalysisAppend = {
       type: 'append',
@@ -840,8 +852,8 @@ async function loadProgressiveWav(file: File, header: WavHeader, loadId: number)
   }
 
   if (loadId !== fileLoadId) return;
-  engine.setBuffer(playbackBuffer);
   availableAudioSamples = header.frameCount;
+  engine.completeProgressiveBuffer();
   isReadingFile = false;
   fileSizeElement.textContent = formatFileSize(file.size);
   updateTransportState();
