@@ -444,8 +444,8 @@ select:focus-visible {
 }
 
 .settings-modal::backdrop {
-  background: rgba(3, 6, 9, 0.68);
-  backdrop-filter: blur(3px);
+  background: transparent;
+  backdrop-filter: none;
 }
 
 .settings-header {
@@ -556,7 +556,7 @@ select:focus-visible {
   position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 0 0;
-  grid-template-rows: minmax(72px, var(--wave-size, 25%)) 7px minmax(140px, 1fr);
+  grid-template-rows: minmax(72px, var(--wave-size, 25%)) 0 minmax(140px, 1fr);
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -568,7 +568,7 @@ select:focus-visible {
 }
 
 .editor-stack.has-spectrum-analyzer {
-  grid-template-columns: minmax(0, 1fr) 7px var(--spectrum-size, 12.5vw);
+  grid-template-columns: minmax(0, 1fr) 0 var(--spectrum-size, 12.5vw);
 }
 
 .editor-panel {
@@ -602,7 +602,7 @@ select:focus-visible {
   top: 25px;
   bottom: 0;
   right: 0;
-  width: 48px;
+  width: 38px;
   cursor: ns-resize;
   touch-action: none;
   transition: background 120ms ease, box-shadow 120ms ease;
@@ -625,22 +625,37 @@ select:focus-visible {
   display: grid;
   grid-row: 2;
   grid-column: 1;
-  border-top: 1px solid rgba(194, 216, 231, 0.24);
-  border-bottom: 1px solid rgba(0, 0, 0, 0.8);
-  background: linear-gradient(180deg, #252b32, #15191e);
+  align-self: center;
+  height: 9px;
+  border: 0;
+  background: transparent;
   place-items: center;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+  box-shadow: none;
   cursor: row-resize;
   touch-action: none;
-  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.panel-divider::before {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: transparent;
+  content: "";
+  transition: background 100ms ease;
 }
 
 .panel-divider:hover,
 .panel-divider:focus-visible,
 .panel-divider.is-dragging {
-  border-top-color: rgba(102, 240, 187, 0.65);
-  background: linear-gradient(180deg, #2c3b39, #172522);
   outline: none;
+}
+
+.panel-divider:hover::before,
+.panel-divider:focus-visible::before,
+.panel-divider.is-dragging::before {
+  background: rgba(102, 240, 187, 0.7);
 }
 
 .panel-divider span {
@@ -649,6 +664,14 @@ select:focus-visible {
   border-top: 1px solid rgba(220, 232, 240, 0.2);
   border-bottom: 1px solid rgba(0, 0, 0, 0.5);
   background: rgba(220, 232, 240, 0.06);
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+
+.panel-divider:hover span,
+.panel-divider:focus-visible span,
+.panel-divider.is-dragging span {
+  opacity: 1;
 }
 
 .spectrum-divider {
@@ -657,20 +680,36 @@ select:focus-visible {
   display: grid;
   grid-row: 1 / 4;
   grid-column: 2;
-  border-right: 1px solid rgba(0, 0, 0, 0.78);
-  border-left: 1px solid rgba(194, 216, 231, 0.2);
-  background: linear-gradient(90deg, #252b32, #15191e);
+  justify-self: center;
+  width: 9px;
+  border: 0;
+  background: transparent;
   cursor: col-resize;
   touch-action: none;
   place-items: center;
 }
 
+.spectrum-divider::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 1px;
+  background: transparent;
+  content: "";
+  transition: background 100ms ease;
+}
+
 .spectrum-divider:hover,
 .spectrum-divider:focus-visible,
 .spectrum-divider.is-dragging {
-  border-left-color: rgba(102, 240, 187, 0.65);
   outline: none;
-  background: linear-gradient(90deg, #2c3b39, #172522);
+}
+
+.spectrum-divider:hover::before,
+.spectrum-divider:focus-visible::before,
+.spectrum-divider.is-dragging::before {
+  background: rgba(102, 240, 187, 0.7);
 }
 
 .spectrum-divider span {
@@ -679,13 +718,21 @@ select:focus-visible {
   border-right: 1px solid rgba(0, 0, 0, 0.5);
   border-left: 1px solid rgba(220, 232, 240, 0.2);
   background: rgba(220, 232, 240, 0.06);
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+
+.spectrum-divider:hover span,
+.spectrum-divider:focus-visible span,
+.spectrum-divider.is-dragging span {
+  opacity: 1;
 }
 
 .spectrum-sidebar {
   display: grid;
   grid-row: 1 / 4;
   grid-column: 3;
-  grid-template-rows: minmax(72px, var(--wave-size, 25%)) 7px minmax(140px, 1fr);
+  grid-template-rows: minmax(72px, var(--wave-size, 25%)) 0 minmax(140px, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -699,10 +746,9 @@ select:focus-visible {
 
 .spectrum-horizontal-divider {
   grid-row: 2;
-  border-top: 1px solid rgba(194, 216, 231, 0.24);
-  border-bottom: 1px solid rgba(0, 0, 0, 0.8);
-  background: linear-gradient(180deg, #252b32, #15191e);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .spectrum-canvas-wrap {

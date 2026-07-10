@@ -1,7 +1,9 @@
+import FFT from 'fft.js';
 import { createPaletteLut, type PaletteName } from './palettes';
 import type { SpectrogramData } from './types';
 
-const AXIS_WIDTH = 48;
+const AXIS_WIDTH = 38;
+const AXIS_LABEL_INSET = 6;
 const SPECTRAL_RULER = 25;
 const UNLOADED_SPECTROGRAM_COLOR = 0xff000000;
 
@@ -151,6 +153,12 @@ export class AudioVisualizer {
   private analyzerFrame = 0;
   private cursorTime = 0;
   private spectrumAnalyzerOpen = false;
+  private spectrumFftSize = 2048;
+  private realtimeFft: FFT | null = null;
+  private realtimeInput = new Float64Array(0);
+  private realtimeWindow = new Float64Array(0);
+  private realtimeComplex: number[] = [];
+  private realtimeDb = new Float32Array(0);
   private pinch: PinchGesture | null = null;
   private scrubbingPointer: number | null = null;
   private touchSeekTimer = 0;
@@ -248,12 +256,21 @@ export class AudioVisualizer {
     this.requestAnalyzerRender();
   }
 
+  setSpectrumFftSize(fftSize: number): void {
+    const next = Math.max(2, Math.round(fftSize));
+    if (next === this.spectrumFftSize) return;
+    this.spectrumFftSize = next;
+    this.realtimeFft = null;
+    this.requestAnalyzerRender();
+  }
+
   setPlaybackState(active: boolean, mode: PlaybackFollowMode): void {
     if (this.playbackActive === active && this.playbackFollowMode === mode) return;
     this.playbackActive = active;
     this.playbackFollowMode = mode;
     this.rulerLock = null;
     this.requestRender();
+    this.requestAnalyzerRender();
   }
 
   frequencyAtClientY(clientY: number): number {
@@ -302,9 +319,9 @@ export class AudioVisualizer {
   }
 
   showPlayhead(time: number): void {
-    const previousSpectrumColumn = this.spectrumColumnAtTime(this.cursorTime);
+    const changed = Math.abs(time - this.cursorTime) > 1e-9;
     this.cursorTime = time;
-    if (previousSpectrumColumn !== this.spectrumColumnAtTime(time)) this.requestAnalyzerRender();
+    if (this.playbackActive || changed) this.requestAnalyzerRender();
     if (!this.duration) {
       this.playhead.classList.remove('is-visible');
       return;
@@ -555,7 +572,7 @@ export class AudioVisualizer {
         if (sign < 0 || db !== 0) {
           context.fillStyle = db === 0 ? '#9aa6b2' : '#687581';
           const labelY = Math.max(7, Math.min(height - 7, y));
-          context.fillText(db === 0 ? '0 dB' : `${db}`, plotRight + 9, labelY);
+          context.fillText(db === 0 ? '0 dB' : `${db}`, plotRight + AXIS_LABEL_INSET, labelY);
         }
       }
     }
@@ -566,7 +583,7 @@ export class AudioVisualizer {
     context.lineTo(plotRight, snap(mid));
     context.stroke();
     context.fillStyle = '#5d6974';
-    context.fillText('-∞', plotRight + 9, mid);
+    context.fillText('-∞', plotRight + AXIS_LABEL_INSET, mid);
 
     if (this.peaks && this.samples) {
       const dpr = window.devicePixelRatio || 1;
@@ -707,9 +724,8 @@ export class AudioVisualizer {
       context.fillText(tick.label, tick.x, SPECTRAL_RULER / 2 + 0.5);
     }
 
-    const data = this.spectrogram;
-    const column = this.spectrumColumnAtTime(this.cursorTime);
-    if (!data || column === null || width <= 0 || height <= SPECTRAL_RULER) return;
+    const spectrum = this.computeRealtimeSpectrum();
+    if (!spectrum || width <= 0 || height <= SPECTRAL_RULER) return;
     const physicalWidth = Math.max(1, Math.round(width * dpr));
     const physicalHeight = Math.max(1, Math.round(height * dpr));
     const plotTop = Math.min(physicalHeight - 1, Math.round(SPECTRAL_RULER * dpr));
@@ -727,9 +743,9 @@ export class AudioVisualizer {
     for (let y = plotTop; y < physicalHeight; y += 1) {
       const scaled = 1 - (y - plotTop) / Math.max(1, plotHeight - 1);
       const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
-      const normalizedRow = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
-      const row = Math.max(0, Math.min(data.rows - 1, Math.round(normalizedRow * (data.rows - 1))));
-      const db = data.values[column * data.rows + row] / 10;
+      const normalizedBin = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
+      const bin = Math.max(0, Math.min(spectrum.length - 1, Math.round(normalizedBin * (spectrum.length - 1))));
+      const db = spectrum[bin];
       const normalizedDb = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
       const x = Math.round(normalizedDb * (physicalWidth - 1));
       if (y === plotTop) context.fillRect(x, y, 1, 1);
@@ -740,22 +756,41 @@ export class AudioVisualizer {
     context.restore();
   }
 
-  private spectrumColumnAtTime(time: number): number | null {
-    const data = this.spectrogram;
-    if (!data) return null;
-    const tolerance = Math.max(
-      data.secondsPerColumn / 2,
-      data.fftSize / (2 * data.sampleRate),
-    );
-    if (
-      time < data.startTime - tolerance ||
-      time > data.endTime + tolerance ||
-      time > this.availableSamples / this.sampleRate + tolerance
-    ) return null;
-    return Math.max(0, Math.min(
-      data.columns - 1,
-      Math.round((time - data.startTime) / data.secondsPerColumn),
-    ));
+  private computeRealtimeSpectrum(): Float32Array | null {
+    if (!this.samples || this.availableSamples <= 0 || this.cursorTime < 0 || this.cursorTime > this.duration) {
+      return null;
+    }
+    this.prepareRealtimeFft();
+    const fft = this.realtimeFft!;
+    const center = Math.round(this.cursorTime * this.sampleRate);
+    const start = center - Math.floor(this.spectrumFftSize / 2);
+    if (center >= this.availableSamples + this.spectrumFftSize / 2) return null;
+
+    for (let index = 0; index < this.spectrumFftSize; index += 1) {
+      const source = start + index;
+      const sample = source >= 0 && source < this.availableSamples ? this.samples[source] : 0;
+      this.realtimeInput[index] = sample * this.realtimeWindow[index];
+    }
+    fft.realTransform(this.realtimeComplex, this.realtimeInput);
+    for (let bin = 0; bin < this.realtimeDb.length; bin += 1) {
+      const real = this.realtimeComplex[bin * 2];
+      const imaginary = this.realtimeComplex[bin * 2 + 1];
+      const magnitude = Math.sqrt(real * real + imaginary * imaginary) * (4 / this.spectrumFftSize);
+      this.realtimeDb[bin] = 20 * Math.log10(Math.max(magnitude, 1e-10));
+    }
+    return this.realtimeDb;
+  }
+
+  private prepareRealtimeFft(): void {
+    if (this.realtimeFft?.size === this.spectrumFftSize) return;
+    this.realtimeFft = new FFT(this.spectrumFftSize);
+    this.realtimeInput = new Float64Array(this.spectrumFftSize);
+    this.realtimeWindow = new Float64Array(this.spectrumFftSize);
+    this.realtimeComplex = this.realtimeFft.createComplexArray();
+    this.realtimeDb = new Float32Array(this.spectrumFftSize / 2);
+    for (let index = 0; index < this.spectrumFftSize; index += 1) {
+      this.realtimeWindow[index] = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (this.spectrumFftSize - 1));
+    }
   }
 
   private drawTimeGrid(
@@ -778,12 +813,12 @@ export class AudioVisualizer {
     for (const tick of ticks) {
       const { time, x } = tick;
       if (x < -1 || x > plotRight + 1) continue;
-      context.strokeStyle = withLabels ? 'rgba(183, 202, 219, .10)' : 'rgba(183, 202, 219, .07)';
+      context.strokeStyle = withLabels ? 'rgba(183, 202, 219, .13)' : 'rgba(183, 202, 219, .07)';
       context.lineWidth = 1;
       context.beginPath();
       if (withLabels) {
         context.moveTo(snap(x), SPECTRAL_RULER - 4);
-        context.lineTo(snap(x), SPECTRAL_RULER);
+        context.lineTo(snap(x), plotBottom);
       } else {
         context.moveTo(snap(x), plotTop);
         context.lineTo(snap(x), plotBottom);
@@ -867,9 +902,9 @@ export class AudioVisualizer {
         frequency !== maxFrequency
       ) continue;
       lastY = y;
-      context.strokeStyle = 'rgba(190, 211, 225, .2)';
+      context.strokeStyle = 'rgba(190, 211, 225, .16)';
       context.beginPath();
-      context.moveTo(plotRight, snap(y));
+      context.moveTo(0, snap(y));
       context.lineTo(plotRight + 4, snap(y));
       context.stroke();
       context.fillStyle = '#75828e';
@@ -878,7 +913,7 @@ export class AudioVisualizer {
         : frequency === minFrequency
           ? 'bottom'
           : 'middle';
-      context.fillText(formatFrequency(frequency), plotRight + 9, y);
+      context.fillText(formatFrequency(frequency), plotRight + AXIS_LABEL_INSET, y);
     }
   }
 

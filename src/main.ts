@@ -59,8 +59,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 
       <div class="header-actions">
         <button class="header-icon-button" id="spectrum-button" type="button" aria-label="Open spectrum analyzer" aria-controls="spectrum-analyzer" aria-expanded="false" aria-pressed="false" title="Spectrum analyzer">${spectrumIcon}</button>
-        <button class="header-icon-button" id="settings-button" type="button" aria-label="Spectrogram settings" aria-haspopup="dialog" aria-controls="settings-modal" aria-expanded="false" title="Spectrogram settings">${gearIcon}</button>
         <button class="header-icon-button" id="download-button" type="button" aria-label="Download spectrogram as PNG" title="Download spectrogram as PNG" disabled>${downloadIcon}</button>
+        <button class="header-icon-button" id="settings-button" type="button" aria-label="Spectrogram settings" aria-haspopup="dialog" aria-controls="settings-modal" aria-expanded="false" title="Spectrogram settings">${gearIcon}</button>
       </div>
     </header>
 
@@ -317,6 +317,7 @@ settingsModal.addEventListener('click', (event) => {
 
 fftSlider.addEventListener('input', () => {
   updateFftControl();
+  visualizer.setSpectrumFftSize(fftBins[Number(fftSlider.value)] * 2);
   scheduleSettingsSave();
   window.clearTimeout(fftDebounce);
   fftDebounce = window.setTimeout(() => analyzeCurrentAudio(), 220);
@@ -1244,15 +1245,13 @@ function hideAnalysisOverlay(): void {
 
 function resizePanelsAt(clientY: number): void {
   const rect = editor.getBoundingClientRect();
-  const dividerHeight = panelDivider.offsetHeight;
-  const available = Math.max(1, rect.height - dividerHeight);
-  wavePanelRatio = (clientY - rect.top - dividerHeight / 2) / available;
+  const available = Math.max(1, rect.height);
+  wavePanelRatio = (clientY - rect.top) / available;
   applyPanelRatio();
 }
 
 function applyPanelRatio(): void {
-  const dividerHeight = panelDivider.offsetHeight || 7;
-  const available = Math.max(1, editor.clientHeight - dividerHeight);
+  const available = Math.max(1, editor.clientHeight);
   const minWave = Math.min(96, available * 0.32);
   const minSpectral = Math.min(180, available * 0.48);
   const waveHeight = Math.max(minWave, Math.min(available - minSpectral, wavePanelRatio * available));
@@ -1273,7 +1272,7 @@ function maximumSpectrumAnalyzerWidth(): number {
 
 function resizeSpectrumAnalyzerAt(clientX: number): void {
   const rect = editor.getBoundingClientRect();
-  spectrumAnalyzerWidth = rect.right - clientX + spectrumDividerGrabOffset - spectrumDivider.offsetWidth;
+  spectrumAnalyzerWidth = rect.right - clientX + spectrumDividerGrabOffset - spectrumDivider.offsetWidth / 2;
   applySpectrumAnalyzerLayout();
 }
 
@@ -1325,6 +1324,7 @@ function downloadSpectrogramPng(): void {
 
 function initialize(): void {
   updateFftControl();
+  visualizer.setSpectrumFftSize(fftBins[Number(fftSlider.value)] * 2);
   updateDbRangeControl();
   visualizer.setSpectralRange(Number(dbRangeSlider.value));
   visualizer.setColorPalette(isPaletteName(paletteSelect.value) ? paletteSelect.value : 'viridis');
