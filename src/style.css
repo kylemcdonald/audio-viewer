@@ -567,6 +567,18 @@ select:focus-visible {
   background: #000;
 }
 
+.spectrum-interpolation-control.is-disabled {
+  opacity: 0.42;
+}
+
+.spectrum-interpolation-control.is-disabled .palette-select {
+  cursor: not-allowed;
+}
+
+.spectrum-interpolation-control.is-disabled .palette-select-row::after {
+  opacity: 0.45;
+}
+
 .open-button svg {
   width: 17px;
   height: 17px;

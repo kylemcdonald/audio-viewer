@@ -8,7 +8,7 @@ const SPECTRAL_RULER = 25;
 const UNLOADED_SPECTROGRAM_COLOR = 0xff000000;
 
 export type PlaybackFollowMode = 'center' | 'right' | 'page';
-export type SpectrumDrawStyle = 'outline' | 'filled' | 'bars' | 'lines';
+export type SpectrumDrawStyle = 'outline' | 'filled' | 'bars' | 'lines' | 'points';
 export type SpectrumInterpolation = 'nearest' | 'linear';
 export type ThemeMode = 'dark' | 'light';
 
@@ -157,7 +157,7 @@ export class AudioVisualizer {
   private cursorTime = 0;
   private spectrumAnalyzerOpen = false;
   private spectrumFftSize = 2048;
-  private spectrumDrawStyle: SpectrumDrawStyle = 'outline';
+  private spectrumDrawStyle: SpectrumDrawStyle = 'filled';
   private spectrumInterpolation: SpectrumInterpolation = 'nearest';
   private theme: ThemeMode = 'dark';
   private realtimeFft: FFT | null = null;
@@ -398,6 +398,14 @@ export class AudioVisualizer {
     return this.theme === 'light';
   }
 
+  private get signalColor(): string {
+    return this.isLightTheme ? '#177b57' : '#63efb4';
+  }
+
+  private get pointColor(): string {
+    return this.isLightTheme ? '#000' : '#fff';
+  }
+
   private bindInteractions(): void {
     this.editor.addEventListener('pointerdown', (event) => this.pointerDown(event));
     this.editor.addEventListener('pointermove', (event) => this.pointerMove(event));
@@ -630,7 +638,7 @@ export class AudioVisualizer {
       context.save();
       context.setTransform(1, 0, 0, 1, 0, 0);
       context.imageSmoothingEnabled = false;
-      context.fillStyle = '#63efb4';
+      context.fillStyle = this.signalColor;
       for (let pixel = 0; pixel < physicalWidth; pixel += 1) {
         const from = sampleStart + pixel * samplesPerPhysicalPixel;
         if (from >= this.availableSamples) continue;
@@ -645,7 +653,7 @@ export class AudioVisualizer {
       context.restore();
     }
 
-    this.drawWaveformBorder(context, width, height);
+    this.drawWaveformBorder(context, plotRight, height);
     context.fillStyle = light ? '#68747d' : '#74818d';
     context.font = '600 9px Inter, ui-sans-serif, system-ui, sans-serif';
     context.textAlign = 'left';
@@ -707,7 +715,8 @@ export class AudioVisualizer {
           }
           const db = values[column * rows + row] / 10;
           const normalized = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
-          packed[offset + x] = this.colorLut[Math.round(normalized * 255)];
+          const color = this.colorLut[Math.round(normalized * 255)];
+          packed[offset + x] = this.isLightTheme ? invertPackedColor(color) : color;
         }
       }
       context.setTransform(1, 0, 0, 1, 0, 0);
@@ -738,7 +747,8 @@ export class AudioVisualizer {
     context.fillStyle = light ? '#fff' : '#000';
     context.fillRect(0, 0, width, SPECTRAL_RULER);
 
-    this.drawSpectrumAnalyzerGrid(context, width, height);
+    const amplitudeTicks = this.spectrumAmplitudeTicks(width);
+    this.drawSpectrumAnalyzerGrid(context, width, height, amplitudeTicks);
 
     context.strokeStyle = light ? 'rgba(48, 59, 67, .23)' : 'rgba(196, 216, 230, .15)';
     context.lineWidth = 1;
@@ -750,11 +760,6 @@ export class AudioVisualizer {
     context.fillStyle = '#65727d';
     context.font = '9px "Chivo Mono", ui-monospace, monospace';
     context.textBaseline = 'middle';
-    const amplitudeTicks = [
-      { x: 5, align: 'left' as const, label: `-${this.spectralRangeDb}` },
-      { x: width / 2, align: 'center' as const, label: `-${Math.round(this.spectralRangeDb / 2)}` },
-      { x: width - 5, align: 'right' as const, label: '0' },
-    ];
     for (const tick of amplitudeTicks) {
       context.textAlign = tick.align;
       context.fillText(tick.label, tick.x, SPECTRAL_RULER / 2 + 0.5);
@@ -766,18 +771,24 @@ export class AudioVisualizer {
     const physicalHeight = Math.max(1, Math.round(height * dpr));
     const plotTop = Math.min(physicalHeight - 1, Math.round(SPECTRAL_RULER * dpr));
     const plotHeight = Math.max(1, physicalHeight - plotTop);
-    const trace = this.spectrumTrace(spectrum, physicalWidth, plotHeight);
+    const trace = this.spectrumDrawStyle === 'filled' || this.spectrumDrawStyle === 'outline'
+      ? this.spectrumTrace(spectrum, physicalWidth, plotHeight)
+      : null;
 
     context.save();
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.imageSmoothingEnabled = false;
     if (this.spectrumDrawStyle === 'filled') {
-      context.fillStyle = '#63efb4';
-      for (let row = 0; row < trace.length; row += 1) {
-        context.fillRect(0, plotTop + row, trace[row] + 1, 1);
+      context.fillStyle = this.signalColor;
+      for (let row = 0; row < trace!.length; row += 1) {
+        context.fillRect(0, plotTop + row, trace![row] + 1, 1);
       }
-    } else if (this.spectrumDrawStyle === 'bars' || this.spectrumDrawStyle === 'lines') {
-      context.fillStyle = '#63efb4';
+    } else if (
+      this.spectrumDrawStyle === 'bars' ||
+      this.spectrumDrawStyle === 'lines' ||
+      this.spectrumDrawStyle === 'points'
+    ) {
+      context.fillStyle = this.spectrumDrawStyle === 'points' ? this.pointColor : this.signalColor;
       this.drawSpectrumBins(
         context,
         spectrum,
@@ -787,8 +798,8 @@ export class AudioVisualizer {
         this.spectrumDrawStyle,
       );
     } else {
-      context.fillStyle = '#63efb4';
-      this.drawSpectrumOutline(context, spectrum, trace, physicalWidth, plotTop, plotHeight);
+      context.fillStyle = this.signalColor;
+      this.drawSpectrumOutline(context, spectrum, trace!, physicalWidth, plotTop, plotHeight);
     }
     context.restore();
   }
@@ -799,7 +810,7 @@ export class AudioVisualizer {
     physicalWidth: number,
     plotTop: number,
     plotHeight: number,
-    style: 'bars' | 'lines',
+    style: 'bars' | 'lines' | 'points',
   ): void {
     const maxFrequency = this.sampleRate / 2;
     const minFrequency = this.minimumFrequency;
@@ -809,16 +820,38 @@ export class AudioVisualizer {
       const scaled = scaleFrequency(normalized, this.scaleBlend, maxFrequency, minFrequency);
       const x = spectrumPhysicalX(spectrum[bin], this.spectralRangeDb, physicalWidth);
       const y = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
-      if (style === 'bars') context.rect(0, y, x + 1, 1);
-      else context.rect(x, y, 1, 1);
+      if (style === 'lines') {
+        context.rect(0, y, x + 1, 1);
+      } else if (style === 'points') {
+        context.rect(x, y, 1, 1);
+      } else {
+        const lowerBoundary = Math.max(0, (bin - 0.5) / Math.max(1, spectrum.length - 1));
+        const upperBoundary = Math.min(1, (bin + 0.5) / Math.max(1, spectrum.length - 1));
+        const lowerY = this.spectrumBinBoundaryY(lowerBoundary, plotTop, plotHeight);
+        const upperY = this.spectrumBinBoundaryY(upperBoundary, plotTop, plotHeight);
+        const top = Math.min(lowerY, upperY);
+        const height = Math.abs(lowerY - upperY);
+        context.rect(0, top, x + 1, Math.max(1, height - 1));
+      }
     }
     context.fill();
+  }
+
+  private spectrumBinBoundaryY(normalized: number, plotTop: number, plotHeight: number): number {
+    const scaled = scaleFrequency(
+      normalized,
+      this.scaleBlend,
+      this.sampleRate / 2,
+      this.minimumFrequency,
+    );
+    return plotTop + plotHeight - Math.round(scaled * plotHeight);
   }
 
   private drawSpectrumAnalyzerGrid(
     context: CanvasRenderingContext2D,
     width: number,
     height: number,
+    amplitudeTicks: Array<{ gridX: number }>,
   ): void {
     if (width <= 0 || height <= SPECTRAL_RULER) return;
     context.save();
@@ -827,7 +860,8 @@ export class AudioVisualizer {
       ? 'rgba(48, 59, 67, .16)'
       : 'rgba(190, 211, 225, .11)';
     context.beginPath();
-    for (const x of [0.5, width / 2, width - 0.5]) {
+    for (const tick of amplitudeTicks) {
+      const x = tick.gridX <= 0 ? 0.5 : tick.gridX >= width ? width - 0.5 : tick.gridX;
       context.moveTo(snap(x), SPECTRAL_RULER);
       context.lineTo(snap(x), height);
     }
@@ -850,6 +884,33 @@ export class AudioVisualizer {
     }
     context.stroke();
     context.restore();
+  }
+
+  private spectrumAmplitudeTicks(width: number): Array<{
+    gridX: number;
+    x: number;
+    align: CanvasTextAlign;
+    label: string;
+  }> {
+    const range = this.spectralRangeDb;
+    const maximumLabels = Math.max(3, Math.floor(width / 78) + 1);
+    const candidates = [3, 6, 10, 12, 15, 20, 30, 40, 60];
+    const step = candidates.find((candidate) => Math.ceil(range / candidate) + 1 <= maximumLabels) ?? range;
+    const values = [-range];
+    for (let db = -range + step; db < -1e-6; db += step) values.push(db);
+    if (values[values.length - 1] !== 0) values.push(0);
+
+    return values.map((db) => {
+      const gridX = ((db + range) / range) * width;
+      const atMinimum = db <= -range + 1e-6;
+      const atMaximum = db >= -1e-6;
+      return {
+        gridX,
+        x: atMinimum ? 5 : atMaximum ? width - 5 : gridX,
+        align: atMinimum ? 'left' : atMaximum ? 'right' : 'center',
+        label: db === 0 ? '0' : `${Math.round(db)}`,
+      };
+    });
   }
 
   private spectrumTrace(
@@ -1085,12 +1146,12 @@ export class AudioVisualizer {
     }
   }
 
-  private drawWaveformBorder(context: CanvasRenderingContext2D, width: number, height: number): void {
+  private drawWaveformBorder(context: CanvasRenderingContext2D, plotRight: number, height: number): void {
     context.strokeStyle = this.isLightTheme
       ? 'rgba(49, 59, 67, .32)'
       : 'rgba(190, 210, 224, .16)';
     context.lineWidth = 1;
-    context.strokeRect(0.5, 0.5, Math.max(0, width - 1), Math.max(0, height - 1));
+    context.strokeRect(0.5, 0.5, Math.max(0, plotRight - 1), Math.max(0, height - 1));
   }
 }
 
@@ -1229,6 +1290,10 @@ function drawPixelLine(
 function spectrumPhysicalX(db: number, rangeDb: number, physicalWidth: number): number {
   const normalized = Math.max(0, Math.min(1, (db + rangeDb) / rangeDb));
   return Math.round(normalized * Math.max(0, physicalWidth - 1));
+}
+
+function invertPackedColor(color: number): number {
+  return (color & 0xff000000) | ((~color) & 0x00ffffff);
 }
 
 function snap(value: number): number {
