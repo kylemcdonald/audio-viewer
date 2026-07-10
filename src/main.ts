@@ -20,21 +20,31 @@ const icon = (path: string, viewBox = '0 0 24 24') => `
 const playIcon = icon('<path d="M8 5.6v12.8c0 .8.9 1.3 1.6.8l9-6.4a1 1 0 0 0 0-1.6l-9-6.4A1 1 0 0 0 8 5.6Z" fill="currentColor"/>');
 const pauseIcon = icon('<path d="M7 5.5h3.5v13H7v-13Zm6.5 0H17v13h-3.5v-13Z" fill="currentColor"/>');
 const folderIcon = icon('<path d="M3.5 7.5h6l1.7 2H20.5v8.8a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7V7.5Zm0 0V6.7A1.7 1.7 0 0 1 5.2 5h4l1.6 2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>');
+const importIcon = icon('<path d="M13.5 4H18a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4.5M4 12h11m-4-4 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"/>');
+const spectrumIcon = icon('<path d="M3 17.5h18M4 15l2.3-5 2.2 3.2L11 6l2.2 8 2.3-5.6 1.8 4.2L20 5.5" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>');
 const gearIcon = icon('<path d="M12 8.3a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4Zm7.7 4.9v-2.4l-2-.7a6.3 6.3 0 0 0-.7-1.6l.9-1.9-1.7-1.7-1.9.9a6.3 6.3 0 0 0-1.6-.7l-.7-2h-2.4l-.7 2a6.3 6.3 0 0 0-1.6.7l-1.9-.9-1.7 1.7.9 1.9a6.3 6.3 0 0 0-.7 1.6l-2 .7v2.4l2 .7c.2.6.4 1.1.7 1.6l-.9 1.9 1.7 1.7 1.9-.9c.5.3 1 .6 1.6.7l.7 2H13l.7-2c.6-.2 1.1-.4 1.6-.7l1.9.9 1.7-1.7-.9-1.9c.3-.5.6-1 .7-1.6l2-.7Z" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>');
+const downloadIcon = icon('<path d="M12 3.5v11m-4-4 4 4 4-4M5 19.5h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>');
 const closeIcon = icon('<path d="m7 7 10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>');
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <main class="workbench">
     <header class="topbar">
-      <div class="file-identity is-empty" id="file-identity">
-        <div class="file-name-row">
+      <div class="header-leading">
+        <label class="open-button icon-only" for="file-input" role="button" tabindex="0" aria-label="Import audio" title="Import audio">
+          ${importIcon}
+        </label>
+        <input id="file-input" type="file" accept="audio/*,video/mp4,.wav,.wave,.mp3,.m4a,.mp4,.aac,.flac,.ogg,.opus" hidden />
+        <div class="file-identity is-empty" id="file-identity">
           <strong id="file-name"></strong>
-          <span class="file-size" id="file-size"></span>
-          <span class="file-format is-empty" id="file-format">
-            <span id="format-status"></span>
-            <i></i>
-            <span id="channel-status"></span>
-          </span>
+          <div class="file-meta-row">
+            <span class="file-size" id="file-size"></span>
+            <span class="file-format is-empty" id="file-format">
+              <i></i>
+              <span id="format-status"></span>
+              <i></i>
+              <span id="channel-status"></span>
+            </span>
+          </div>
         </div>
       </div>
 
@@ -48,11 +58,9 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       </div>
 
       <div class="header-actions">
-        <button class="settings-button" id="settings-button" type="button" aria-label="Spectrogram settings" aria-haspopup="dialog" aria-controls="settings-modal" aria-expanded="false">${gearIcon}</button>
-        <label class="open-button icon-only" for="file-input" role="button" tabindex="0" aria-label="Open audio" title="Open audio">
-          ${folderIcon}
-        </label>
-        <input id="file-input" type="file" accept="audio/*,video/mp4,.wav,.wave,.mp3,.m4a,.mp4,.aac,.flac,.ogg,.opus" hidden />
+        <button class="header-icon-button" id="spectrum-button" type="button" aria-label="Open spectrum analyzer" aria-controls="spectrum-analyzer" aria-expanded="false" aria-pressed="false" title="Spectrum analyzer">${spectrumIcon}</button>
+        <button class="header-icon-button" id="settings-button" type="button" aria-label="Spectrogram settings" aria-haspopup="dialog" aria-controls="settings-modal" aria-expanded="false" title="Spectrogram settings">${gearIcon}</button>
+        <button class="header-icon-button" id="download-button" type="button" aria-label="Download spectrogram as PNG" title="Download spectrogram as PNG" disabled>${downloadIcon}</button>
       </div>
     </header>
 
@@ -138,6 +146,15 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
         </section>
 
+        <div class="spectrum-divider" id="spectrum-divider" role="separator" aria-label="Resize spectrum analyzer" aria-orientation="vertical" aria-valuemin="96" tabindex="0" data-timeline-exempt hidden><span></span></div>
+        <aside class="spectrum-sidebar" id="spectrum-analyzer" aria-label="Spectrum at the playback cursor" data-timeline-exempt hidden>
+          <div class="spectrum-wave-spacer" aria-hidden="true"></div>
+          <div class="spectrum-horizontal-divider" aria-hidden="true"></div>
+          <div class="spectrum-canvas-wrap">
+            <canvas id="spectrum-canvas"></canvas>
+          </div>
+        </aside>
+
         <div class="editor-playhead" id="playhead" aria-hidden="true">
           <span class="playhead-cap"></span>
           <span class="playhead-line"></span>
@@ -161,6 +178,9 @@ const get = <T extends HTMLElement>(id: string): T => document.getElementById(id
 
 const engine = new AudioEngine();
 const editor = get<HTMLDivElement>('editor');
+const waveCanvas = get<HTMLCanvasElement>('wave-canvas');
+const spectralCanvas = get<HTMLCanvasElement>('spectral-canvas');
+const spectrumCanvas = get<HTMLCanvasElement>('spectrum-canvas');
 const playButton = get<HTMLButtonElement>('play-button');
 const currentTimeElement = get<HTMLSpanElement>('current-time');
 const totalTimeElement = get<HTMLSpanElement>('total-time');
@@ -189,6 +209,10 @@ const frequencyAxisControl = get<HTMLElement>('frequency-axis-control');
 const settingsModal = get<HTMLDialogElement>('settings-modal');
 const settingsButton = get<HTMLButtonElement>('settings-button');
 const settingsClose = get<HTMLButtonElement>('settings-close');
+const spectrumButton = get<HTMLButtonElement>('spectrum-button');
+const downloadButton = get<HTMLButtonElement>('download-button');
+const spectrumDivider = get<HTMLElement>('spectrum-divider');
+const spectrumAnalyzer = get<HTMLElement>('spectrum-analyzer');
 
 const SETTINGS_STORAGE_KEY = 'audio-spectrogram.settings.v1';
 const persistedSettings = readPersistedSettings();
@@ -223,6 +247,15 @@ let wavePanelRatio = clampNumber(persistedSettings?.paneRatio, 0.25, 0.1, 0.75);
 let dividerPointer: number | null = null;
 let frequencyScaleBlend = clampNumber(persistedSettings?.frequencyScale, 1, 0, 1);
 let frequencyScaleDrag: { pointerId: number; anchorFrequency: number } | null = null;
+let spectrumAnalyzerOpen = persistedSettings?.spectrumAnalyzerOpen === true;
+let spectrumAnalyzerWidth = clampNumber(
+  persistedSettings?.spectrumAnalyzerWidth,
+  defaultSpectrumAnalyzerWidth(),
+  96,
+  Math.max(96, window.innerWidth * 0.45),
+);
+let spectrumDividerPointer: number | null = null;
+let spectrumDividerGrabOffset = 0;
 let overlayTimer = 0;
 let overlayToken = 0;
 let playbackFollowMode = playbackFollowSelect.value as PlaybackFollowMode;
@@ -232,8 +265,9 @@ const fftBins = [256, 512, 1024, 2048, 4096] as const;
 
 const visualizer = new AudioVisualizer({
   editor,
-  waveCanvas: get<HTMLCanvasElement>('wave-canvas'),
-  spectralCanvas: get<HTMLCanvasElement>('spectral-canvas'),
+  waveCanvas,
+  spectralCanvas,
+  spectrumCanvas,
   playhead: get<HTMLElement>('playhead'),
   onSeek: (time) => {
     engine.seek(time);
@@ -252,6 +286,12 @@ engine.onEnded = () => {
 };
 
 playButton.addEventListener('click', () => void togglePlayback());
+downloadButton.addEventListener('click', downloadSpectrogramPng);
+spectrumButton.addEventListener('click', () => {
+  spectrumAnalyzerOpen = !spectrumAnalyzerOpen;
+  applySpectrumAnalyzerLayout();
+  scheduleSettingsSave();
+});
 
 settingsButton.addEventListener('click', () => {
   if (settingsModal.open) return;
@@ -382,6 +422,46 @@ panelDivider.addEventListener('keydown', (event) => {
   scheduleSettingsSave();
 });
 
+spectrumDivider.addEventListener('pointerdown', (event) => {
+  if (event.button > 0 || !spectrumAnalyzerOpen) return;
+  event.preventDefault();
+  event.stopPropagation();
+  spectrumDividerPointer = event.pointerId;
+  spectrumDividerGrabOffset = event.clientX - spectrumDivider.getBoundingClientRect().left;
+  spectrumDivider.setPointerCapture(event.pointerId);
+  spectrumDivider.classList.add('is-dragging');
+  resizeSpectrumAnalyzerAt(event.clientX);
+});
+
+spectrumDivider.addEventListener('pointermove', (event) => {
+  if (spectrumDividerPointer !== event.pointerId) return;
+  event.preventDefault();
+  event.stopPropagation();
+  resizeSpectrumAnalyzerAt(event.clientX);
+});
+
+const finishSpectrumDividerDrag = (event: PointerEvent) => {
+  if (spectrumDividerPointer !== event.pointerId) return;
+  event.stopPropagation();
+  spectrumDividerPointer = null;
+  spectrumDividerGrabOffset = 0;
+  spectrumDivider.classList.remove('is-dragging');
+  scheduleSettingsSave();
+};
+
+spectrumDivider.addEventListener('pointerup', finishSpectrumDividerDrag);
+spectrumDivider.addEventListener('pointercancel', finishSpectrumDividerDrag);
+spectrumDivider.addEventListener('keydown', (event) => {
+  if (!spectrumAnalyzerOpen) return;
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  if (event.key === 'Home') spectrumAnalyzerWidth = defaultSpectrumAnalyzerWidth();
+  else if (event.key === 'End') spectrumAnalyzerWidth = 96;
+  else spectrumAnalyzerWidth += event.key === 'ArrowLeft' ? 12 : -12;
+  applySpectrumAnalyzerLayout();
+  scheduleSettingsSave();
+});
+
 fileInput.addEventListener('change', () => {
   const file = fileInput.files?.[0];
   if (file) void loadFile(file);
@@ -435,6 +515,7 @@ window.addEventListener('drop', (event) => {
 
 window.addEventListener('resize', () => {
   applyPanelRatio();
+  applySpectrumAnalyzerLayout();
   scheduleViewportAnalysis(90);
 });
 window.addEventListener('pagehide', persistSettings);
@@ -542,6 +623,7 @@ async function loadFile(file: File): Promise<void> {
     analysisWorker?.terminate();
     analysisWorker = null;
     latestSpectrogram = null;
+    updateDownloadState();
     activeAnalysisRequest = null;
     visualizer.clearAudio();
     hideAnalysisOverlay();
@@ -559,6 +641,7 @@ function prepareFileLoad(file: File): void {
   audioDuration = 0;
   monoSamples = null;
   latestSpectrogram = null;
+  updateDownloadState();
   activeAnalysisRequest = null;
   activeMp4Session?.dispose();
   activeMp4Session = null;
@@ -738,6 +821,7 @@ async function loadWithBrowserDecoder(file: File, loadId: number): Promise<void>
   audioDuration = buffer.duration;
   availableAudioSamples = monoSamples.length;
   latestSpectrogram = null;
+  updateDownloadState();
   activeAnalysisRequest = null;
   visualizer.setSpectrogram(null);
   visualizer.setAudio(monoSamples, buffer.sampleRate, buffer.duration);
@@ -943,6 +1027,7 @@ function handleAnalysisMessage(event: MessageEvent<AnalysisMessage>): void {
     secondsPerColumn: message.data.secondsPerColumn,
   };
   latestSpectrogram = data;
+  updateDownloadState();
   visualizer.setSpectrogram(data);
   if (message.complete) {
     analysisProgress.style.width = '100%';
@@ -1009,28 +1094,46 @@ type AnalysisCoverage = {
 };
 
 type PersistedSettings = {
-  version: 3;
+  version: 4;
   paneRatio: number;
   frequencyScale: number;
   fftIndex: number;
   dbRange: number;
   palette: PaletteName;
   playbackFollowMode: PlaybackFollowMode;
+  spectrumAnalyzerOpen: boolean;
+  spectrumAnalyzerWidth: number;
 };
 
 function readPersistedSettings(): PersistedSettings | null {
   try {
     const value = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) ?? 'null') as Partial<PersistedSettings> | null;
-    if (value?.version === 3) return value as PersistedSettings;
+    if (value?.version === 4) return value as PersistedSettings;
+    if ((value?.version as number | undefined) === 3) {
+      return {
+        ...value,
+        version: 4,
+        spectrumAnalyzerOpen: false,
+        spectrumAnalyzerWidth: defaultSpectrumAnalyzerWidth(),
+      } as PersistedSettings;
+    }
     if ((value?.version as number | undefined) === 2) {
-      return { ...value, version: 3, playbackFollowMode: 'page' } as PersistedSettings;
+      return {
+        ...value,
+        version: 4,
+        playbackFollowMode: 'page',
+        spectrumAnalyzerOpen: false,
+        spectrumAnalyzerWidth: defaultSpectrumAnalyzerWidth(),
+      } as PersistedSettings;
     }
     if ((value?.version as number | undefined) === 1) {
       return {
         ...value,
-        version: 3,
+        version: 4,
         palette: 'viridis',
         playbackFollowMode: 'page',
+        spectrumAnalyzerOpen: false,
+        spectrumAnalyzerWidth: defaultSpectrumAnalyzerWidth(),
       } as PersistedSettings;
     }
     return null;
@@ -1047,13 +1150,15 @@ function scheduleSettingsSave(): void {
 function persistSettings(): void {
   window.clearTimeout(settingsSaveTimer);
   const settings: PersistedSettings = {
-    version: 3,
+    version: 4,
     paneRatio: wavePanelRatio,
     frequencyScale: frequencyScaleBlend,
     fftIndex: Number(fftSlider.value),
     dbRange: Number(dbRangeSlider.value),
     palette: isPaletteName(paletteSelect.value) ? paletteSelect.value : 'viridis',
     playbackFollowMode,
+    spectrumAnalyzerOpen,
+    spectrumAnalyzerWidth,
   };
   try {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
@@ -1147,12 +1252,75 @@ function applyPanelRatio(): void {
   panelDivider.setAttribute('aria-valuetext', `${Math.round(wavePanelRatio * 100)}% waveform height`);
 }
 
+function defaultSpectrumAnalyzerWidth(): number {
+  return Math.max(96, Math.round(window.innerWidth / 8));
+}
+
+function maximumSpectrumAnalyzerWidth(): number {
+  const width = editor.clientWidth || window.innerWidth;
+  return Math.max(96, Math.min(width * 0.45, width - 420));
+}
+
+function resizeSpectrumAnalyzerAt(clientX: number): void {
+  const rect = editor.getBoundingClientRect();
+  spectrumAnalyzerWidth = rect.right - clientX + spectrumDividerGrabOffset - spectrumDivider.offsetWidth;
+  applySpectrumAnalyzerLayout();
+}
+
+function applySpectrumAnalyzerLayout(): void {
+  spectrumAnalyzerWidth = Math.max(96, Math.min(maximumSpectrumAnalyzerWidth(), spectrumAnalyzerWidth));
+  editor.style.setProperty('--spectrum-size', `${Math.round(spectrumAnalyzerWidth)}px`);
+  editor.classList.toggle('has-spectrum-analyzer', spectrumAnalyzerOpen);
+  spectrumDivider.hidden = !spectrumAnalyzerOpen;
+  spectrumAnalyzer.hidden = !spectrumAnalyzerOpen;
+  spectrumButton.classList.toggle('is-active', spectrumAnalyzerOpen);
+  spectrumButton.setAttribute('aria-expanded', spectrumAnalyzerOpen.toString());
+  spectrumButton.setAttribute('aria-pressed', spectrumAnalyzerOpen.toString());
+  spectrumButton.setAttribute('aria-label', spectrumAnalyzerOpen ? 'Close spectrum analyzer' : 'Open spectrum analyzer');
+  spectrumDivider.setAttribute('aria-valuemax', Math.round(maximumSpectrumAnalyzerWidth()).toString());
+  spectrumDivider.setAttribute('aria-valuenow', Math.round(spectrumAnalyzerWidth).toString());
+  spectrumDivider.setAttribute('aria-valuetext', `${Math.round(spectrumAnalyzerWidth)} pixel analyzer width`);
+  visualizer.setSpectrumAnalyzerOpen(spectrumAnalyzerOpen);
+  scheduleViewportAnalysis(90);
+}
+
+function updateDownloadState(): void {
+  downloadButton.disabled = latestSpectrogram === null;
+}
+
+function downloadSpectrogramPng(): void {
+  if (!latestSpectrogram || spectralCanvas.width <= 1 || spectralCanvas.height <= 1) {
+    showToast('Load audio and wait for the spectrogram before downloading.');
+    return;
+  }
+
+  spectralCanvas.toBlob((blob) => {
+    if (!blob) {
+      showToast('Could not create the spectrogram PNG.');
+      return;
+    }
+    const sourceName = fileNameElement.textContent?.trim() || 'spectrogram';
+    const baseName = sourceName.replace(/\.[^.]+$/, '') || 'spectrogram';
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${baseName}-spectrogram.png`;
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, 'image/png');
+}
+
 function initialize(): void {
   updateFftControl();
   updateDbRangeControl();
   visualizer.setSpectralRange(Number(dbRangeSlider.value));
   visualizer.setColorPalette(isPaletteName(paletteSelect.value) ? paletteSelect.value : 'viridis');
   setFrequencyScale(frequencyScaleBlend);
+  applySpectrumAnalyzerLayout();
+  updateDownloadState();
   updateDropOverlayState();
   requestAnimationFrame(applyPanelRatio);
   requestAnimationFrame(animationLoop);

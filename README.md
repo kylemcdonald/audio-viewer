@@ -21,6 +21,8 @@ Open [http://vibecheck.local:5173/](http://vibecheck.local:5173/).
 - Pinch to zoom and two-finger drag to pan. Trackpad pinch and scrolling are supported too.
 - Double-click the editor to restore the full-file view.
 - Drag the divider between the waveform and spectrogram to resize the panels.
+- Toggle the resizable cursor spectrum from the analyzer button; its pixel-sharp trace follows the current playhead FFT.
+- Download the visible spectrogram canvas as a full-resolution PNG from the header.
 - Choose centered, right-edge, or paged playback scrolling in the gear menu.
 - Blend continuously between linear and logarithmic frequency scales.
 - Select 256–4,096 FFT bins to trade time resolution for frequency resolution.

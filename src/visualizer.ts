@@ -32,6 +32,7 @@ export type VisualizerOptions = {
   editor: HTMLElement;
   waveCanvas: HTMLCanvasElement;
   spectralCanvas: HTMLCanvasElement;
+  spectrumCanvas: HTMLCanvasElement;
   playhead: HTMLElement;
   onSeek: (time: number) => void;
   onViewChange: (start: number, duration: number) => void;
@@ -129,6 +130,7 @@ export class AudioVisualizer {
   private readonly editor: HTMLElement;
   private readonly waveCanvas: HTMLCanvasElement;
   private readonly spectralCanvas: HTMLCanvasElement;
+  private readonly spectrumCanvas: HTMLCanvasElement;
   private readonly playhead: HTMLElement;
   private readonly onSeek: (time: number) => void;
   private readonly onViewChange: (start: number, duration: number) => void;
@@ -146,6 +148,9 @@ export class AudioVisualizer {
   private scaleBlend = 1;
   private spectralRangeDb = 120;
   private renderFrame = 0;
+  private analyzerFrame = 0;
+  private cursorTime = 0;
+  private spectrumAnalyzerOpen = false;
   private pinch: PinchGesture | null = null;
   private scrubbingPointer: number | null = null;
   private touchSeekTimer = 0;
@@ -158,13 +163,18 @@ export class AudioVisualizer {
     this.editor = options.editor;
     this.waveCanvas = options.waveCanvas;
     this.spectralCanvas = options.spectralCanvas;
+    this.spectrumCanvas = options.spectrumCanvas;
     this.playhead = options.playhead;
     this.onSeek = options.onSeek;
     this.onViewChange = options.onViewChange;
 
-    this.resizeObserver = new ResizeObserver(() => this.requestRender());
+    this.resizeObserver = new ResizeObserver(() => {
+      this.requestRender();
+      this.requestAnalyzerRender();
+    });
     this.resizeObserver.observe(this.waveCanvas);
     this.resizeObserver.observe(this.spectralCanvas);
+    this.resizeObserver.observe(this.spectrumCanvas);
     this.bindInteractions();
     this.requestRender();
   }
@@ -213,11 +223,13 @@ export class AudioVisualizer {
   setSpectrogram(data: SpectrogramData | null): void {
     this.spectrogram = data;
     this.requestRender();
+    this.requestAnalyzerRender();
   }
 
   setSpectralRange(value: number): void {
     this.spectralRangeDb = Math.max(60, Math.min(140, value));
     this.requestRender();
+    this.requestAnalyzerRender();
   }
 
   setColorPalette(palette: PaletteName): void {
@@ -228,6 +240,12 @@ export class AudioVisualizer {
   setScaleBlend(value: number): void {
     this.scaleBlend = Math.max(0, Math.min(1, value));
     this.requestRender();
+    this.requestAnalyzerRender();
+  }
+
+  setSpectrumAnalyzerOpen(open: boolean): void {
+    this.spectrumAnalyzerOpen = open;
+    this.requestAnalyzerRender();
   }
 
   setPlaybackState(active: boolean, mode: PlaybackFollowMode): void {
@@ -279,11 +297,14 @@ export class AudioVisualizer {
   }
 
   showPlayhead(time: number): void {
+    const previousSpectrumColumn = this.spectrumColumnAtTime(this.cursorTime);
+    this.cursorTime = time;
+    if (previousSpectrumColumn !== this.spectrumColumnAtTime(time)) this.requestAnalyzerRender();
     if (!this.duration) {
       this.playhead.classList.remove('is-visible');
       return;
     }
-    const width = this.editor.clientWidth - AXIS_WIDTH;
+    const width = this.timelinePlotWidth;
     const ratio = (time - this.viewStart) / this.viewDuration;
     if (ratio < 0 || ratio > 1) {
       this.playhead.classList.remove('is-visible');
@@ -315,7 +336,11 @@ export class AudioVisualizer {
 
   get analysisColumnCount(): number {
     const dpr = window.devicePixelRatio || 1;
-    return Math.max(1, Math.round((this.editor.clientWidth - AXIS_WIDTH) * dpr));
+    return Math.max(1, Math.round(this.timelinePlotWidth * dpr));
+  }
+
+  private get timelinePlotWidth(): number {
+    return Math.max(1, this.waveCanvas.clientWidth - AXIS_WIDTH);
   }
 
   private get minimumFrequency(): number {
@@ -328,11 +353,14 @@ export class AudioVisualizer {
     this.editor.addEventListener('pointerup', (event) => this.pointerUp(event));
     this.editor.addEventListener('pointercancel', (event) => this.pointerUp(event));
     this.editor.addEventListener('wheel', (event) => this.wheel(event), { passive: false });
-    this.editor.addEventListener('dblclick', () => this.resetView());
+    this.editor.addEventListener('dblclick', (event) => {
+      if (!this.isTimelineEvent(event)) return;
+      this.resetView();
+    });
   }
 
   private pointerDown(event: PointerEvent): void {
-    if (!this.duration || event.button > 0) return;
+    if (!this.duration || event.button > 0 || !this.isTimelineEvent(event)) return;
     const point = this.eventPoint(event);
     this.pointers.set(event.pointerId, point);
     this.editor.setPointerCapture(event.pointerId);
@@ -374,7 +402,7 @@ export class AudioVisualizer {
       const distance = Math.max(10, Math.hypot(a.x - b.x, a.y - b.y));
       const nextDuration = this.pinch.startDuration * (this.pinch.distance / distance);
       const clampedDuration = this.clampDuration(nextDuration);
-      const plotWidth = Math.max(1, this.editor.clientWidth - AXIS_WIDTH);
+      const plotWidth = this.timelinePlotWidth;
       const relativeX = centerX / plotWidth;
       this.setView(this.pinch.anchorTime - relativeX * clampedDuration, clampedDuration);
       return;
@@ -399,7 +427,7 @@ export class AudioVisualizer {
   }
 
   private wheel(event: WheelEvent): void {
-    if (!this.duration) return;
+    if (!this.duration || !this.isTimelineEvent(event)) return;
     event.preventDefault();
     const rect = this.editor.getBoundingClientRect();
     const x = event.clientX - rect.left;
@@ -407,14 +435,14 @@ export class AudioVisualizer {
     if (event.ctrlKey || event.metaKey) {
       const anchor = this.timeAtX(x);
       const nextDuration = this.clampDuration(this.viewDuration * Math.exp(event.deltaY * 0.008));
-      const plotWidth = Math.max(1, this.editor.clientWidth - AXIS_WIDTH);
+      const plotWidth = this.timelinePlotWidth;
       const ratio = x / plotWidth;
       this.setView(anchor - ratio * nextDuration, nextDuration);
       return;
     }
 
     const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
-    const plotWidth = Math.max(1, this.editor.clientWidth - AXIS_WIDTH);
+    const plotWidth = this.timelinePlotWidth;
     this.setView(this.viewStart + (delta / plotWidth) * this.viewDuration, this.viewDuration);
   }
 
@@ -423,7 +451,7 @@ export class AudioVisualizer {
   }
 
   private timeAtX(x: number): number {
-    const plotWidth = Math.max(1, this.editor.clientWidth - AXIS_WIDTH);
+    const plotWidth = this.timelinePlotWidth;
     const ratio = Math.max(0, Math.min(1, x / plotWidth));
     return this.viewStart + ratio * this.viewDuration;
   }
@@ -431,6 +459,10 @@ export class AudioVisualizer {
   private eventPoint(event: PointerEvent): PointerPoint {
     const rect = this.editor.getBoundingClientRect();
     return { x: event.clientX - rect.left, y: event.clientY - rect.top, type: event.pointerType };
+  }
+
+  private isTimelineEvent(event: Event): boolean {
+    return !(event.target instanceof Element && event.target.closest('[data-timeline-exempt]'));
   }
 
   private clampDuration(duration: number): number {
@@ -460,6 +492,15 @@ export class AudioVisualizer {
       this.renderFrame = 0;
       this.drawWaveform();
       this.drawSpectrogram();
+      this.requestAnalyzerRender();
+    });
+  }
+
+  private requestAnalyzerRender(): void {
+    if (!this.spectrumAnalyzerOpen || this.analyzerFrame) return;
+    this.analyzerFrame = requestAnimationFrame(() => {
+      this.analyzerFrame = 0;
+      this.drawSpectrumAnalyzer();
     });
   }
 
@@ -626,6 +667,90 @@ export class AudioVisualizer {
     this.drawTimeGrid(context, height, SPECTRAL_RULER, plotBottom, true);
     this.drawFrequencyGrid(context, plotRight, plotBottom, plotHeight);
     this.drawAxisBorder(context, width, height);
+  }
+
+  private drawSpectrumAnalyzer(): void {
+    if (!this.spectrumAnalyzerOpen) return;
+    const canvas = this.spectrumCanvas;
+    const context = this.prepareCanvas(canvas);
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    context.imageSmoothingEnabled = false;
+    context.fillStyle = '#080b12';
+    context.fillRect(0, 0, width, height);
+    context.fillStyle = '#0d1117';
+    context.fillRect(0, 0, width, SPECTRAL_RULER);
+
+    context.strokeStyle = 'rgba(196, 216, 230, .15)';
+    context.lineWidth = 1;
+    context.beginPath();
+    context.moveTo(0, SPECTRAL_RULER - 0.5);
+    context.lineTo(width, SPECTRAL_RULER - 0.5);
+    context.stroke();
+
+    context.fillStyle = '#65727d';
+    context.font = '9px "Chivo Mono", ui-monospace, monospace';
+    context.textBaseline = 'middle';
+    const amplitudeTicks = [
+      { x: 5, align: 'left' as const, label: `-${this.spectralRangeDb}` },
+      { x: width / 2, align: 'center' as const, label: `-${Math.round(this.spectralRangeDb / 2)}` },
+      { x: width - 5, align: 'right' as const, label: '0' },
+    ];
+    for (const tick of amplitudeTicks) {
+      context.textAlign = tick.align;
+      context.fillText(tick.label, tick.x, SPECTRAL_RULER / 2 + 0.5);
+    }
+
+    const data = this.spectrogram;
+    const column = this.spectrumColumnAtTime(this.cursorTime);
+    if (!data || column === null || width <= 0 || height <= SPECTRAL_RULER) return;
+    const physicalWidth = Math.max(1, Math.round(width * dpr));
+    const physicalHeight = Math.max(1, Math.round(height * dpr));
+    const plotTop = Math.min(physicalHeight - 1, Math.round(SPECTRAL_RULER * dpr));
+    const plotHeight = Math.max(1, physicalHeight - plotTop);
+    const maxFrequency = this.sampleRate / 2;
+    const minFrequency = this.minimumFrequency;
+    const minNormalized = minFrequency / maxFrequency;
+    let previousX = 0;
+    let previousY = plotTop;
+
+    context.save();
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.fillStyle = '#63efb4';
+    for (let y = plotTop; y < physicalHeight; y += 1) {
+      const scaled = 1 - (y - plotTop) / Math.max(1, plotHeight - 1);
+      const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
+      const normalizedRow = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
+      const row = Math.max(0, Math.min(data.rows - 1, Math.round(normalizedRow * (data.rows - 1))));
+      const db = data.values[column * data.rows + row] / 10;
+      const normalizedDb = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
+      const x = Math.round(normalizedDb * (physicalWidth - 1));
+      if (y === plotTop) context.fillRect(x, y, 1, 1);
+      else drawPixelLine(context, previousX, previousY, x, y);
+      previousX = x;
+      previousY = y;
+    }
+    context.restore();
+  }
+
+  private spectrumColumnAtTime(time: number): number | null {
+    const data = this.spectrogram;
+    if (!data) return null;
+    const tolerance = Math.max(
+      data.secondsPerColumn / 2,
+      data.fftSize / (2 * data.sampleRate),
+    );
+    if (
+      time < data.startTime - tolerance ||
+      time > data.endTime + tolerance ||
+      time > this.availableSamples / this.sampleRate + tolerance
+    ) return null;
+    return Math.max(0, Math.min(
+      data.columns - 1,
+      Math.round((time - data.startTime) / data.secondsPerColumn),
+    ));
   }
 
   private drawTimeGrid(
@@ -862,6 +987,36 @@ export function formatClock(time: number, precise = true): string {
   return precise
     ? `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`
     : `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+}
+
+function drawPixelLine(
+  context: CanvasRenderingContext2D,
+  startX: number,
+  startY: number,
+  endX: number,
+  endY: number,
+): void {
+  let x = startX;
+  let y = startY;
+  const deltaX = Math.abs(endX - startX);
+  const deltaY = Math.abs(endY - startY);
+  const stepX = startX < endX ? 1 : -1;
+  const stepY = startY < endY ? 1 : -1;
+  let error = deltaX - deltaY;
+
+  while (true) {
+    context.fillRect(x, y, 1, 1);
+    if (x === endX && y === endY) break;
+    const doubled = error * 2;
+    if (doubled > -deltaY) {
+      error -= deltaY;
+      x += stepX;
+    }
+    if (doubled < deltaX) {
+      error += deltaX;
+      y += stepY;
+    }
+  }
 }
 
 function snap(value: number): number {

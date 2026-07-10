@@ -92,7 +92,8 @@ select:focus-visible {
   pointer-events: none;
 }
 
-.file-name-row,
+.header-leading,
+.file-meta-row,
 .transport,
 .header-actions,
 .settings-header,
@@ -105,27 +106,33 @@ select:focus-visible {
 
 .file-identity {
   min-width: 0;
-  padding-left: 4px;
+  overflow: hidden;
 }
 
 .file-identity.is-empty {
   visibility: hidden;
 }
 
-.file-name-row {
+.header-leading {
   min-width: 0;
-  gap: 8px;
+  gap: 12px;
 }
 
-.file-name-row strong {
+.file-identity strong {
+  display: block;
   min-width: 0;
   overflow: hidden;
   color: #e9edf0;
-  flex: 0 1 auto;
   font-size: 13px;
   font-weight: 590;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.file-meta-row {
+  min-width: 0;
+  gap: 0;
+  margin-top: 5px;
 }
 
 .file-size {
@@ -141,7 +148,7 @@ select:focus-visible {
   align-items: center;
   gap: 7px;
   min-width: 0;
-  margin-left: 2px;
+  margin-left: 7px;
   color: #6c7983;
   font-family: var(--mono);
   font-size: 9px;
@@ -193,7 +200,7 @@ select:focus-visible {
 }
 
 .icon-button svg,
-.settings-button svg,
+.header-icon-button svg,
 .settings-close svg,
 .open-button svg,
 .drop-icon svg {
@@ -378,7 +385,7 @@ select:focus-visible {
   padding: 0;
 }
 
-.settings-button,
+.header-icon-button,
 .settings-close {
   display: grid;
   padding: 0;
@@ -389,22 +396,39 @@ select:focus-visible {
   place-items: center;
 }
 
-.settings-button {
+.header-icon-button {
   width: 36px;
   height: 36px;
   border-radius: 6px;
 }
 
-.settings-button svg {
+.header-icon-button svg {
   width: 18px;
   height: 18px;
 }
 
-.settings-button:hover,
+.header-icon-button:hover,
 .settings-close:hover {
   border-color: rgba(105, 235, 184, 0.38);
   color: #d9e5e0;
   background: linear-gradient(180deg, rgba(54, 68, 71, 0.65), rgba(29, 42, 41, 0.65));
+}
+
+.header-icon-button.is-active {
+  border-color: rgba(105, 235, 184, 0.48);
+  color: #79e4ba;
+  background: linear-gradient(180deg, rgba(49, 78, 70, 0.7), rgba(25, 49, 43, 0.72));
+}
+
+.header-icon-button:disabled {
+  opacity: 0.34;
+  cursor: default;
+}
+
+.header-icon-button:disabled:hover {
+  border-color: rgba(181, 207, 221, 0.2);
+  color: #91a0a9;
+  background: linear-gradient(180deg, rgba(50, 58, 67, 0.52), rgba(29, 34, 41, 0.55));
 }
 
 .settings-modal {
@@ -531,6 +555,7 @@ select:focus-visible {
 .editor-stack {
   position: relative;
   display: grid;
+  grid-template-columns: minmax(0, 1fr) 0 0;
   grid-template-rows: minmax(72px, var(--wave-size, 25%)) 7px minmax(140px, 1fr);
   width: 100%;
   height: 100%;
@@ -540,6 +565,10 @@ select:focus-visible {
   background: #0a0d12;
   box-shadow: inset 0 1px rgba(255, 255, 255, 0.02);
   touch-action: none;
+}
+
+.editor-stack.has-spectrum-analyzer {
+  grid-template-columns: minmax(0, 1fr) 7px var(--spectrum-size, 12.5vw);
 }
 
 .editor-panel {
@@ -556,10 +585,14 @@ select:focus-visible {
 }
 
 .wave-panel {
+  grid-row: 1;
+  grid-column: 1;
   background: #11151b;
 }
 
 .spectral-panel {
+  grid-row: 3;
+  grid-column: 1;
   background: #080b12;
 }
 
@@ -590,6 +623,8 @@ select:focus-visible {
   position: relative;
   z-index: 4;
   display: grid;
+  grid-row: 2;
+  grid-column: 1;
   border-top: 1px solid rgba(194, 216, 231, 0.24);
   border-bottom: 1px solid rgba(0, 0, 0, 0.8);
   background: linear-gradient(180deg, #252b32, #15191e);
@@ -614,6 +649,80 @@ select:focus-visible {
   border-top: 1px solid rgba(220, 232, 240, 0.2);
   border-bottom: 1px solid rgba(0, 0, 0, 0.5);
   background: rgba(220, 232, 240, 0.06);
+}
+
+.spectrum-divider {
+  position: relative;
+  z-index: 9;
+  display: grid;
+  grid-row: 1 / 4;
+  grid-column: 2;
+  border-right: 1px solid rgba(0, 0, 0, 0.78);
+  border-left: 1px solid rgba(194, 216, 231, 0.2);
+  background: linear-gradient(90deg, #252b32, #15191e);
+  cursor: col-resize;
+  touch-action: none;
+  place-items: center;
+}
+
+.spectrum-divider:hover,
+.spectrum-divider:focus-visible,
+.spectrum-divider.is-dragging {
+  border-left-color: rgba(102, 240, 187, 0.65);
+  outline: none;
+  background: linear-gradient(90deg, #2c3b39, #172522);
+}
+
+.spectrum-divider span {
+  width: 3px;
+  height: 38px;
+  border-right: 1px solid rgba(0, 0, 0, 0.5);
+  border-left: 1px solid rgba(220, 232, 240, 0.2);
+  background: rgba(220, 232, 240, 0.06);
+}
+
+.spectrum-sidebar {
+  display: grid;
+  grid-row: 1 / 4;
+  grid-column: 3;
+  grid-template-rows: minmax(72px, var(--wave-size, 25%)) 7px minmax(140px, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #0a0d12;
+}
+
+.spectrum-wave-spacer {
+  grid-row: 1;
+  background: #0c0f14;
+}
+
+.spectrum-horizontal-divider {
+  grid-row: 2;
+  border-top: 1px solid rgba(194, 216, 231, 0.24);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.8);
+  background: linear-gradient(180deg, #252b32, #15191e);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+}
+
+.spectrum-canvas-wrap {
+  position: relative;
+  grid-row: 3;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #080b12;
+}
+
+.spectrum-canvas-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.spectrum-divider[hidden],
+.spectrum-sidebar[hidden] {
+  display: none;
 }
 
 .editor-playhead {
