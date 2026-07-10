@@ -162,7 +162,7 @@ select:focus-visible {
 
 .transport {
   justify-content: center;
-  gap: 5px;
+  gap: 10px;
 }
 
 .header-actions {
@@ -245,25 +245,23 @@ select:focus-visible {
   display: grid;
 }
 
-.timecode {
-  display: flex;
-  align-items: baseline;
-  min-width: 123px;
-  margin-left: 8px;
+.transport-time {
+  width: 76px;
   color: #d9e5e1;
   font-family: var(--mono);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.015em;
+  white-space: nowrap;
 }
 
-.time-divider,
-#total-time {
+.transport-time.current {
+  text-align: right;
+}
+
+.transport-time.total {
   color: #56616a;
-}
-
-.time-divider {
-  padding: 0 4px;
+  text-align: left;
 }
 
 .control-group {
@@ -856,8 +854,8 @@ select:focus-visible {
     gap: 12px;
   }
 
-  .timecode {
-    min-width: 111px;
+  .transport-time {
+    width: 66px;
     font-size: 10px;
   }
 

@@ -9,7 +9,7 @@ import type {
   AnalysisStreamInitialize,
   SpectrogramData,
 } from './types';
-import { AudioVisualizer, formatClock } from './visualizer';
+import { AudioVisualizer, formatClock, type PlaybackFollowMode } from './visualizer';
 import { decodeWavChunk, parseWavHeader, preferredWavChunkBytes, type WavHeader } from './wav-reader';
 
 const icon = (path: string, viewBox = '0 0 24 24') => `
@@ -38,15 +38,12 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       </div>
 
       <div class="transport" aria-label="Playback controls">
+        <span class="transport-time current" id="current-time" aria-live="off">00:00.000</span>
         <button class="play-button" id="play-button" type="button" aria-label="Play" title="Play / pause (Space)">
           <span class="play-icon">${playIcon}</span>
           <span class="pause-icon">${pauseIcon}</span>
         </button>
-        <div class="timecode" aria-live="off">
-          <span id="current-time">00:00.000</span>
-          <span class="time-divider">/</span>
-          <span id="total-time">00:00.000</span>
-        </div>
+        <span class="transport-time total" id="total-time">00:00.000</span>
       </div>
 
       <div class="header-actions">
@@ -100,6 +97,19 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
               <option value="viridis" selected>Viridis</option>
               <option value="magma">Magma</option>
               <option value="inferno">Inferno</option>
+            </select>
+          </div>
+        </div>
+        <div class="settings-divider" aria-hidden="true"></div>
+        <div class="control-group playback-control">
+          <div class="control-heading">
+            <label for="playback-follow-select">Playback scrolling</label>
+          </div>
+          <div class="palette-select-row">
+            <select id="playback-follow-select" class="palette-select" aria-label="Playback scrolling behavior">
+              <option value="center">Keep cursor centered</option>
+              <option value="right">Keep cursor on right</option>
+              <option value="page" selected>Page when cursor reaches end</option>
             </select>
           </div>
         </div>
@@ -162,6 +172,7 @@ const fftOutput = get<HTMLOutputElement>('fft-output');
 const dbRangeSlider = get<HTMLInputElement>('db-range-slider');
 const dbRangeOutput = get<HTMLOutputElement>('db-range-output');
 const paletteSelect = get<HTMLSelectElement>('palette-select');
+const playbackFollowSelect = get<HTMLSelectElement>('playback-follow-select');
 const analysisOverlay = get<HTMLElement>('analysis-overlay');
 const analysisTitle = get<HTMLElement>('analysis-title');
 const analysisDetail = get<HTMLElement>('analysis-detail');
@@ -183,6 +194,9 @@ const persistedSettings = readPersistedSettings();
 fftSlider.value = Math.round(clampNumber(persistedSettings?.fftIndex, 2, 0, 4)).toString();
 dbRangeSlider.value = clampNumber(persistedSettings?.dbRange, 120, 60, 140).toString();
 paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSettings.palette : 'viridis';
+playbackFollowSelect.value = isPlaybackFollowMode(persistedSettings?.playbackFollowMode)
+  ? persistedSettings.playbackFollowMode
+  : 'page';
 
 let monoSamples: Float32Array | null = null;
 let audioSampleRate = 48000;
@@ -195,6 +209,8 @@ let viewportAnalysisTimer = 0;
 let lastViewportAnalysisAt = 0;
 let analysisViewStart = 0;
 let analysisViewDuration = 1;
+let latestSpectrogram: SpectrogramData | null = null;
+let activeAnalysisRequest: AnalysisCoverage | null = null;
 let toastTimer = 0;
 let settingsSaveTimer = 0;
 let dragDepth = 0;
@@ -207,6 +223,8 @@ let frequencyScaleBlend = clampNumber(persistedSettings?.frequencyScale, 1, 0, 1
 let frequencyScaleDrag: { pointerId: number; anchorFrequency: number } | null = null;
 let overlayTimer = 0;
 let overlayToken = 0;
+let playbackFollowMode = playbackFollowSelect.value as PlaybackFollowMode;
+let lastPlaybackAnalysisCheck = 0;
 
 const fftBins = [256, 512, 1024, 2048, 4096] as const;
 
@@ -223,7 +241,7 @@ const visualizer = new AudioVisualizer({
   onViewChange: (start, duration) => {
     analysisViewStart = start;
     analysisViewDuration = duration;
-    scheduleViewportAnalysis(24);
+    scheduleViewportAnalysis(engine.isPlaying ? playbackAnalysisInterval() : 24);
   },
 });
 
@@ -270,6 +288,17 @@ dbRangeSlider.addEventListener('input', () => {
 paletteSelect.addEventListener('change', () => {
   if (!isPaletteName(paletteSelect.value)) return;
   visualizer.setColorPalette(paletteSelect.value);
+  scheduleSettingsSave();
+});
+
+playbackFollowSelect.addEventListener('change', () => {
+  if (!isPlaybackFollowMode(playbackFollowSelect.value)) return;
+  playbackFollowMode = playbackFollowSelect.value;
+  visualizer.setPlaybackState(engine.isPlaying, playbackFollowMode);
+  if (engine.isPlaying) {
+    visualizer.follow(engine.currentTime);
+    scheduleViewportAnalysis(0);
+  }
   scheduleSettingsSave();
 });
 
@@ -417,6 +446,11 @@ async function togglePlayback(): Promise<void> {
 function updateTransportState(): void {
   playButton.classList.toggle('is-playing', engine.isPlaying);
   playButton.setAttribute('aria-label', engine.isPlaying ? 'Pause' : 'Play');
+  visualizer.setPlaybackState(engine.isPlaying, playbackFollowMode);
+  if (engine.isPlaying) {
+    hideAnalysisOverlay();
+    scheduleViewportAnalysis(0);
+  }
 }
 
 function updateTimecode(time = engine.currentTime): void {
@@ -426,8 +460,13 @@ function updateTimecode(time = engine.currentTime): void {
 
 function animationLoop(): void {
   const time = engine.currentTime;
-  updateTimecode(time);
   if (engine.isPlaying) visualizer.follow(time);
+  updateTimecode(time);
+  const analysisCheckInterval = playbackAnalysisInterval();
+  if (engine.isPlaying && performance.now() - lastPlaybackAnalysisCheck >= analysisCheckInterval) {
+    lastPlaybackAnalysisCheck = performance.now();
+    scheduleViewportAnalysis(analysisCheckInterval);
+  }
   requestAnimationFrame(animationLoop);
 }
 
@@ -469,6 +508,8 @@ function prepareFileLoad(file: File): void {
   availableAudioSamples = 0;
   audioDuration = 0;
   monoSamples = null;
+  latestSpectrogram = null;
+  activeAnalysisRequest = null;
   engine.clear();
   analysisWorker?.terminate();
   analysisWorker = null;
@@ -556,6 +597,8 @@ async function loadWithBrowserDecoder(file: File, loadId: number): Promise<void>
   audioSampleRate = buffer.sampleRate;
   audioDuration = buffer.duration;
   availableAudioSamples = monoSamples.length;
+  latestSpectrogram = null;
+  activeAnalysisRequest = null;
   visualizer.setSpectrogram(null);
   visualizer.setAudio(monoSamples, buffer.sampleRate, buffer.duration);
   setFileFormat(buffer.sampleRate, buffer.numberOfChannels);
@@ -633,6 +676,7 @@ function initializeStreamingAnalysisWorker(sampleLength: number, sampleRate: num
 function resetAnalysisWorker(): Worker {
   analysisWorker?.terminate();
   analysisId += 1;
+  activeAnalysisRequest = null;
   analysisWorker = new Worker(new URL('./spectrogram.worker.ts', import.meta.url), { type: 'module' });
   analysisWorker.onmessage = handleAnalysisMessage;
   analysisWorker.onerror = () => {
@@ -658,29 +702,47 @@ function scheduleViewportAnalysis(interval = 24): void {
   }, remaining);
 }
 
+function playbackAnalysisInterval(): number {
+  return Math.max(16, Math.min(120, analysisViewDuration * 250));
+}
+
 function analyzeCurrentAudio(): void {
   if (!analysisWorker || audioDuration <= 0) return;
   window.clearTimeout(fftDebounce);
   window.clearTimeout(viewportAnalysisTimer);
   viewportAnalysisTimer = 0;
-  lastViewportAnalysisAt = performance.now();
-  analysisId += 1;
   const bins = fftBins[Number(fftSlider.value)];
   const fftSize = bins * 2;
+  const visibleColumns = visualizer.analysisColumnCount;
+  const viewDuration = Math.max(0.001, analysisViewDuration);
   let requestStart = analysisViewStart;
-  let requestDuration = analysisViewDuration;
-  let requestColumns = visualizer.analysisColumnCount;
+  let requestEnd = analysisViewStart + viewDuration;
+  let requiredEnd = requestEnd;
 
   if (isReadingFile) {
     const safeEnd = Math.max(0, (availableAudioSamples - fftSize / 2) / audioSampleRate);
-    const availableEnd = Math.min(analysisViewStart + analysisViewDuration, safeEnd);
-    if (availableEnd <= requestStart) return;
-    requestDuration = availableEnd - requestStart;
-    requestColumns = Math.max(
-      1,
-      Math.round(requestColumns * (requestDuration / Math.max(0.001, analysisViewDuration))),
-    );
-  } else {
+    requestEnd = Math.min(requestEnd, safeEnd);
+    requiredEnd = requestEnd;
+  } else if (engine.isPlaying) {
+    const requestedScreens = playbackFollowMode === 'page' ? 3 : 2;
+    const requiredScreens = playbackFollowMode === 'page' ? 2.75 : 1.55;
+    requestEnd = Math.min(audioDuration, requestStart + viewDuration * requestedScreens);
+    requiredEnd = Math.min(audioDuration, requestStart + viewDuration * requiredScreens);
+  }
+
+  if (requestEnd <= requestStart) return;
+  const requestDuration = requestEnd - requestStart;
+  const requestColumns = Math.max(1, Math.round(visibleColumns * (requestDuration / viewDuration)));
+  const secondsPerColumn = analysisTargetStep(requestDuration, requestColumns);
+
+  if (
+    coverageIncludes(latestSpectrogram, requestStart, requiredEnd, fftSize, secondsPerColumn) ||
+    coverageIncludes(activeAnalysisRequest, requestStart, requiredEnd, fftSize, secondsPerColumn)
+  ) return;
+
+  lastViewportAnalysisAt = performance.now();
+  analysisId += 1;
+  if (!isReadingFile && !engine.isPlaying) {
     beginDelayedOverlay('Preparing spectral map', 'Computing visible columns…');
     analysisProgress.style.width = '2%';
   }
@@ -693,6 +755,13 @@ function analyzeCurrentAudio(): void {
     viewDuration: requestDuration,
     columns: requestColumns,
     minimumSecondsPerColumn: 0.001,
+  };
+  activeAnalysisRequest = {
+    id: request.id,
+    fftSize,
+    startTime: requestStart,
+    endTime: requestEnd,
+    secondsPerColumn,
   };
   analysisWorker.postMessage(request);
 }
@@ -714,6 +783,7 @@ function handleAnalysisMessage(event: MessageEvent<AnalysisMessage>): void {
     return;
   }
   if (message.type === 'error') {
+    if (activeAnalysisRequest?.id === message.id) activeAnalysisRequest = null;
     hideAnalysisOverlay();
     showToast(`Spectral analysis failed: ${message.message}`);
     return;
@@ -730,9 +800,32 @@ function handleAnalysisMessage(event: MessageEvent<AnalysisMessage>): void {
     endTime: message.data.endTime,
     secondsPerColumn: message.data.secondsPerColumn,
   };
+  latestSpectrogram = data;
   visualizer.setSpectrogram(data);
-  if (message.complete) analysisProgress.style.width = '100%';
+  if (message.complete) {
+    analysisProgress.style.width = '100%';
+    if (activeAnalysisRequest?.id === message.id) activeAnalysisRequest = null;
+  }
   hideAnalysisOverlay();
+}
+
+function analysisTargetStep(duration: number, columns: number): number {
+  const desiredMs = Math.max(1, (duration * 1000) / Math.max(1, Math.round(columns)));
+  return 2 ** Math.max(0, Math.floor(Math.log2(desiredMs))) / 1000;
+}
+
+function coverageIncludes(
+  coverage: Pick<SpectrogramData, 'fftSize' | 'startTime' | 'endTime' | 'secondsPerColumn'> | AnalysisCoverage | null,
+  startTime: number,
+  endTime: number,
+  fftSize: number,
+  secondsPerColumn: number,
+): boolean {
+  if (!coverage || coverage.fftSize !== fftSize) return false;
+  const tolerance = Math.max(0.001, coverage.secondsPerColumn * 1.1);
+  return coverage.secondsPerColumn <= secondsPerColumn * 1.01 &&
+    coverage.startTime <= startTime + tolerance &&
+    coverage.endTime >= endTime - tolerance;
 }
 
 function updateFftControl(): void {
@@ -765,21 +858,38 @@ function updateRangeFill(input: HTMLInputElement): void {
   input.style.setProperty('--fill', `${progress}%`);
 }
 
+type AnalysisCoverage = {
+  id: number;
+  fftSize: number;
+  startTime: number;
+  endTime: number;
+  secondsPerColumn: number;
+};
+
 type PersistedSettings = {
-  version: 2;
+  version: 3;
   paneRatio: number;
   frequencyScale: number;
   fftIndex: number;
   dbRange: number;
   palette: PaletteName;
+  playbackFollowMode: PlaybackFollowMode;
 };
 
 function readPersistedSettings(): PersistedSettings | null {
   try {
     const value = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) ?? 'null') as Partial<PersistedSettings> | null;
-    if (value?.version === 2) return value as PersistedSettings;
+    if (value?.version === 3) return value as PersistedSettings;
+    if ((value?.version as number | undefined) === 2) {
+      return { ...value, version: 3, playbackFollowMode: 'page' } as PersistedSettings;
+    }
     if ((value?.version as number | undefined) === 1) {
-      return { ...value, version: 2, palette: 'viridis' } as PersistedSettings;
+      return {
+        ...value,
+        version: 3,
+        palette: 'viridis',
+        playbackFollowMode: 'page',
+      } as PersistedSettings;
     }
     return null;
   } catch {
@@ -795,18 +905,23 @@ function scheduleSettingsSave(): void {
 function persistSettings(): void {
   window.clearTimeout(settingsSaveTimer);
   const settings: PersistedSettings = {
-    version: 2,
+    version: 3,
     paneRatio: wavePanelRatio,
     frequencyScale: frequencyScaleBlend,
     fftIndex: Number(fftSlider.value),
     dbRange: Number(dbRangeSlider.value),
     palette: isPaletteName(paletteSelect.value) ? paletteSelect.value : 'viridis',
+    playbackFollowMode,
   };
   try {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
   } catch {
     // Storage may be disabled or unavailable in a private browsing context.
   }
+}
+
+function isPlaybackFollowMode(value: unknown): value is PlaybackFollowMode {
+  return value === 'center' || value === 'right' || value === 'page';
 }
 
 function clampNumber(value: unknown, fallback: number, minimum: number, maximum: number): number {

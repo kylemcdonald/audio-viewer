@@ -3,6 +3,9 @@ import type { SpectrogramData } from './types';
 
 const AXIS_WIDTH = 48;
 const SPECTRAL_RULER = 25;
+const UNLOADED_SPECTROGRAM_COLOR = 0xff000000;
+
+export type PlaybackFollowMode = 'center' | 'right' | 'page';
 
 type PeakLevel = {
   blockSize: number;
@@ -16,6 +19,13 @@ type PinchGesture = {
   distance: number;
   anchorTime: number;
   startDuration: number;
+};
+
+type RulerLock = {
+  step: number;
+  width: number;
+  duration: number;
+  positions: number[];
 };
 
 export type VisualizerOptions = {
@@ -140,6 +150,9 @@ export class AudioVisualizer {
   private scrubbingPointer: number | null = null;
   private touchSeekTimer = 0;
   private wasPinching = false;
+  private playbackActive = false;
+  private playbackFollowMode: PlaybackFollowMode = 'page';
+  private rulerLock: RulerLock | null = null;
 
   constructor(options: VisualizerOptions) {
     this.editor = options.editor;
@@ -217,6 +230,14 @@ export class AudioVisualizer {
     this.requestRender();
   }
 
+  setPlaybackState(active: boolean, mode: PlaybackFollowMode): void {
+    if (this.playbackActive === active && this.playbackFollowMode === mode) return;
+    this.playbackActive = active;
+    this.playbackFollowMode = mode;
+    this.rulerLock = null;
+    this.requestRender();
+  }
+
   frequencyAtClientY(clientY: number): number {
     const rect = this.spectralCanvas.getBoundingClientRect();
     const plotHeight = Math.max(1, rect.height - SPECTRAL_RULER);
@@ -275,8 +296,15 @@ export class AudioVisualizer {
 
   follow(time: number): void {
     if (this.viewDuration >= this.duration * 0.999) return;
-    const edge = this.viewStart + this.viewDuration * 0.94;
-    if (time > edge) {
+    if (this.playbackFollowMode === 'center') {
+      this.setView(time - this.viewDuration * 0.5, this.viewDuration);
+      return;
+    }
+    if (this.playbackFollowMode === 'right') {
+      this.setView(time - this.viewDuration * 0.88, this.viewDuration);
+      return;
+    }
+    if (time > this.viewStart + this.viewDuration * 0.94) {
       this.setView(time - this.viewDuration * 0.08, this.viewDuration);
     }
   }
@@ -537,7 +565,8 @@ export class AudioVisualizer {
     const plotBottom = height;
     const plotWidth = Math.max(1, plotRight);
     const plotHeight = Math.max(1, plotBottom - SPECTRAL_RULER);
-    context.fillStyle = '#080b12';
+    const isStreaming = Boolean(this.samples && this.availableSamples < this.samples.length);
+    context.fillStyle = isStreaming ? '#000' : '#080b12';
     context.fillRect(0, 0, width, height);
 
     if (this.spectrogram) {
@@ -549,9 +578,9 @@ export class AudioVisualizer {
       const maxFrequency = this.sampleRate / 2;
       const minFrequency = this.minimumFrequency;
       const minNormalized = minFrequency / maxFrequency;
-      const timeStartColumn = (this.viewStart - startTime) / secondsPerColumn;
-      const columnsPerPixel = (this.viewDuration / pixelWidth) / secondsPerColumn;
       const rowMap = new Uint16Array(pixelHeight);
+      const columnMap = new Int32Array(pixelWidth);
+      const availableTime = this.availableSamples / this.sampleRate;
 
       for (let y = 0; y < pixelHeight; y += 1) {
         const scaled = 1 - y / Math.max(1, pixelHeight - 1);
@@ -560,12 +589,25 @@ export class AudioVisualizer {
         rowMap[y] = Math.min(rows - 1, Math.max(0, Math.round(row * (rows - 1))));
       }
 
+      for (let x = 0; x < pixelWidth; x += 1) {
+        const time = this.viewStart + (x / Math.max(1, pixelWidth - 1)) * this.viewDuration;
+        if (isStreaming && time > availableTime) {
+          columnMap[x] = -1;
+          continue;
+        }
+        const columnFloat = (time - startTime) / secondsPerColumn;
+        columnMap[x] = Math.max(0, Math.min(columns - 1, Math.round(columnFloat)));
+      }
+
       for (let y = 0; y < pixelHeight; y += 1) {
         const row = rowMap[y];
         const offset = y * pixelWidth;
         for (let x = 0; x < pixelWidth; x += 1) {
-          const columnFloat = timeStartColumn + x * columnsPerPixel;
-          const column = Math.max(0, Math.min(columns - 1, Math.round(columnFloat)));
+          const column = columnMap[x];
+          if (column < 0) {
+            packed[offset + x] = UNLOADED_SPECTROGRAM_COLOR;
+            continue;
+          }
           const db = values[column * rows + row] / 10;
           const normalized = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
           packed[offset + x] = this.colorLut[Math.round(normalized * 255)];
@@ -598,13 +640,13 @@ export class AudioVisualizer {
     const plotRight = width - AXIS_WIDTH;
     const plotWidth = plotRight;
     const step = niceStep(this.viewDuration / Math.max(2, plotWidth / 105));
-    const first = Math.ceil(this.viewStart / step) * step;
+    const ticks = this.timeTicks(plotWidth, step);
     context.font = '10px Inter, ui-sans-serif, system-ui, sans-serif';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
 
-    for (let time = first; time <= this.viewStart + this.viewDuration + step * 0.01; time += step) {
-      const x = ((time - this.viewStart) / this.viewDuration) * plotWidth;
+    for (const tick of ticks) {
+      const { time, x } = tick;
       if (x < -1 || x > plotRight + 1) continue;
       context.strokeStyle = withLabels ? 'rgba(183, 202, 219, .10)' : 'rgba(183, 202, 219, .07)';
       context.lineWidth = 1;
@@ -632,6 +674,42 @@ export class AudioVisualizer {
       context.stroke();
     }
     void height;
+  }
+
+  private timeTicks(plotWidth: number, step: number): Array<{ time: number; x: number }> {
+    const lockPositions = this.playbackActive && step <= 0.1;
+    if (!lockPositions) {
+      this.rulerLock = null;
+      const firstIndex = Math.ceil((this.viewStart - step * 1e-6) / step);
+      const lastIndex = Math.floor((this.viewStart + this.viewDuration + step * 1e-6) / step);
+      const ticks: Array<{ time: number; x: number }> = [];
+      for (let index = firstIndex; index <= lastIndex; index += 1) {
+        const time = index * step;
+        ticks.push({ time, x: ((time - this.viewStart) / this.viewDuration) * plotWidth });
+      }
+      return ticks;
+    }
+
+    if (
+      !this.rulerLock ||
+      this.rulerLock.step !== step ||
+      this.rulerLock.width !== plotWidth ||
+      Math.abs(this.rulerLock.duration - this.viewDuration) > 1e-9
+    ) {
+      const firstIndex = Math.ceil((this.viewStart - step * 1e-6) / step);
+      const lastIndex = Math.floor((this.viewStart + this.viewDuration + step * 1e-6) / step);
+      const positions: number[] = [];
+      for (let index = firstIndex; index <= lastIndex; index += 1) {
+        const time = index * step;
+        positions.push(((time - this.viewStart) / this.viewDuration) * plotWidth);
+      }
+      this.rulerLock = { step, width: plotWidth, duration: this.viewDuration, positions };
+    }
+
+    return this.rulerLock.positions.map((x) => ({
+      x,
+      time: this.viewStart + (x / Math.max(1, plotWidth)) * this.viewDuration,
+    }));
   }
 
   private drawFrequencyGrid(
@@ -767,11 +845,13 @@ function selectWaveformDbTicks(halfHeight: number): number[] {
 }
 
 function formatRuler(time: number, step: number): string {
-  const minutes = Math.floor(time / 60);
-  const seconds = time - minutes * 60;
-  if (step < 0.1) return `${minutes}:${seconds.toFixed(2).padStart(5, '0')}`;
-  if (step < 1) return `${minutes}:${seconds.toFixed(1).padStart(4, '0')}`;
-  return `${minutes}:${Math.floor(seconds).toString().padStart(2, '0')}`;
+  const precision = step < 0.01 ? 3 : step < 0.1 ? 2 : step < 1 ? 1 : 0;
+  const factor = 10 ** precision;
+  const rounded = Math.round(Math.max(0, time) * factor) / factor;
+  const minutes = Math.floor(rounded / 60);
+  const seconds = rounded - minutes * 60;
+  const width = precision > 0 ? precision + 3 : 2;
+  return `${minutes}:${seconds.toFixed(precision).padStart(width, '0')}`;
 }
 
 export function formatClock(time: number, precise = true): string {
