@@ -95,7 +95,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
           <div class="slider-row">
             <span>TIME</span>
-            <input id="spectrum-fft-slider" class="range-input stepped" type="range" min="0" max="4" step="1" value="2" aria-label="Spectrum resolution" />
+            <input id="spectrum-fft-slider" class="range-input stepped" type="range" min="0" max="8" step="1" value="2" aria-label="Spectrum resolution" />
             <span>FREQ</span>
           </div>
         </div>
@@ -121,6 +121,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
               <option value="outline" selected>Outline</option>
               <option value="filled">Filled</option>
               <option value="bars">Bars</option>
+              <option value="lines">Lines</option>
             </select>
           </div>
         </div>
@@ -275,7 +276,7 @@ const spectrumAnalyzer = get<HTMLElement>('spectrum-analyzer');
 const SETTINGS_STORAGE_KEY = 'audio-spectrogram.settings.v1';
 const persistedSettings = readPersistedSettings();
 fftSlider.value = Math.round(clampNumber(persistedSettings?.fftIndex, 2, 0, 4)).toString();
-spectrumFftSlider.value = Math.round(clampNumber(persistedSettings?.spectrumFftIndex, 2, 0, 4)).toString();
+spectrumFftSlider.value = Math.round(clampNumber(persistedSettings?.spectrumFftIndex, 2, 0, 8)).toString();
 dbRangeSlider.value = clampNumber(persistedSettings?.dbRange, 120, 60, 140).toString();
 spectrumStyleSelect.value = isSpectrumDrawStyle(persistedSettings?.spectrumDrawStyle)
   ? persistedSettings.spectrumDrawStyle
@@ -330,7 +331,7 @@ let lastPlaybackAnalysisCheck = 0;
 
 document.documentElement.dataset.theme = themeMode;
 
-const fftBins = [256, 512, 1024, 2048, 4096] as const;
+const fftBins = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] as const;
 
 const visualizer = new AudioVisualizer({
   editor,
@@ -1245,7 +1246,7 @@ function readPersistedSettings(): PersistedSettings | null {
       return {
         ...value,
         version: 6,
-        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
+        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 8),
         spectrumDrawStyle: 'outline',
         spectrumInterpolation: 'nearest',
         theme: 'dark',
@@ -1255,7 +1256,7 @@ function readPersistedSettings(): PersistedSettings | null {
       return {
         ...value,
         version: 6,
-        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
+        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 8),
         spectrumDrawStyle: 'outline',
         spectrumInterpolation: 'nearest',
         theme: 'dark',
@@ -1267,7 +1268,7 @@ function readPersistedSettings(): PersistedSettings | null {
       return {
         ...value,
         version: 6,
-        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
+        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 8),
         spectrumDrawStyle: 'outline',
         spectrumInterpolation: 'nearest',
         theme: 'dark',
@@ -1280,7 +1281,7 @@ function readPersistedSettings(): PersistedSettings | null {
       return {
         ...value,
         version: 6,
-        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
+        spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 8),
         spectrumDrawStyle: 'outline',
         spectrumInterpolation: 'nearest',
         theme: 'dark',
@@ -1332,7 +1333,7 @@ function isPlaybackFollowMode(value: unknown): value is PlaybackFollowMode {
 }
 
 function isSpectrumDrawStyle(value: unknown): value is SpectrumDrawStyle {
-  return value === 'outline' || value === 'filled' || value === 'bars';
+  return value === 'outline' || value === 'filled' || value === 'bars' || value === 'lines';
 }
 
 function isSpectrumInterpolation(value: unknown): value is SpectrumInterpolation {

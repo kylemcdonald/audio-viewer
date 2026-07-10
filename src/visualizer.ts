@@ -8,7 +8,7 @@ const SPECTRAL_RULER = 25;
 const UNLOADED_SPECTROGRAM_COLOR = 0xff000000;
 
 export type PlaybackFollowMode = 'center' | 'right' | 'page';
-export type SpectrumDrawStyle = 'outline' | 'filled' | 'bars';
+export type SpectrumDrawStyle = 'outline' | 'filled' | 'bars' | 'lines';
 export type SpectrumInterpolation = 'nearest' | 'linear';
 export type ThemeMode = 'dark' | 'light';
 
@@ -772,23 +772,47 @@ export class AudioVisualizer {
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.imageSmoothingEnabled = false;
     if (this.spectrumDrawStyle === 'filled') {
-      context.fillStyle = 'rgba(99, 239, 180, .28)';
+      context.fillStyle = '#63efb4';
       for (let row = 0; row < trace.length; row += 1) {
         context.fillRect(0, plotTop + row, trace[row] + 1, 1);
       }
+    } else if (this.spectrumDrawStyle === 'bars' || this.spectrumDrawStyle === 'lines') {
       context.fillStyle = '#63efb4';
-      this.drawSpectrumOutline(context, spectrum, trace, physicalWidth, plotTop, plotHeight);
-    } else if (this.spectrumDrawStyle === 'bars') {
-      context.fillStyle = '#63efb4';
-      const stride = Math.max(2, Math.round(2 * dpr));
-      for (let row = 0; row < trace.length; row += stride) {
-        context.fillRect(0, plotTop + row, trace[row] + 1, Math.max(1, Math.round(dpr)));
-      }
+      this.drawSpectrumBins(
+        context,
+        spectrum,
+        physicalWidth,
+        plotTop,
+        plotHeight,
+        this.spectrumDrawStyle,
+      );
     } else {
       context.fillStyle = '#63efb4';
       this.drawSpectrumOutline(context, spectrum, trace, physicalWidth, plotTop, plotHeight);
     }
     context.restore();
+  }
+
+  private drawSpectrumBins(
+    context: CanvasRenderingContext2D,
+    spectrum: Float32Array,
+    physicalWidth: number,
+    plotTop: number,
+    plotHeight: number,
+    style: 'bars' | 'lines',
+  ): void {
+    const maxFrequency = this.sampleRate / 2;
+    const minFrequency = this.minimumFrequency;
+    context.beginPath();
+    for (let bin = 0; bin < spectrum.length; bin += 1) {
+      const normalized = bin / Math.max(1, spectrum.length - 1);
+      const scaled = scaleFrequency(normalized, this.scaleBlend, maxFrequency, minFrequency);
+      const x = spectrumPhysicalX(spectrum[bin], this.spectralRangeDb, physicalWidth);
+      const y = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
+      if (style === 'bars') context.rect(0, y, x + 1, 1);
+      else context.rect(x, y, 1, 1);
+    }
+    context.fill();
   }
 
   private drawSpectrumAnalyzerGrid(
