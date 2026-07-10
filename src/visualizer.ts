@@ -33,6 +33,16 @@ type RulerLock = {
   positions: number[];
 };
 
+type CanvasSurface = {
+  context: CanvasRenderingContext2D;
+  width: number;
+  height: number;
+  pixelWidth: number;
+  pixelHeight: number;
+  scaleX: number;
+  scaleY: number;
+};
+
 export type VisualizerOptions = {
   editor: HTMLElement;
   waveCanvas: HTMLCanvasElement;
@@ -158,7 +168,7 @@ export class AudioVisualizer {
   private spectrumAnalyzerOpen = false;
   private spectrumFftSize = 2048;
   private spectrumDrawStyle: SpectrumDrawStyle = 'filled';
-  private spectrumInterpolation: SpectrumInterpolation = 'nearest';
+  private spectrumInterpolation: SpectrumInterpolation = 'linear';
   private theme: ThemeMode = 'dark';
   private realtimeFft: FFT | null = null;
   private realtimeInput = new Float64Array(0);
@@ -294,6 +304,7 @@ export class AudioVisualizer {
     this.playbackActive = active;
     this.playbackFollowMode = mode;
     this.rulerLock = null;
+    this.showPlayhead(this.cursorTime);
     this.requestRender();
     this.requestAnalyzerRender();
   }
@@ -351,6 +362,10 @@ export class AudioVisualizer {
       this.playhead.classList.remove('is-visible');
       return;
     }
+    if (this.playbackActive && this.viewDuration < 1) {
+      this.playhead.classList.remove('is-visible');
+      return;
+    }
     const width = this.timelinePlotWidth;
     const ratio = (time - this.viewStart) / this.viewDuration;
     if (ratio < 0 || ratio > 1) {
@@ -387,7 +402,7 @@ export class AudioVisualizer {
   }
 
   private get timelinePlotWidth(): number {
-    return Math.max(1, this.waveCanvas.clientWidth - AXIS_WIDTH);
+    return Math.max(1, this.waveCanvas.getBoundingClientRect().width - AXIS_WIDTH);
   }
 
   private get minimumFrequency(): number {
@@ -563,24 +578,39 @@ export class AudioVisualizer {
     });
   }
 
-  private prepareCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
+  private prepareCanvas(canvas: HTMLCanvasElement): CanvasSurface {
+    const bounds = canvas.getBoundingClientRect();
+    const width = Math.max(1, bounds.width);
+    const height = Math.max(1, bounds.height);
     const dpr = window.devicePixelRatio || 1;
-    const width = Math.max(1, Math.round(canvas.clientWidth * dpr));
-    const height = Math.max(1, Math.round(canvas.clientHeight * dpr));
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
+    const pixelWidth = Math.max(1, Math.round(width * dpr));
+    const pixelHeight = Math.max(1, Math.round(height * dpr));
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
     }
     const context = canvas.getContext('2d', { alpha: false })!;
-    context.setTransform(dpr, 0, 0, dpr, 0, 0);
-    return context;
+    const scaleX = pixelWidth / width;
+    const scaleY = pixelHeight / height;
+    context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = 'source-over';
+    context.filter = 'none';
+    return { context, width, height, pixelWidth, pixelHeight, scaleX, scaleY };
   }
 
   private drawWaveform(): void {
     const canvas = this.waveCanvas;
-    const context = this.prepareCanvas(canvas);
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
+    const surface = this.prepareCanvas(canvas);
+    const {
+      context,
+      width,
+      height,
+      pixelHeight: physicalHeight,
+      scaleX,
+      scaleY,
+    } = surface;
     const plotRight = width - AXIS_WIDTH;
     const plotWidth = Math.max(1, plotRight);
     const mid = height / 2;
@@ -591,7 +621,7 @@ export class AudioVisualizer {
     context.fillStyle = light ? '#fff' : '#000';
     context.fillRect(plotRight, 0, AXIS_WIDTH, height);
 
-    this.drawTimeGrid(context, height, 0, height, false);
+    this.drawTimeGrid(context, plotRight, height, 0, height, false, scaleX);
 
     const dbTicks = selectWaveformDbTicks(waveHalfHeight);
     context.font = '10px "Chivo Mono", ui-monospace, monospace';
@@ -606,8 +636,8 @@ export class AudioVisualizer {
           : (light ? 'rgba(56, 67, 75, .13)' : 'rgba(158, 181, 196, .08)');
         context.lineWidth = 1;
         context.beginPath();
-        context.moveTo(0, snap(y));
-        context.lineTo(plotRight, snap(y));
+        context.moveTo(0, snap(y, scaleY));
+        context.lineTo(plotRight, snap(y, scaleY));
         context.stroke();
         if (sign < 0 || db !== 0) {
           context.fillStyle = db === 0
@@ -621,16 +651,14 @@ export class AudioVisualizer {
 
     context.strokeStyle = light ? 'rgba(49, 59, 67, .3)' : 'rgba(188, 210, 222, .22)';
     context.beginPath();
-    context.moveTo(0, snap(mid));
-    context.lineTo(plotRight, snap(mid));
+    context.moveTo(0, snap(mid, scaleY));
+    context.lineTo(plotRight, snap(mid, scaleY));
     context.stroke();
     context.fillStyle = light ? '#65717a' : '#5d6974';
     context.fillText('-∞', plotRight + AXIS_LABEL_INSET, mid);
 
     if (this.peaks && this.samples) {
-      const dpr = window.devicePixelRatio || 1;
-      const physicalWidth = Math.max(1, Math.floor(plotWidth * dpr));
-      const physicalHeight = Math.max(1, Math.round(height * dpr));
+      const physicalWidth = Math.max(1, Math.round(plotWidth * scaleX));
       const physicalMid = physicalHeight / 2;
       const physicalHalfHeight = physicalHeight / 2;
       const sampleStart = this.viewStart * this.sampleRate;
@@ -638,6 +666,7 @@ export class AudioVisualizer {
       context.save();
       context.setTransform(1, 0, 0, 1, 0, 0);
       context.imageSmoothingEnabled = false;
+      context.globalAlpha = 1;
       context.fillStyle = this.signalColor;
       for (let pixel = 0; pixel < physicalWidth; pixel += 1) {
         const from = sampleStart + pixel * samplesPerPhysicalPixel;
@@ -653,7 +682,7 @@ export class AudioVisualizer {
       context.restore();
     }
 
-    this.drawWaveformBorder(context, plotRight, height);
+    this.drawWaveformBorder(surface, plotRight);
     context.fillStyle = light ? '#68747d' : '#74818d';
     context.font = '600 9px Inter, ui-sans-serif, system-ui, sans-serif';
     context.textAlign = 'left';
@@ -662,10 +691,8 @@ export class AudioVisualizer {
 
   private drawSpectrogram(): void {
     const canvas = this.spectralCanvas;
-    const context = this.prepareCanvas(canvas);
-    const dpr = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
+    const surface = this.prepareCanvas(canvas);
+    const { context, width, height, scaleX, scaleY } = surface;
     const plotRight = width - AXIS_WIDTH;
     const plotBottom = height;
     const plotWidth = Math.max(1, plotRight);
@@ -675,8 +702,8 @@ export class AudioVisualizer {
     context.fillRect(0, 0, width, height);
 
     if (this.spectrogram) {
-      const pixelWidth = Math.max(1, Math.round(plotWidth * dpr));
-      const pixelHeight = Math.max(1, Math.round(plotHeight * dpr));
+      const pixelWidth = Math.max(1, Math.round(plotWidth * scaleX));
+      const pixelHeight = Math.max(1, Math.round(plotHeight * scaleY));
       const image = context.createImageData(pixelWidth, pixelHeight);
       const packed = new Uint32Array(image.data.buffer);
       const { columns, rows, values, startTime, secondsPerColumn } = this.spectrogram;
@@ -720,8 +747,8 @@ export class AudioVisualizer {
         }
       }
       context.setTransform(1, 0, 0, 1, 0, 0);
-      context.putImageData(image, 0, Math.round(SPECTRAL_RULER * dpr));
-      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+      context.putImageData(image, 0, Math.round(SPECTRAL_RULER * scaleY));
+      context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
     }
 
     context.fillStyle = this.isLightTheme ? '#fff' : '#000';
@@ -729,17 +756,15 @@ export class AudioVisualizer {
     context.fillStyle = this.isLightTheme ? '#fff' : '#000';
     context.fillRect(0, 0, plotWidth, SPECTRAL_RULER);
 
-    this.drawTimeGrid(context, height, SPECTRAL_RULER, plotBottom, true);
-    this.drawFrequencyGrid(context, plotRight, plotBottom, plotHeight);
+    this.drawTimeGrid(context, plotRight, height, SPECTRAL_RULER, plotBottom, true, scaleX);
+    this.drawFrequencyGrid(context, plotRight, plotBottom, plotHeight, scaleY);
   }
 
   private drawSpectrumAnalyzer(): void {
     if (!this.spectrumAnalyzerOpen) return;
     const canvas = this.spectrumCanvas;
-    const context = this.prepareCanvas(canvas);
-    const dpr = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
+    const surface = this.prepareCanvas(canvas);
+    const { context, width, height, pixelWidth: physicalWidth, pixelHeight: physicalHeight, scaleX, scaleY } = surface;
     context.imageSmoothingEnabled = false;
     const light = this.isLightTheme;
     context.fillStyle = light ? '#fff' : '#000';
@@ -748,7 +773,7 @@ export class AudioVisualizer {
     context.fillRect(0, 0, width, SPECTRAL_RULER);
 
     const amplitudeTicks = this.spectrumAmplitudeTicks(width);
-    this.drawSpectrumAnalyzerGrid(context, width, height, amplitudeTicks);
+    this.drawSpectrumAnalyzerGrid(context, width, height, amplitudeTicks, scaleX, scaleY);
 
     context.strokeStyle = light ? 'rgba(48, 59, 67, .23)' : 'rgba(196, 216, 230, .15)';
     context.lineWidth = 1;
@@ -767,9 +792,7 @@ export class AudioVisualizer {
 
     const spectrum = this.computeRealtimeSpectrum();
     if (!spectrum || width <= 0 || height <= SPECTRAL_RULER) return;
-    const physicalWidth = Math.max(1, Math.round(width * dpr));
-    const physicalHeight = Math.max(1, Math.round(height * dpr));
-    const plotTop = Math.min(physicalHeight - 1, Math.round(SPECTRAL_RULER * dpr));
+    const plotTop = Math.min(physicalHeight - 1, Math.round(SPECTRAL_RULER * scaleY));
     const plotHeight = Math.max(1, physicalHeight - plotTop);
     const trace = this.spectrumDrawStyle === 'filled' || this.spectrumDrawStyle === 'outline'
       ? this.spectrumTrace(spectrum, physicalWidth, plotHeight)
@@ -778,6 +801,7 @@ export class AudioVisualizer {
     context.save();
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.imageSmoothingEnabled = false;
+    context.globalAlpha = 1;
     if (this.spectrumDrawStyle === 'filled') {
       context.fillStyle = this.signalColor;
       for (let row = 0; row < trace!.length; row += 1) {
@@ -852,6 +876,8 @@ export class AudioVisualizer {
     width: number,
     height: number,
     amplitudeTicks: Array<{ gridX: number }>,
+    scaleX: number,
+    scaleY: number,
   ): void {
     if (width <= 0 || height <= SPECTRAL_RULER) return;
     context.save();
@@ -862,8 +888,8 @@ export class AudioVisualizer {
     context.beginPath();
     for (const tick of amplitudeTicks) {
       const x = tick.gridX <= 0 ? 0.5 : tick.gridX >= width ? width - 0.5 : tick.gridX;
-      context.moveTo(snap(x), SPECTRAL_RULER);
-      context.lineTo(snap(x), height);
+      context.moveTo(snap(x, scaleX), SPECTRAL_RULER);
+      context.lineTo(snap(x, scaleX), height);
     }
 
     const maxFrequency = this.sampleRate / 2;
@@ -878,7 +904,10 @@ export class AudioVisualizer {
       if (frequency !== minFrequency && Math.abs(y - height) < 21) continue;
       if (Math.abs(y - lastY) < 21 && frequency !== minFrequency && frequency !== maxFrequency) continue;
       lastY = y;
-      const snappedY = Math.max(SPECTRAL_RULER + 0.5, Math.min(height - 0.5, snap(y)));
+      const snappedY = Math.max(
+        SPECTRAL_RULER + 0.5,
+        Math.min(height - 0.5, snap(y, scaleY)),
+      );
       context.moveTo(0, snappedY);
       context.lineTo(width, snappedY);
     }
@@ -1018,14 +1047,14 @@ export class AudioVisualizer {
 
   private drawTimeGrid(
     context: CanvasRenderingContext2D,
+    plotRight: number,
     height: number,
     plotTop: number,
     plotBottom: number,
     withLabels: boolean,
+    scaleX: number,
   ): void {
     if (!this.duration) return;
-    const width = this.waveCanvas.clientWidth;
-    const plotRight = width - AXIS_WIDTH;
     const plotWidth = plotRight;
     const step = niceStep(this.viewDuration / Math.max(2, plotWidth / 105));
     const ticks = this.timeTicks(plotWidth, step);
@@ -1042,11 +1071,11 @@ export class AudioVisualizer {
       context.lineWidth = 1;
       context.beginPath();
       if (withLabels) {
-        context.moveTo(snap(x), SPECTRAL_RULER - 4);
-        context.lineTo(snap(x), SPECTRAL_RULER);
+        context.moveTo(snap(x, scaleX), SPECTRAL_RULER - 4);
+        context.lineTo(snap(x, scaleX), SPECTRAL_RULER);
       } else {
-        context.moveTo(snap(x), plotTop);
-        context.lineTo(snap(x), plotBottom);
+        context.moveTo(snap(x, scaleX), plotTop);
+        context.lineTo(snap(x, scaleX), plotBottom);
       }
       context.stroke();
       if (withLabels) {
@@ -1109,6 +1138,7 @@ export class AudioVisualizer {
     plotRight: number,
     plotBottom: number,
     plotHeight: number,
+    scaleY: number,
   ): void {
     const maxFrequency = this.sampleRate / 2;
     const minFrequency = this.minimumFrequency;
@@ -1133,8 +1163,8 @@ export class AudioVisualizer {
         ? 'rgba(49, 59, 67, .24)'
         : 'rgba(190, 211, 225, .16)';
       context.beginPath();
-      context.moveTo(plotRight, snap(y));
-      context.lineTo(plotRight + 4, snap(y));
+      context.moveTo(plotRight, snap(y, scaleY));
+      context.lineTo(plotRight + 4, snap(y, scaleY));
       context.stroke();
       context.fillStyle = this.isLightTheme ? '#68747d' : '#75828e';
       context.textBaseline = frequency === maxFrequency
@@ -1146,12 +1176,21 @@ export class AudioVisualizer {
     }
   }
 
-  private drawWaveformBorder(context: CanvasRenderingContext2D, plotRight: number, height: number): void {
-    context.strokeStyle = this.isLightTheme
+  private drawWaveformBorder(surface: CanvasSurface, plotRight: number): void {
+    const { context, pixelHeight, scaleX, scaleY } = surface;
+    const right = Math.max(1, Math.round(plotRight * scaleX));
+    const borderX = Math.max(1, Math.round(scaleX));
+    const borderY = Math.max(1, Math.round(scaleY));
+    context.save();
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.fillStyle = this.isLightTheme
       ? 'rgba(49, 59, 67, .32)'
       : 'rgba(190, 210, 224, .16)';
-    context.lineWidth = 1;
-    context.strokeRect(0.5, 0.5, Math.max(0, plotRight - 1), Math.max(0, height - 1));
+    context.fillRect(0, 0, right, borderY);
+    context.fillRect(0, Math.max(0, pixelHeight - borderY), right, borderY);
+    context.fillRect(0, 0, borderX, pixelHeight);
+    context.fillRect(Math.max(0, right - borderX), 0, borderX, pixelHeight);
+    context.restore();
   }
 }
 
@@ -1296,7 +1335,7 @@ function invertPackedColor(color: number): number {
   return (color & 0xff000000) | ((~color) & 0x00ffffff);
 }
 
-function snap(value: number): number {
-  const dpr = window.devicePixelRatio || 1;
-  return Math.round(value * dpr) / dpr;
+function snap(value: number, scale = window.devicePixelRatio || 1): number {
+  const physicalWidth = Math.max(1, scale);
+  return (Math.round(value * scale - physicalWidth / 2) + physicalWidth / 2) / scale;
 }

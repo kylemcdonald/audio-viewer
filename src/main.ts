@@ -95,7 +95,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
           <div class="slider-row">
             <span>TIME</span>
-            <input id="spectrum-fft-slider" class="range-input stepped" type="range" min="0" max="8" step="1" value="2" aria-label="Spectrum resolution" />
+            <input id="spectrum-fft-slider" class="range-input stepped" type="range" min="0" max="8" step="1" value="4" aria-label="Spectrum resolution" />
             <span>FREQ</span>
           </div>
         </div>
@@ -133,8 +133,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
           <div class="palette-select-row">
             <select id="spectrum-interpolation-select" class="palette-select" aria-label="Spectrum interpolation style">
-              <option value="nearest" selected>Nearest neighbor</option>
-              <option value="linear">Linear</option>
+              <option value="nearest">Nearest neighbor</option>
+              <option value="linear" selected>Linear</option>
             </select>
           </div>
         </div>
@@ -277,14 +277,14 @@ const spectrumAnalyzer = get<HTMLElement>('spectrum-analyzer');
 const SETTINGS_STORAGE_KEY = 'audio-spectrogram.settings.v1';
 const persistedSettings = readPersistedSettings();
 fftSlider.value = Math.round(clampNumber(persistedSettings?.fftIndex, 2, 0, 4)).toString();
-spectrumFftSlider.value = Math.round(clampNumber(persistedSettings?.spectrumFftIndex, 2, 0, 8)).toString();
+spectrumFftSlider.value = Math.round(clampNumber(persistedSettings?.spectrumFftIndex, 4, 0, 8)).toString();
 dbRangeSlider.value = clampNumber(persistedSettings?.dbRange, 120, 60, 140).toString();
 spectrumStyleSelect.value = isSpectrumDrawStyle(persistedSettings?.spectrumDrawStyle)
   ? persistedSettings.spectrumDrawStyle
   : 'filled';
 spectrumInterpolationSelect.value = isSpectrumInterpolation(persistedSettings?.spectrumInterpolation)
   ? persistedSettings.spectrumInterpolation
-  : 'nearest';
+  : 'linear';
 paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSettings.palette : 'viridis';
 playbackFollowSelect.value = isPlaybackFollowMode(persistedSettings?.playbackFollowMode)
   ? persistedSettings.playbackFollowMode
@@ -1335,7 +1335,7 @@ function persistSettings(): void {
     spectrumDrawStyle: isSpectrumDrawStyle(spectrumStyleSelect.value) ? spectrumStyleSelect.value : 'filled',
     spectrumInterpolation: isSpectrumInterpolation(spectrumInterpolationSelect.value)
       ? spectrumInterpolationSelect.value
-      : 'nearest',
+      : 'linear',
     palette: isPaletteName(paletteSelect.value) ? paletteSelect.value : 'viridis',
     playbackFollowMode,
     spectrumAnalyzerOpen,
@@ -1435,9 +1435,12 @@ function resizePanelsAt(clientY: number): void {
 
 function applyPanelRatio(): void {
   const available = Math.max(1, editor.clientHeight);
-  const minWave = Math.min(96, available * 0.32);
-  const minSpectral = Math.min(180, available * 0.48);
-  const waveHeight = Math.max(minWave, Math.min(available - minSpectral, wavePanelRatio * available));
+  const minWave = Math.ceil(Math.min(96, available * 0.32));
+  const minSpectral = Math.ceil(Math.min(180, available * 0.48));
+  const waveHeight = Math.max(
+    minWave,
+    Math.min(Math.floor(available - minSpectral), Math.round(wavePanelRatio * available)),
+  );
   wavePanelRatio = waveHeight / available;
   editor.style.setProperty('--wave-size', `${waveHeight}px`);
   panelDivider.setAttribute('aria-valuenow', Math.round(wavePanelRatio * 100).toString());
@@ -1515,7 +1518,7 @@ function initialize(): void {
   );
   updateSpectrumInterpolationControl();
   visualizer.setSpectrumInterpolation(
-    isSpectrumInterpolation(spectrumInterpolationSelect.value) ? spectrumInterpolationSelect.value : 'nearest',
+    isSpectrumInterpolation(spectrumInterpolationSelect.value) ? spectrumInterpolationSelect.value : 'linear',
   );
   updateDbRangeControl();
   visualizer.setSpectralRange(Number(dbRangeSlider.value));

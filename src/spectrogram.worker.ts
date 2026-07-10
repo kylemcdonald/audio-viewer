@@ -8,6 +8,7 @@ const WORKGROUP_SIZE = 256;
 const MAX_COMPLEX_VALUES_PER_BATCH = 1_048_576;
 const MAX_CACHE_VALUES = 32_000_000;
 const DB_QUANTIZATION = 10;
+const FLOOR_DB = -200;
 const INITIAL_COLUMN_TARGET = 64;
 const MINIMUM_TEMPORAL_STEP_MS = 1;
 
@@ -20,6 +21,7 @@ let gpuContextPromise: Promise<GpuContext> | null = null;
 let cachedFftSize = 0;
 let cachedRows = 0;
 let maximumCachedFrames = 1;
+let frameCacheGeneration = 0;
 const frameCache = new Map<number, Int16Array>();
 
 type AnalysisLayout = {
@@ -82,7 +84,7 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
     bins: request.fftSize / 2,
     rows: Math.min(request.fftSize / 2, 1024),
   };
-  prepareFrameCache(request.fftSize, layout.rows);
+  const cacheGeneration = prepareFrameCache(request.fftSize, layout.rows);
   const plan = createAnalysisPlan(request);
   if (plan.targetTicks.length === 0) return;
   const fullyCached = plan.targetTicks.every((tick) => frameCache.has(tick));
@@ -102,7 +104,15 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
       layout,
       plan,
       fullyCached,
-      (ticks, report) => analyzeFramesWithGpu(gpu, ticks, request.fftSize, layout, request.id, report),
+      (ticks, report) => analyzeFramesWithGpu(
+        gpu,
+        ticks,
+        request.fftSize,
+        layout,
+        request.id,
+        cacheGeneration,
+        report,
+      ),
     );
   } catch {
     if (request.id !== latestJobId) return;
@@ -114,7 +124,14 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
         layout,
         plan,
         fullyCached || cachedAfterGpu,
-        (ticks, report) => analyzeFramesWithCpu(ticks, request.fftSize, layout, request.id, report),
+        (ticks, report) => analyzeFramesWithCpu(
+          ticks,
+          request.fftSize,
+          layout,
+          request.id,
+          cacheGeneration,
+          report,
+        ),
       );
     } catch (error) {
       if (request.id !== latestJobId) return;
@@ -251,7 +268,7 @@ function postViewport(
   reusedColumns: number,
 ): void {
   if (request.id !== latestJobId || plan.targetTicks.length === 0) return;
-  const values = assembleViewport(plan.targetTicks, availableStepMs, layout.rows);
+  const values = assembleViewport(plan.targetTicks, availableStepMs, layout.rows, request.fftSize);
   const payload = {
     type: 'partial' as const,
     id: request.id,
@@ -274,8 +291,16 @@ function postViewport(
   worker.postMessage(payload, [values.buffer]);
 }
 
-function assembleViewport(targetTicks: readonly number[], availableStepMs: number, rows: number): Int16Array {
+function assembleViewport(
+  targetTicks: readonly number[],
+  availableStepMs: number,
+  rows: number,
+  fftSize: number,
+): Int16Array {
   const values = new Int16Array(targetTicks.length * rows);
+  values.fill(quantizeDb(FLOOR_DB));
+  const resolved: Array<Int16Array | null> = new Array(targetTicks.length).fill(null);
+
   for (let column = 0; column < targetTicks.length; column += 1) {
     const tick = targetTicks[column];
     let frame = frameCache.get(tick);
@@ -285,6 +310,34 @@ function assembleViewport(targetTicks: readonly number[], availableStepMs: numbe
       const upper = Math.ceil(tick / availableStepMs) * availableStepMs;
       frame = frameCache.get(nearest) ?? frameCache.get(lower) ?? frameCache.get(upper);
     }
+    if (frame) resolved[column] = frame;
+  }
+
+  const nearestLeft = new Int32Array(targetTicks.length);
+  let left = -1;
+  for (let column = 0; column < targetTicks.length; column += 1) {
+    if (resolved[column]) left = column;
+    nearestLeft[column] = left;
+  }
+
+  let right = -1;
+  for (let column = targetTicks.length - 1; column >= 0; column -= 1) {
+    if (resolved[column]) right = column;
+    if (!resolved[column] && isFrameAvailable(targetTicks[column], fftSize)) {
+      const leftIndex = nearestLeft[column];
+      const leftDistance = leftIndex < 0
+        ? Number.POSITIVE_INFINITY
+        : Math.abs(targetTicks[column] - targetTicks[leftIndex]);
+      const rightDistance = right < 0
+        ? Number.POSITIVE_INFINITY
+        : Math.abs(targetTicks[right] - targetTicks[column]);
+      const nearestIndex = leftDistance <= rightDistance ? leftIndex : right;
+      if (nearestIndex >= 0) resolved[column] = resolved[nearestIndex];
+    }
+  }
+
+  for (let column = 0; column < targetTicks.length; column += 1) {
+    const frame = resolved[column];
     if (frame) values.set(frame, column * rows);
   }
   return values;
@@ -312,13 +365,29 @@ function createFrameStarts(ticks: readonly number[], sampleRate: number, fftSize
   return starts;
 }
 
-function prepareFrameCache(fftSize: number, rows: number): void {
+function packFrameSamples(ticks: readonly number[], fftSize: number): Float32Array {
+  const packed = new Float32Array(ticks.length * fftSize);
+  if (!audioSamples) return packed;
+  const starts = createFrameStarts(ticks, audioSampleRate, fftSize);
+  for (let frame = 0; frame < starts.length; frame += 1) {
+    const start = starts[frame];
+    const sourceStart = Math.max(0, start);
+    const sourceEnd = Math.min(audioSamples.length, start + fftSize);
+    if (sourceEnd <= sourceStart) continue;
+    const destinationStart = frame * fftSize + sourceStart - start;
+    packed.set(audioSamples.subarray(sourceStart, sourceEnd), destinationStart);
+  }
+  return packed;
+}
+
+function prepareFrameCache(fftSize: number, rows: number): number {
   if (cachedFftSize !== fftSize || cachedRows !== rows) {
     clearFrameCache();
     cachedFftSize = fftSize;
     cachedRows = rows;
   }
   maximumCachedFrames = Math.max(1, Math.floor(MAX_CACHE_VALUES / rows));
+  return frameCacheGeneration;
 }
 
 function clearFrameCache(): void {
@@ -326,9 +395,11 @@ function clearFrameCache(): void {
   cachedFftSize = 0;
   cachedRows = 0;
   maximumCachedFrames = 1;
+  frameCacheGeneration += 1;
 }
 
-function cacheFrame(tick: number, frame: Int16Array): void {
+function cacheFrame(tick: number, frame: Int16Array, generation: number): boolean {
+  if (generation !== frameCacheGeneration) return false;
   if (frameCache.has(tick)) frameCache.delete(tick);
   frameCache.set(tick, frame);
   while (frameCache.size > maximumCachedFrames) {
@@ -336,6 +407,7 @@ function cacheFrame(tick: number, frame: Int16Array): void {
     if (oldest === undefined) break;
     frameCache.delete(oldest);
   }
+  return true;
 }
 
 function touchCachedFrames(ticks: readonly number[]): void {
@@ -374,6 +446,7 @@ async function analyzeFramesWithGpu(
   fftSize: number,
   layout: AnalysisLayout,
   id: number,
+  cacheGeneration: number,
   report: (progress: number) => void,
 ): Promise<boolean> {
   if (!audioSamples || ticks.length === 0) return true;
@@ -383,38 +456,27 @@ async function analyzeFramesWithGpu(
 
   try {
     for (let frameStart = 0; frameStart < ticks.length; frameStart += maxBatchFrames) {
-      if (id !== latestJobId) return false;
+      if (id !== latestJobId || cacheGeneration !== frameCacheGeneration) return false;
       const batchTicks = ticks.slice(frameStart, frameStart + maxBatchFrames);
-      const globalStarts = createFrameStarts(batchTicks, audioSampleRate, fftSize);
-      const frameCount = globalStarts.length;
-      const chunkStart = Math.max(0, globalStarts[0]);
-      const chunkEnd = Math.max(
-        chunkStart,
-        Math.min(audioSamples.length, globalStarts[globalStarts.length - 1] + fftSize),
-      );
-      const sampleChunk = audioSamples.slice(chunkStart, chunkEnd);
-      const localStarts = new Int32Array(frameCount);
-      for (let index = 0; index < frameCount; index += 1) {
-        localStarts[index] = globalStarts[index] - chunkStart;
-      }
+      const frameCount = batchTicks.length;
+      const packedSamples = packFrameSamples(batchTicks, fftSize);
       const batch = await runGpuBatch(
         device,
         pipelines,
         stageParameters,
-        sampleChunk,
-        localStarts,
+        packedSamples,
         fftSize,
         layout,
       );
+      if (id !== latestJobId || cacheGeneration !== frameCacheGeneration) return false;
       for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
         const frame = new Int16Array(layout.rows);
         const source = frameIndex * layout.rows;
         for (let row = 0; row < layout.rows; row += 1) {
           frame[row] = quantizeDb(batch[source + row]);
         }
-        cacheFrame(batchTicks[frameIndex], frame);
+        if (!cacheFrame(batchTicks[frameIndex], frame, cacheGeneration)) return false;
       }
-      if (id !== latestJobId) return false;
       report((frameStart + frameCount) / ticks.length);
     }
   } finally {
@@ -428,6 +490,7 @@ async function analyzeFramesWithCpu(
   fftSize: number,
   layout: AnalysisLayout,
   id: number,
+  cacheGeneration: number,
   report: (progress: number) => void,
 ): Promise<boolean> {
   if (!audioSamples || ticks.length === 0) return true;
@@ -442,7 +505,7 @@ async function analyzeFramesWithCpu(
 
   for (let column = 0; column < frameStarts.length; column += 1) {
     if (column % 24 === 0) {
-      if (id !== latestJobId) return false;
+      if (id !== latestJobId || cacheGeneration !== frameCacheGeneration) return false;
       report(column / frameStarts.length);
       await yieldToWorker();
     }
@@ -465,14 +528,15 @@ async function analyzeFramesWithCpu(
       }
       frame[row] = quantizeDb(20 * Math.log10(Math.max(peak, 1e-10)));
     }
-    cacheFrame(ticks[column], frame);
+    if (!cacheFrame(ticks[column], frame, cacheGeneration)) return false;
   }
   report(1);
   return true;
 }
 
 function quantizeDb(value: number): number {
-  return Math.round(Math.max(-200, Math.min(20, value)) * DB_QUANTIZATION);
+  const safeValue = Number.isFinite(value) ? value : FLOOR_DB;
+  return Math.round(Math.max(FLOOR_DB, Math.min(20, safeValue)) * DB_QUANTIZATION);
 }
 
 type GpuPipelines = {
@@ -490,7 +554,6 @@ async function createGpuPipelines(device: GPUDevice): Promise<GpuPipelines> {
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ],
   });
   const stageLayout = device.createBindGroupLayout({
@@ -542,15 +605,13 @@ async function runGpuBatch(
   pipelines: GpuPipelines,
   stageParameters: GPUBuffer[],
   samples: Float32Array,
-  frameStarts: Int32Array,
   fftSize: number,
   layout: AnalysisLayout,
 ): Promise<Float32Array> {
-  const frameCount = frameStarts.length;
+  const frameCount = samples.length / fftSize;
   const complexCount = frameCount * fftSize;
   const outputCount = frameCount * layout.rows;
   const sampleBuffer = createMappedBuffer(device, samples, GPUBufferUsage.STORAGE);
-  const startBuffer = createMappedBuffer(device, frameStarts, GPUBufferUsage.STORAGE);
   const complexBuffer = device.createBuffer({ size: complexCount * 8, usage: GPUBufferUsage.STORAGE });
   const outputBuffer = device.createBuffer({
     size: outputCount * 4,
@@ -571,7 +632,6 @@ async function runGpuBatch(
       { binding: 0, resource: { buffer: sampleBuffer } },
       { binding: 1, resource: { buffer: complexBuffer } },
       { binding: 2, resource: { buffer: parameterBuffer } },
-      { binding: 3, resource: { buffer: startBuffer } },
     ],
   });
   const magnitudeGroup = device.createBindGroup({
@@ -613,7 +673,6 @@ async function runGpuBatch(
   const result = new Float32Array(new Float32Array(readbackBuffer.getMappedRange()).slice());
   readbackBuffer.unmap();
   sampleBuffer.destroy();
-  startBuffer.destroy();
   complexBuffer.destroy();
   outputBuffer.destroy();
   readbackBuffer.destroy();
@@ -677,7 +736,6 @@ ${PARAMETER_STRUCT}
 @group(0) @binding(0) var<storage, read> samples: array<f32>;
 @group(0) @binding(1) var<storage, read_write> complex_values: array<vec2<f32>>;
 @group(0) @binding(2) var<uniform> parameters: Parameters;
-@group(0) @binding(3) var<storage, read> frame_starts: array<i32>;
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
@@ -686,10 +744,10 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
   if (index >= total) { return; }
   let frame = index / parameters.fft_size;
   let local = index % parameters.fft_size;
-  let source_index = frame_starts[frame] + i32(local);
+  let source_index = frame * parameters.fft_size + local;
   var sample_value = 0.0;
-  if (source_index >= 0 && source_index < i32(parameters.sample_count)) {
-    sample_value = samples[u32(source_index)];
+  if (source_index < parameters.sample_count) {
+    sample_value = samples[source_index];
   }
   let phase = 6.283185307179586 * f32(local) / f32(parameters.fft_size - 1u);
   let window = 0.5 - 0.5 * cos(phase);

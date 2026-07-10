@@ -627,6 +627,7 @@ select:focus-visible {
   display: block;
   width: 100%;
   height: 100%;
+  image-rendering: pixelated;
 }
 
 .wave-panel {
@@ -809,6 +810,7 @@ select:focus-visible {
   display: block;
   width: 100%;
   height: 100%;
+  image-rendering: pixelated;
 }
 
 .spectrum-divider[hidden],
