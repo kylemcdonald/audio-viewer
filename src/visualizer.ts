@@ -594,7 +594,7 @@ export class AudioVisualizer {
     this.drawTimeGrid(context, height, 0, height, false);
 
     const dbTicks = selectWaveformDbTicks(waveHalfHeight);
-    context.font = '10px Inter, ui-sans-serif, system-ui, sans-serif';
+    context.font = '10px "Chivo Mono", ui-monospace, monospace';
     context.textAlign = 'left';
     context.textBaseline = 'middle';
     for (const db of dbTicks) {
@@ -1029,7 +1029,7 @@ export class AudioVisualizer {
     const plotWidth = plotRight;
     const step = niceStep(this.viewDuration / Math.max(2, plotWidth / 105));
     const ticks = this.timeTicks(plotWidth, step);
-    context.font = '10px Inter, ui-sans-serif, system-ui, sans-serif';
+    context.font = '10px "Chivo Mono", ui-monospace, monospace';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
 
@@ -1113,7 +1113,7 @@ export class AudioVisualizer {
     const maxFrequency = this.sampleRate / 2;
     const minFrequency = this.minimumFrequency;
     const candidates = frequencyTicks(maxFrequency, this.scaleBlend, minFrequency);
-    context.font = '10px Inter, ui-sans-serif, system-ui, sans-serif';
+    context.font = '10px "Chivo Mono", ui-monospace, monospace';
     context.textAlign = 'left';
     context.textBaseline = 'middle';
     let lastY = Number.POSITIVE_INFINITY;
