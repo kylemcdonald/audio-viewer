@@ -581,7 +581,7 @@ async function loadProgressiveWav(file: File, header: WavHeader, loadId: number)
   isReadingFile = false;
   fileSizeElement.textContent = formatFileSize(file.size);
   updateTransportState();
-  analyzeCurrentAudio();
+  analyzeCurrentAudio({ stableUpdate: true, force: true });
 }
 
 async function loadWithBrowserDecoder(file: File, loadId: number): Promise<void> {
@@ -706,7 +706,7 @@ function playbackAnalysisInterval(): number {
   return Math.max(16, Math.min(120, analysisViewDuration * 250));
 }
 
-function analyzeCurrentAudio(): void {
+function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean } = {}): void {
   if (!analysisWorker || audioDuration <= 0) return;
   window.clearTimeout(fftDebounce);
   window.clearTimeout(viewportAnalysisTimer);
@@ -735,10 +735,10 @@ function analyzeCurrentAudio(): void {
   const requestColumns = Math.max(1, Math.round(visibleColumns * (requestDuration / viewDuration)));
   const secondsPerColumn = analysisTargetStep(requestDuration, requestColumns);
 
-  if (
+  if (!options.force && (
     coverageIncludes(latestSpectrogram, requestStart, requiredEnd, fftSize, secondsPerColumn) ||
     coverageIncludes(activeAnalysisRequest, requestStart, requiredEnd, fftSize, secondsPerColumn)
-  ) return;
+  )) return;
 
   lastViewportAnalysisAt = performance.now();
   analysisId += 1;
@@ -755,6 +755,8 @@ function analyzeCurrentAudio(): void {
     viewDuration: requestDuration,
     columns: requestColumns,
     minimumSecondsPerColumn: 0.001,
+    intermediateResults: !isReadingFile && !options.stableUpdate,
+    prefetchFiner: !isReadingFile,
   };
   activeAnalysisRequest = {
     id: request.id,

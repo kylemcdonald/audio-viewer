@@ -36,6 +36,8 @@ export type AnalysisRequest = {
   viewDuration: number;
   columns: number;
   minimumSecondsPerColumn: number;
+  intermediateResults: boolean;
+  prefetchFiner: boolean;
 };
 
 export type AnalysisBackend = {

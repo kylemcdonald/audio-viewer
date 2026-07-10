@@ -140,12 +140,16 @@ function createAnalysisPlan(request: AnalysisRequest): AnalysisPlan {
   const targetStepMs = minimumStepMs * 2 ** exponent;
   const targetTicks = createAlignedTicks(request.startTime, request.viewDuration, targetStepMs)
     .filter((tick) => isFrameAvailable(tick, request.fftSize));
-  let initialStepMs = targetStepMs;
-  while ((request.viewDuration * 1000) / initialStepMs + 1 > INITIAL_COLUMN_TARGET) {
-    initialStepMs *= 2;
-  }
   const stages: number[] = [];
-  for (let step = initialStepMs; step >= targetStepMs; step /= 2) stages.push(step);
+  if (request.intermediateResults) {
+    let initialStepMs = targetStepMs;
+    while ((request.viewDuration * 1000) / initialStepMs + 1 > INITIAL_COLUMN_TARGET) {
+      initialStepMs *= 2;
+    }
+    for (let step = initialStepMs; step >= targetStepMs; step /= 2) stages.push(step);
+  } else {
+    stages.push(targetStepMs);
+  }
   return { targetStepMs, targetTicks, stages };
 }
 
@@ -212,7 +216,7 @@ async function computeCachedViewport(
     }
   }
 
-  if (request.id !== latestJobId) return;
+  if (request.id !== latestJobId || !request.prefetchFiner) return;
   await prefetchFinerLevels(request, plan.targetStepMs, compute);
 }
 
