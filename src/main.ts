@@ -581,7 +581,7 @@ function updateRangeFill(input: HTMLInputElement): void {
 }
 
 type PersistedSettings = {
-  version: 1;
+  version: 2;
   paneRatio: number;
   frequencyScale: number;
   fftIndex: number;
@@ -592,7 +592,11 @@ type PersistedSettings = {
 function readPersistedSettings(): PersistedSettings | null {
   try {
     const value = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) ?? 'null') as Partial<PersistedSettings> | null;
-    return value?.version === 1 ? value as PersistedSettings : null;
+    if (value?.version === 2) return value as PersistedSettings;
+    if ((value?.version as number | undefined) === 1) {
+      return { ...value, version: 2, palette: 'viridis' } as PersistedSettings;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -606,7 +610,7 @@ function scheduleSettingsSave(): void {
 function persistSettings(): void {
   window.clearTimeout(settingsSaveTimer);
   const settings: PersistedSettings = {
-    version: 1,
+    version: 2,
     paneRatio: wavePanelRatio,
     frequencyScale: frequencyScaleBlend,
     fftIndex: Number(fftSlider.value),
