@@ -851,12 +851,7 @@ export class AudioVisualizer {
       : [];
     this.drawSpectrumAnalyzerGrid(context, width, height, amplitudeTicks, scaleX, scaleY);
 
-    context.strokeStyle = light ? 'rgba(48, 59, 67, .23)' : 'rgba(196, 216, 230, .15)';
-    context.lineWidth = 1;
-    context.beginPath();
-    context.moveTo(0, SPECTRAL_RULER - 0.5);
-    context.lineTo(width, SPECTRAL_RULER - 0.5);
-    context.stroke();
+    this.drawSpectrumAnalyzerRulerBorder(context, physicalWidth, plotTop);
 
     this.drawSpectrumAmplitudeLabels(context, amplitudeTicks, hoverLabels);
 
@@ -1124,6 +1119,7 @@ export class AudioVisualizer {
     let lastY = Number.POSITIVE_INFINITY;
     for (let index = candidates.length - 1; index >= 0; index -= 1) {
       const frequency = candidates[index];
+      if (frequency === maxFrequency) continue;
       const scaled = scaleFrequency(frequency / maxFrequency, this.scaleBlend, maxFrequency, minFrequency);
       const y = height - scaled * plotHeight;
       if (frequency !== minFrequency && Math.abs(y - height) < 21) continue;
@@ -1137,6 +1133,20 @@ export class AudioVisualizer {
       context.lineTo(width, snappedY);
     }
     context.stroke();
+    context.restore();
+  }
+
+  private drawSpectrumAnalyzerRulerBorder(
+    context: CanvasRenderingContext2D,
+    physicalWidth: number,
+    plotTop: number,
+  ): void {
+    context.save();
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.fillStyle = this.isLightTheme
+      ? 'rgba(48, 59, 67, .23)'
+      : 'rgba(196, 216, 230, .15)';
+    context.fillRect(0, Math.max(0, plotTop - 1), physicalWidth, 1);
     context.restore();
   }
 
@@ -1310,15 +1320,6 @@ export class AudioVisualizer {
       }
     }
 
-    if (withLabels) {
-      context.strokeStyle = this.isLightTheme
-        ? 'rgba(49, 59, 67, .24)'
-        : 'rgba(196, 216, 230, .15)';
-      context.beginPath();
-      context.moveTo(0, SPECTRAL_RULER - 0.5);
-      context.lineTo(plotRight, SPECTRAL_RULER - 0.5);
-      context.stroke();
-    }
     void height;
   }
 
@@ -1402,10 +1403,10 @@ export class AudioVisualizer {
   }
 
   private drawWaveformBorder(surface: CanvasSurface, plotRight: number): void {
-    const { context, pixelHeight, scaleX, scaleY } = surface;
+    const { context, pixelHeight, scaleX } = surface;
     const right = Math.max(1, Math.round(plotRight * scaleX));
-    const borderX = Math.max(1, Math.round(scaleX));
-    const borderY = Math.max(1, Math.round(scaleY));
+    const borderX = 1;
+    const borderY = 1;
     context.save();
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.fillStyle = this.isLightTheme
