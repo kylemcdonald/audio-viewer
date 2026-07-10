@@ -10,6 +10,7 @@ const UNLOADED_SPECTROGRAM_COLOR = 0xff000000;
 export type PlaybackFollowMode = 'center' | 'right' | 'page';
 export type SpectrumDrawStyle = 'outline' | 'filled' | 'bars';
 export type SpectrumInterpolation = 'nearest' | 'linear';
+export type ThemeMode = 'dark' | 'light';
 
 type PeakLevel = {
   blockSize: number;
@@ -158,6 +159,7 @@ export class AudioVisualizer {
   private spectrumFftSize = 2048;
   private spectrumDrawStyle: SpectrumDrawStyle = 'outline';
   private spectrumInterpolation: SpectrumInterpolation = 'nearest';
+  private theme: ThemeMode = 'dark';
   private realtimeFft: FFT | null = null;
   private realtimeInput = new Float64Array(0);
   private realtimeWindow = new Float64Array(0);
@@ -280,6 +282,13 @@ export class AudioVisualizer {
     this.requestAnalyzerRender();
   }
 
+  setTheme(theme: ThemeMode): void {
+    if (theme === this.theme) return;
+    this.theme = theme;
+    this.requestRender();
+    this.requestAnalyzerRender();
+  }
+
   setPlaybackState(active: boolean, mode: PlaybackFollowMode): void {
     if (this.playbackActive === active && this.playbackFollowMode === mode) return;
     this.playbackActive = active;
@@ -383,6 +392,10 @@ export class AudioVisualizer {
 
   private get minimumFrequency(): number {
     return 0;
+  }
+
+  private get isLightTheme(): boolean {
+    return this.theme === 'light';
   }
 
   private bindInteractions(): void {
@@ -564,9 +577,10 @@ export class AudioVisualizer {
     const plotWidth = Math.max(1, plotRight);
     const mid = height / 2;
     const waveHalfHeight = height / 2;
-    context.fillStyle = '#11151b';
+    const light = this.isLightTheme;
+    context.fillStyle = light ? '#fff' : '#000';
     context.fillRect(0, 0, width, height);
-    context.fillStyle = '#0c0f14';
+    context.fillStyle = light ? '#fff' : '#000';
     context.fillRect(plotRight, 0, AXIS_WIDTH, height);
 
     this.drawTimeGrid(context, height, 0, height, false);
@@ -579,26 +593,30 @@ export class AudioVisualizer {
       const amplitude = 10 ** (db / 20);
       for (const sign of [-1, 1]) {
         const y = mid + sign * amplitude * waveHalfHeight;
-        context.strokeStyle = db === 0 ? 'rgba(158, 181, 196, .14)' : 'rgba(158, 181, 196, .08)';
+        context.strokeStyle = db === 0
+          ? (light ? 'rgba(56, 67, 75, .26)' : 'rgba(158, 181, 196, .14)')
+          : (light ? 'rgba(56, 67, 75, .13)' : 'rgba(158, 181, 196, .08)');
         context.lineWidth = 1;
         context.beginPath();
         context.moveTo(0, snap(y));
         context.lineTo(plotRight, snap(y));
         context.stroke();
         if (sign < 0 || db !== 0) {
-          context.fillStyle = db === 0 ? '#9aa6b2' : '#687581';
+          context.fillStyle = db === 0
+            ? (light ? '#56616a' : '#9aa6b2')
+            : (light ? '#76818a' : '#687581');
           const labelY = Math.max(7, Math.min(height - 7, y));
           context.fillText(db === 0 ? '0 dB' : `${db}`, plotRight + AXIS_LABEL_INSET, labelY);
         }
       }
     }
 
-    context.strokeStyle = 'rgba(188, 210, 222, .22)';
+    context.strokeStyle = light ? 'rgba(49, 59, 67, .3)' : 'rgba(188, 210, 222, .22)';
     context.beginPath();
     context.moveTo(0, snap(mid));
     context.lineTo(plotRight, snap(mid));
     context.stroke();
-    context.fillStyle = '#5d6974';
+    context.fillStyle = light ? '#65717a' : '#5d6974';
     context.fillText('-∞', plotRight + AXIS_LABEL_INSET, mid);
 
     if (this.peaks && this.samples) {
@@ -628,7 +646,7 @@ export class AudioVisualizer {
     }
 
     this.drawWaveformBorder(context, width, height);
-    context.fillStyle = '#74818d';
+    context.fillStyle = light ? '#68747d' : '#74818d';
     context.font = '600 9px Inter, ui-sans-serif, system-ui, sans-serif';
     context.textAlign = 'left';
     context.fillText('L+R', 9, 14);
@@ -645,7 +663,7 @@ export class AudioVisualizer {
     const plotWidth = Math.max(1, plotRight);
     const plotHeight = Math.max(1, plotBottom - SPECTRAL_RULER);
     const isStreaming = Boolean(this.samples && this.availableSamples < this.samples.length);
-    context.fillStyle = isStreaming ? '#000' : '#080b12';
+    context.fillStyle = isStreaming ? '#000' : (this.isLightTheme ? '#fff' : '#000');
     context.fillRect(0, 0, width, height);
 
     if (this.spectrogram) {
@@ -697,9 +715,9 @@ export class AudioVisualizer {
       context.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
-    context.fillStyle = '#0c0f14';
+    context.fillStyle = this.isLightTheme ? '#fff' : '#000';
     context.fillRect(plotRight, 0, AXIS_WIDTH, height);
-    context.fillStyle = '#0d1117';
+    context.fillStyle = this.isLightTheme ? '#fff' : '#000';
     context.fillRect(0, 0, plotWidth, SPECTRAL_RULER);
 
     this.drawTimeGrid(context, height, SPECTRAL_RULER, plotBottom, true);
@@ -714,14 +732,15 @@ export class AudioVisualizer {
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
     context.imageSmoothingEnabled = false;
-    context.fillStyle = '#080b12';
+    const light = this.isLightTheme;
+    context.fillStyle = light ? '#fff' : '#000';
     context.fillRect(0, 0, width, height);
-    context.fillStyle = '#0d1117';
+    context.fillStyle = light ? '#fff' : '#000';
     context.fillRect(0, 0, width, SPECTRAL_RULER);
 
     this.drawSpectrumAnalyzerGrid(context, width, height);
 
-    context.strokeStyle = 'rgba(196, 216, 230, .15)';
+    context.strokeStyle = light ? 'rgba(48, 59, 67, .23)' : 'rgba(196, 216, 230, .15)';
     context.lineWidth = 1;
     context.beginPath();
     context.moveTo(0, SPECTRAL_RULER - 0.5);
@@ -780,7 +799,9 @@ export class AudioVisualizer {
     if (width <= 0 || height <= SPECTRAL_RULER) return;
     context.save();
     context.lineWidth = 1;
-    context.strokeStyle = 'rgba(190, 211, 225, .11)';
+    context.strokeStyle = this.isLightTheme
+      ? 'rgba(48, 59, 67, .16)'
+      : 'rgba(190, 211, 225, .11)';
     context.beginPath();
     for (const x of [0.5, width / 2, width - 0.5]) {
       context.moveTo(snap(x), SPECTRAL_RULER);
@@ -930,7 +951,9 @@ export class AudioVisualizer {
     for (const tick of ticks) {
       const { time, x } = tick;
       if (x < -1 || x > plotRight + 1) continue;
-      context.strokeStyle = withLabels ? 'rgba(183, 202, 219, .13)' : 'rgba(183, 202, 219, .07)';
+      context.strokeStyle = withLabels
+        ? (this.isLightTheme ? 'rgba(49, 59, 67, .2)' : 'rgba(183, 202, 219, .13)')
+        : (this.isLightTheme ? 'rgba(49, 59, 67, .13)' : 'rgba(183, 202, 219, .07)');
       context.lineWidth = 1;
       context.beginPath();
       if (withLabels) {
@@ -942,14 +965,16 @@ export class AudioVisualizer {
       }
       context.stroke();
       if (withLabels) {
-        context.fillStyle = '#83909c';
+        context.fillStyle = this.isLightTheme ? '#68747d' : '#83909c';
         context.textAlign = x < 24 ? 'left' : x > plotRight - 24 ? 'right' : 'center';
         context.fillText(formatRuler(time, step), x, SPECTRAL_RULER / 2 + 0.5);
       }
     }
 
     if (withLabels) {
-      context.strokeStyle = 'rgba(196, 216, 230, .15)';
+      context.strokeStyle = this.isLightTheme
+        ? 'rgba(49, 59, 67, .24)'
+        : 'rgba(196, 216, 230, .15)';
       context.beginPath();
       context.moveTo(0, SPECTRAL_RULER - 0.5);
       context.lineTo(plotRight, SPECTRAL_RULER - 0.5);
@@ -1019,12 +1044,14 @@ export class AudioVisualizer {
         frequency !== maxFrequency
       ) continue;
       lastY = y;
-      context.strokeStyle = 'rgba(190, 211, 225, .16)';
+      context.strokeStyle = this.isLightTheme
+        ? 'rgba(49, 59, 67, .24)'
+        : 'rgba(190, 211, 225, .16)';
       context.beginPath();
       context.moveTo(plotRight, snap(y));
       context.lineTo(plotRight + 4, snap(y));
       context.stroke();
-      context.fillStyle = '#75828e';
+      context.fillStyle = this.isLightTheme ? '#68747d' : '#75828e';
       context.textBaseline = frequency === maxFrequency
         ? 'top'
         : frequency === minFrequency
@@ -1035,7 +1062,9 @@ export class AudioVisualizer {
   }
 
   private drawWaveformBorder(context: CanvasRenderingContext2D, width: number, height: number): void {
-    context.strokeStyle = 'rgba(190, 210, 224, .16)';
+    context.strokeStyle = this.isLightTheme
+      ? 'rgba(49, 59, 67, .32)'
+      : 'rgba(190, 210, 224, .16)';
     context.lineWidth = 1;
     context.strokeRect(0.5, 0.5, Math.max(0, width - 1), Math.max(0, height - 1));
   }

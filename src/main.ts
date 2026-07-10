@@ -15,6 +15,7 @@ import {
   type PlaybackFollowMode,
   type SpectrumDrawStyle,
   type SpectrumInterpolation,
+  type ThemeMode,
 } from './visualizer';
 import { decodeWavChunk, parseWavHeader, preferredWavChunkBytes, type WavHeader } from './wav-reader';
 import type { Mp4AudioSession } from './mp4-reader';
@@ -161,6 +162,20 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
             </select>
           </div>
         </div>
+        <div class="settings-divider" aria-hidden="true"></div>
+        <div class="control-group appearance-control">
+          <div class="control-heading">
+            <label for="theme-toggle">Appearance</label>
+          </div>
+          <div class="theme-toggle-row">
+            <span>Dark</span>
+            <label class="theme-switch">
+              <input id="theme-toggle" type="checkbox" role="switch" aria-label="Use light mode" />
+              <span aria-hidden="true"></span>
+            </label>
+            <span>Light</span>
+          </div>
+        </div>
       </div>
     </dialog>
 
@@ -195,7 +210,6 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         </aside>
 
         <div class="editor-playhead" id="playhead" aria-hidden="true">
-          <span class="playhead-cap"></span>
           <span class="playhead-line"></span>
         </div>
 
@@ -237,6 +251,7 @@ const spectrumStyleSelect = get<HTMLSelectElement>('spectrum-style-select');
 const spectrumInterpolationSelect = get<HTMLSelectElement>('spectrum-interpolation-select');
 const paletteSelect = get<HTMLSelectElement>('palette-select');
 const playbackFollowSelect = get<HTMLSelectElement>('playback-follow-select');
+const themeToggle = get<HTMLInputElement>('theme-toggle');
 const analysisOverlay = get<HTMLElement>('analysis-overlay');
 const analysisTitle = get<HTMLElement>('analysis-title');
 const analysisDetail = get<HTMLElement>('analysis-detail');
@@ -272,6 +287,7 @@ paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSetti
 playbackFollowSelect.value = isPlaybackFollowMode(persistedSettings?.playbackFollowMode)
   ? persistedSettings.playbackFollowMode
   : 'page';
+themeToggle.checked = isThemeMode(persistedSettings?.theme) && persistedSettings.theme === 'light';
 
 let monoSamples: Float32Array | null = null;
 let audioSampleRate = 48000;
@@ -309,7 +325,10 @@ let spectrumDividerGrabOffset = 0;
 let overlayTimer = 0;
 let overlayToken = 0;
 let playbackFollowMode = playbackFollowSelect.value as PlaybackFollowMode;
+let themeMode: ThemeMode = themeToggle.checked ? 'light' : 'dark';
 let lastPlaybackAnalysisCheck = 0;
+
+document.documentElement.dataset.theme = themeMode;
 
 const fftBins = [256, 512, 1024, 2048, 4096] as const;
 
@@ -410,6 +429,12 @@ playbackFollowSelect.addEventListener('change', () => {
     visualizer.follow(engine.currentTime);
     scheduleViewportAnalysis(0);
   }
+  scheduleSettingsSave();
+});
+
+themeToggle.addEventListener('change', () => {
+  themeMode = themeToggle.checked ? 'light' : 'dark';
+  applyTheme();
   scheduleSettingsSave();
 });
 
@@ -1163,6 +1188,17 @@ function setFrequencyScale(value: number): void {
   scheduleSettingsSave();
 }
 
+function applyTheme(): void {
+  document.documentElement.dataset.theme = themeMode;
+  themeToggle.checked = themeMode === 'light';
+  themeToggle.setAttribute('aria-checked', themeToggle.checked.toString());
+  document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute(
+    'content',
+    themeMode === 'light' ? '#ffffff' : '#000000',
+  );
+  visualizer.setTheme(themeMode);
+}
+
 function updateRangeFill(input: HTMLInputElement): void {
   const min = Number(input.min) || 0;
   const max = Number(input.max) || 100;
@@ -1179,7 +1215,7 @@ type AnalysisCoverage = {
 };
 
 type PersistedSettings = {
-  version: 5;
+  version: 6;
   paneRatio: number;
   frequencyScale: number;
   fftIndex: number;
@@ -1191,28 +1227,38 @@ type PersistedSettings = {
   playbackFollowMode: PlaybackFollowMode;
   spectrumAnalyzerOpen: boolean;
   spectrumAnalyzerWidth: number;
+  theme: ThemeMode;
 };
 
 function readPersistedSettings(): PersistedSettings | null {
   try {
     const value = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) ?? 'null') as Partial<PersistedSettings> | null;
-    if (value?.version === 5) return value as PersistedSettings;
+    if (value?.version === 6) return value as PersistedSettings;
+    if ((value?.version as number | undefined) === 5) {
+      return {
+        ...value,
+        version: 6,
+        theme: 'dark',
+      } as PersistedSettings;
+    }
     if ((value?.version as number | undefined) === 4) {
       return {
         ...value,
-        version: 5,
+        version: 6,
         spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
         spectrumDrawStyle: 'outline',
         spectrumInterpolation: 'nearest',
+        theme: 'dark',
       } as PersistedSettings;
     }
     if ((value?.version as number | undefined) === 3) {
       return {
         ...value,
-        version: 5,
+        version: 6,
         spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
         spectrumDrawStyle: 'outline',
         spectrumInterpolation: 'nearest',
+        theme: 'dark',
         spectrumAnalyzerOpen: false,
         spectrumAnalyzerWidth: defaultSpectrumAnalyzerWidth(),
       } as PersistedSettings;
@@ -1220,10 +1266,11 @@ function readPersistedSettings(): PersistedSettings | null {
     if ((value?.version as number | undefined) === 2) {
       return {
         ...value,
-        version: 5,
+        version: 6,
         spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
         spectrumDrawStyle: 'outline',
         spectrumInterpolation: 'nearest',
+        theme: 'dark',
         playbackFollowMode: 'page',
         spectrumAnalyzerOpen: false,
         spectrumAnalyzerWidth: defaultSpectrumAnalyzerWidth(),
@@ -1232,10 +1279,11 @@ function readPersistedSettings(): PersistedSettings | null {
     if ((value?.version as number | undefined) === 1) {
       return {
         ...value,
-        version: 5,
+        version: 6,
         spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 4),
         spectrumDrawStyle: 'outline',
         spectrumInterpolation: 'nearest',
+        theme: 'dark',
         palette: 'viridis',
         playbackFollowMode: 'page',
         spectrumAnalyzerOpen: false,
@@ -1256,7 +1304,7 @@ function scheduleSettingsSave(): void {
 function persistSettings(): void {
   window.clearTimeout(settingsSaveTimer);
   const settings: PersistedSettings = {
-    version: 5,
+    version: 6,
     paneRatio: wavePanelRatio,
     frequencyScale: frequencyScaleBlend,
     fftIndex: Number(fftSlider.value),
@@ -1270,6 +1318,7 @@ function persistSettings(): void {
     playbackFollowMode,
     spectrumAnalyzerOpen,
     spectrumAnalyzerWidth,
+    theme: themeMode,
   };
   try {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
@@ -1288,6 +1337,10 @@ function isSpectrumDrawStyle(value: unknown): value is SpectrumDrawStyle {
 
 function isSpectrumInterpolation(value: unknown): value is SpectrumInterpolation {
   return value === 'nearest' || value === 'linear';
+}
+
+function isThemeMode(value: unknown): value is ThemeMode {
+  return value === 'dark' || value === 'light';
 }
 
 function clampNumber(value: unknown, fallback: number, minimum: number, maximum: number): number {
@@ -1431,6 +1484,7 @@ function downloadSpectrogramPng(): void {
 }
 
 function initialize(): void {
+  applyTheme();
   updateFftControl();
   updateSpectrumFftControl();
   visualizer.setSpectrumFftSize(fftBins[Number(spectrumFftSlider.value)] * 2);
