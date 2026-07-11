@@ -999,13 +999,24 @@ export class AudioVisualizer {
       const maxFrequency = this.sampleRate / 2;
       const minFrequency = this.minimumFrequency;
       const minNormalized = minFrequency / maxFrequency;
-      const rowMap = new Uint16Array(pixelHeight);
+      const rowMap = new Int32Array(pixelHeight);
       const columnMap = new Int32Array(pixelWidth);
       const availableTime = this.availableSamples / this.sampleRate;
+      const isCqt = this.spectrogram.mode === 'cqt';
+      const cqtFmin = this.spectrogram.cqtFmin ?? 32.703;
+      const cqtBinsPerOctave = this.spectrogram.cqtBinsPerOctave ?? 24;
 
       for (let y = 0; y < pixelHeight; y += 1) {
         const scaled = 1 - y / Math.max(1, pixelHeight - 1);
         const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
+        if (isCqt) {
+          // CQT rows are log-spaced bands: row = B * log2(f / fmin).
+          // Pixels outside the band range render at the display floor.
+          const hertz = frequency * maxFrequency;
+          const row = hertz > 0 ? Math.round(cqtBinsPerOctave * Math.log2(hertz / cqtFmin)) : -1;
+          rowMap[y] = row >= 0 && row < rows ? row : -1;
+          continue;
+        }
         const row = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
         rowMap[y] = Math.min(rows - 1, Math.max(0, Math.round(row * (rows - 1))));
       }
@@ -1029,7 +1040,8 @@ export class AudioVisualizer {
             packed[offset + x] = UNLOADED_SPECTROGRAM_COLOR;
             continue;
           }
-          const db = values[column * rows + row] / 10;
+          // Rows outside the analysis band range (CQT) draw at the floor.
+          const db = row < 0 ? -this.spectralRangeDb : values[column * rows + row] / 10;
           const normalized = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
           const paletteIndex = Math.round(normalized * 255);
           packed[offset + x] = this.colorLut[this.isLightTheme ? 255 - paletteIndex : paletteIndex];

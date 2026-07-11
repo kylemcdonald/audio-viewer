@@ -5,6 +5,7 @@ import type {
   AnalysisAppend,
   AnalysisInitialize,
   AnalysisMessage,
+  AnalysisMode,
   AnalysisRequest,
   AnalysisStreamInitialize,
   SpectrogramData,
@@ -80,6 +81,18 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <button class="settings-close" id="settings-close" type="button" aria-label="Close settings">${closeIcon}</button>
       </div>
       <div class="settings-controls">
+        <div class="control-group analysis-mode-control">
+          <div class="control-heading">
+            <label for="analysis-mode-select">Spectrogram analysis</label>
+          </div>
+          <div class="palette-select-row">
+            <select id="analysis-mode-select" class="palette-select" aria-label="Spectrogram analysis mode">
+              <option value="fft" selected>FFT — linear bins</option>
+              <option value="cqt">CQT — constant-Q log bands</option>
+            </select>
+          </div>
+        </div>
+        <div class="settings-divider" aria-hidden="true"></div>
         <div class="control-group fft-control">
           <div class="control-heading">
             <label for="fft-slider">Spectrogram resolution</label>
@@ -269,6 +282,7 @@ const dbRangeSlider = get<HTMLInputElement>('db-range-slider');
 const dbRangeOutput = get<HTMLOutputElement>('db-range-output');
 const frequencyScaleSlider = get<HTMLInputElement>('frequency-scale-slider');
 const frequencyScaleOutput = get<HTMLOutputElement>('frequency-scale-output');
+const analysisModeSelect = get<HTMLSelectElement>('analysis-mode-select');
 const spectrumStyleSelect = get<HTMLSelectElement>('spectrum-style-select');
 const spectrumInterpolationSelect = get<HTMLSelectElement>('spectrum-interpolation-select');
 const paletteSelect = get<HTMLSelectElement>('palette-select');
@@ -308,6 +322,7 @@ spectrumStyleSelect.value = isSpectrumDrawStyle(persistedSettings?.spectrumDrawS
 spectrumInterpolationSelect.value = isSpectrumInterpolation(persistedSettings?.spectrumInterpolation)
   ? persistedSettings.spectrumInterpolation
   : 'linear';
+analysisModeSelect.value = persistedSettings?.analysisMode === 'cqt' ? 'cqt' : 'fft';
 paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSettings.palette : 'viridis';
 playbackFollowSelect.value = isPlaybackFollowMode(persistedSettings?.playbackFollowMode)
   ? persistedSettings.playbackFollowMode
@@ -430,6 +445,11 @@ fftSlider.addEventListener('input', () => {
   scheduleSettingsSave();
   window.clearTimeout(fftDebounce);
   fftDebounce = window.setTimeout(() => analyzeCurrentAudio(), 220);
+});
+
+analysisModeSelect.addEventListener('change', () => {
+  scheduleSettingsSave();
+  analyzeCurrentAudio({ force: true });
 });
 
 spectrumFftSlider.addEventListener('input', () => {
@@ -1114,6 +1134,7 @@ function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean 
   viewportAnalysisTimer = 0;
   const bins = fftBins[Number(fftSlider.value)];
   const fftSize = bins * 2;
+  const analysisMode: AnalysisMode = analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft';
   const visibleColumns = visualizer.analysisColumnCount;
   const viewDuration = Math.max(0.001, analysisViewDuration);
   let requestStart = analysisViewStart;
@@ -1137,8 +1158,8 @@ function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean 
   const secondsPerColumn = analysisTargetStep(requestDuration, requestColumns);
 
   if (!options.force && (
-    coverageIncludes(latestSpectrogram, requestStart, requiredEnd, fftSize, secondsPerColumn) ||
-    coverageIncludes(activeAnalysisRequest, requestStart, requiredEnd, fftSize, secondsPerColumn)
+    coverageIncludes(latestSpectrogram, requestStart, requiredEnd, fftSize, secondsPerColumn, analysisMode) ||
+    coverageIncludes(activeAnalysisRequest, requestStart, requiredEnd, fftSize, secondsPerColumn, analysisMode)
   )) return;
 
   lastViewportAnalysisAt = performance.now();
@@ -1152,6 +1173,7 @@ function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean 
     type: 'analyze',
     id: analysisId,
     fftSize,
+    analysisMode,
     startTime: requestStart,
     viewDuration: requestDuration,
     columns: requestColumns,
@@ -1162,6 +1184,7 @@ function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean 
   activeAnalysisRequest = {
     id: request.id,
     fftSize,
+    mode: analysisMode,
     startTime: requestStart,
     endTime: requestEnd,
     secondsPerColumn,
@@ -1202,6 +1225,9 @@ function handleAnalysisMessage(event: MessageEvent<AnalysisMessage>): void {
     startTime: message.data.startTime,
     endTime: message.data.endTime,
     secondsPerColumn: message.data.secondsPerColumn,
+    mode: message.data.mode ?? 'fft',
+    cqtFmin: message.data.cqtFmin,
+    cqtBinsPerOctave: message.data.cqtBinsPerOctave,
   };
   latestSpectrogram = data;
   updateDownloadState();
@@ -1219,13 +1245,14 @@ function analysisTargetStep(duration: number, columns: number): number {
 }
 
 function coverageIncludes(
-  coverage: Pick<SpectrogramData, 'fftSize' | 'startTime' | 'endTime' | 'secondsPerColumn'> | AnalysisCoverage | null,
+  coverage: Pick<SpectrogramData, 'fftSize' | 'mode' | 'startTime' | 'endTime' | 'secondsPerColumn'> | AnalysisCoverage | null,
   startTime: number,
   endTime: number,
   fftSize: number,
   secondsPerColumn: number,
+  mode: AnalysisMode,
 ): boolean {
-  if (!coverage || coverage.fftSize !== fftSize) return false;
+  if (!coverage || coverage.fftSize !== fftSize || coverage.mode !== mode) return false;
   const tolerance = Math.max(0.001, coverage.secondsPerColumn * 1.1);
   return coverage.secondsPerColumn <= secondsPerColumn * 1.01 &&
     coverage.startTime <= startTime + tolerance &&
@@ -1298,6 +1325,7 @@ function updateRangeFill(input: HTMLInputElement): void {
 type AnalysisCoverage = {
   id: number;
   fftSize: number;
+  mode: AnalysisMode;
   startTime: number;
   endTime: number;
   secondsPerColumn: number;
@@ -1308,6 +1336,7 @@ type PersistedSettings = {
   paneRatio: number;
   frequencyScale: number;
   fftIndex: number;
+  analysisMode?: AnalysisMode;
   spectrumFftIndex: number;
   dbRange: number;
   spectrumDrawStyle: SpectrumDrawStyle;
@@ -1404,6 +1433,7 @@ function persistSettings(): void {
     paneRatio: wavePanelRatio,
     frequencyScale: frequencyScaleBlend,
     fftIndex: Number(fftSlider.value),
+    analysisMode: analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft',
     spectrumFftIndex: Number(spectrumFftSlider.value),
     dbRange: Number(dbRangeSlider.value),
     spectrumDrawStyle: isSpectrumDrawStyle(spectrumStyleSelect.value) ? spectrumStyleSelect.value : 'filled',

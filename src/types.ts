@@ -1,3 +1,5 @@
+export type AnalysisMode = 'fft' | 'cqt';
+
 export type SpectrogramData = {
   values: Int16Array;
   columns: number;
@@ -8,6 +10,11 @@ export type SpectrogramData = {
   startTime: number;
   endTime: number;
   secondsPerColumn: number;
+  /** Rows are linear FFT bins ('fft') or log-spaced constant-Q bands ('cqt'). */
+  mode: AnalysisMode;
+  /** CQT band grid (mode 'cqt'): f_k = cqtFmin * 2^(k / cqtBinsPerOctave). */
+  cqtFmin?: number;
+  cqtBinsPerOctave?: number;
 };
 
 export type AnalysisInitialize = {
@@ -32,6 +39,7 @@ export type AnalysisRequest = {
   type: 'analyze';
   id: number;
   fftSize: number;
+  analysisMode: AnalysisMode;
   startTime: number;
   viewDuration: number;
   columns: number;

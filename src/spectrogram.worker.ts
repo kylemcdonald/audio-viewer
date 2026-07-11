@@ -1,11 +1,21 @@
 /// <reference lib="webworker" />
 
 import FFT from 'fft.js';
-import type { AnalysisInput, AnalysisRequest } from './types';
+import type { AnalysisInput, AnalysisMode, AnalysisRequest } from './types';
+import {
+  buildCqtPlan,
+  cqtColumnFromSpectrum,
+  cqtSegmentSize,
+  CQT_COLUMN_SHADER,
+  type CqtPlan,
+} from './cqt';
 
 const worker = self as unknown as DedicatedWorkerGlobalScope;
 const WORKGROUP_SIZE = 256;
 const MAX_COMPLEX_VALUES_PER_BATCH = 1_048_576;
+// CQT segments are up to 8x longer than FFT frames; a larger batch budget
+// keeps the frames-per-batch count (and per-batch overhead) comparable.
+const MAX_CQT_COMPLEX_VALUES_PER_BATCH = 4_194_304;
 const MAX_CACHE_VALUES = 32_000_000;
 const DB_QUANTIZATION = 10;
 const FLOOR_DB = -200;
@@ -23,6 +33,17 @@ let cachedRows = 0;
 let maximumCachedFrames = 1;
 let frameCacheGeneration = 0;
 const frameCache = new Map<number, Int16Array>();
+const cqtPlans = new Map<string, CqtPlan>();
+
+function getCqtPlan(sampleRate: number, fftSize: number): CqtPlan {
+  const key = `${sampleRate}:${cqtSegmentSize(fftSize)}`;
+  let plan = cqtPlans.get(key);
+  if (!plan) {
+    plan = buildCqtPlan(sampleRate, fftSize);
+    cqtPlans.set(key, plan);
+  }
+  return plan;
+}
 
 type AnalysisLayout = {
   bins: number;
@@ -32,6 +53,8 @@ type AnalysisLayout = {
 type GpuContext = {
   device: GPUDevice;
   pipelines: GpuPipelines;
+  /** Static CQT band tables uploaded once per (sampleRate, segment) plan. */
+  cqtPlanBuffers: Map<string, { meta: GPUBuffer; win: GPUBuffer }>;
 };
 
 type AnalysisPlan = {
@@ -80,17 +103,21 @@ worker.onmessage = (event: MessageEvent<AnalysisInput>) => {
 
 async function analyzeViewport(request: AnalysisRequest): Promise<void> {
   if (!audioSamples) return;
-  const layout: AnalysisLayout = {
-    bins: request.fftSize / 2,
-    rows: Math.min(request.fftSize / 2, 1024),
-  };
-  const cacheGeneration = prepareFrameCache(request.fftSize, layout.rows);
-  const plan = createAnalysisPlan(request);
+  const mode: AnalysisMode = request.analysisMode === 'cqt' ? 'cqt' : 'fft';
+  const cqtPlan = mode === 'cqt' ? getCqtPlan(audioSampleRate, request.fftSize) : null;
+  // The analysis segment per column: the FFT frame, or the (longer) CQT one.
+  const segmentSize = cqtPlan ? cqtPlan.L : request.fftSize;
+  const layout: AnalysisLayout = cqtPlan
+    ? { bins: cqtPlan.nBands, rows: cqtPlan.nBands }
+    : { bins: request.fftSize / 2, rows: Math.min(request.fftSize / 2, 1024) };
+  // Negative key namespaces CQT cache entries away from FFT sizes.
+  const cacheGeneration = prepareFrameCache(cqtPlan ? -cqtPlan.L : request.fftSize, layout.rows);
+  const plan = createAnalysisPlan(request, segmentSize);
   if (plan.targetTicks.length === 0) return;
   const fullyCached = plan.targetTicks.every((tick) => frameCache.has(tick));
 
   if (fullyCached) {
-    postViewport(request, layout, plan, plan.targetStepMs, 0, true, 0, plan.targetTicks.length);
+    postViewport(request, layout, plan, plan.targetStepMs, 0, true, 0, plan.targetTicks.length, cqtPlan);
     await yieldToWorker();
     if (request.id !== latestJobId) return;
   }
@@ -103,16 +130,20 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
       request,
       layout,
       plan,
+      segmentSize,
+      cqtPlan,
       fullyCached,
-      (ticks, report) => analyzeFramesWithGpu(
-        gpu,
-        ticks,
-        request.fftSize,
-        layout,
-        request.id,
-        cacheGeneration,
-        report,
-      ),
+      (ticks, report) => (cqtPlan
+        ? analyzeCqtFramesWithGpu(gpu, ticks, cqtPlan, request.id, cacheGeneration, report)
+        : analyzeFramesWithGpu(
+          gpu,
+          ticks,
+          request.fftSize,
+          layout,
+          request.id,
+          cacheGeneration,
+          report,
+        )),
     );
   } catch {
     if (request.id !== latestJobId) return;
@@ -123,15 +154,19 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
         request,
         layout,
         plan,
+        segmentSize,
+        cqtPlan,
         fullyCached || cachedAfterGpu,
-        (ticks, report) => analyzeFramesWithCpu(
-          ticks,
-          request.fftSize,
-          layout,
-          request.id,
-          cacheGeneration,
-          report,
-        ),
+        (ticks, report) => (cqtPlan
+          ? analyzeCqtFramesWithCpu(ticks, cqtPlan, request.id, cacheGeneration, report)
+          : analyzeFramesWithCpu(
+            ticks,
+            request.fftSize,
+            layout,
+            request.id,
+            cacheGeneration,
+            report,
+          )),
       );
     } catch (error) {
       if (request.id !== latestJobId) return;
@@ -144,7 +179,7 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
   }
 }
 
-function createAnalysisPlan(request: AnalysisRequest): AnalysisPlan {
+function createAnalysisPlan(request: AnalysisRequest, segmentSize: number): AnalysisPlan {
   const minimumStepMs = Math.max(
     MINIMUM_TEMPORAL_STEP_MS,
     Math.round(request.minimumSecondsPerColumn * 1000),
@@ -156,7 +191,7 @@ function createAnalysisPlan(request: AnalysisRequest): AnalysisPlan {
   const exponent = Math.max(0, Math.floor(Math.log2(desiredStepMs / minimumStepMs)));
   const targetStepMs = minimumStepMs * 2 ** exponent;
   const targetTicks = createAlignedTicks(request.startTime, request.viewDuration, targetStepMs)
-    .filter((tick) => isFrameAvailable(tick, request.fftSize));
+    .filter((tick) => isFrameAvailable(tick, segmentSize));
   const stages: number[] = [];
   if (request.intermediateResults) {
     let initialStepMs = targetStepMs;
@@ -174,6 +209,8 @@ async function computeCachedViewport(
   request: AnalysisRequest,
   layout: AnalysisLayout,
   plan: AnalysisPlan,
+  segmentSize: number,
+  cqtPlan: CqtPlan | null,
   visibleResultAlreadySent: boolean,
   compute: FrameComputer,
 ): Promise<void> {
@@ -185,7 +222,7 @@ async function computeCachedViewport(
       touchCachedFrames(plan.targetTicks);
       const stageStepMs = plan.stages[level];
       const stageTicks = createAlignedTicks(request.startTime, request.viewDuration, stageStepMs)
-        .filter((tick) => isFrameAvailable(tick, request.fftSize));
+        .filter((tick) => isFrameAvailable(tick, segmentSize));
       const missingTicks = stageTicks.filter((tick) => !frameCache.has(tick));
       const reusedColumns = countCachedFrames(plan.targetTicks);
 
@@ -204,6 +241,7 @@ async function computeCachedViewport(
           false,
           0,
           reusedColumns,
+          cqtPlan,
         );
         visibleResultSent = true;
         await yieldToWorker();
@@ -226,6 +264,7 @@ async function computeCachedViewport(
         stageStepMs === plan.targetStepMs,
         missingTicks.length,
         reusedColumns,
+        cqtPlan,
       );
       visibleResultSent = true;
       finestReadyStepMs = stageStepMs;
@@ -234,18 +273,19 @@ async function computeCachedViewport(
   }
 
   if (request.id !== latestJobId || !request.prefetchFiner) return;
-  await prefetchFinerLevels(request, plan.targetStepMs, compute);
+  await prefetchFinerLevels(request, plan.targetStepMs, segmentSize, compute);
 }
 
 async function prefetchFinerLevels(
   request: AnalysisRequest,
   targetStepMs: number,
+  segmentSize: number,
   compute: FrameComputer,
 ): Promise<void> {
   for (let stepMs = targetStepMs / 2; stepMs >= MINIMUM_TEMPORAL_STEP_MS; stepMs /= 2) {
     if (request.id !== latestJobId) return;
     const ticks = createAlignedTicks(request.startTime, request.viewDuration, stepMs)
-      .filter((tick) => isFrameAvailable(tick, request.fftSize));
+      .filter((tick) => isFrameAvailable(tick, segmentSize));
     if (ticks.length > maximumCachedFrames) return;
     touchCachedFrames(ticks);
     const missingTicks = ticks.filter((tick) => !frameCache.has(tick));
@@ -266,9 +306,11 @@ function postViewport(
   complete: boolean,
   computedColumns: number,
   reusedColumns: number,
+  cqtPlan: CqtPlan | null,
 ): void {
   if (request.id !== latestJobId || plan.targetTicks.length === 0) return;
-  const values = assembleViewport(plan.targetTicks, availableStepMs, layout.rows, request.fftSize);
+  const segmentSize = cqtPlan ? cqtPlan.L : request.fftSize;
+  const values = assembleViewport(plan.targetTicks, availableStepMs, layout.rows, segmentSize);
   const payload = {
     type: 'partial' as const,
     id: request.id,
@@ -286,6 +328,9 @@ function postViewport(
       startTime: plan.targetTicks[0] / 1000,
       endTime: plan.targetTicks[plan.targetTicks.length - 1] / 1000,
       secondsPerColumn: plan.targetStepMs / 1000,
+      mode: (cqtPlan ? 'cqt' : 'fft') as AnalysisMode,
+      cqtFmin: cqtPlan?.fMin,
+      cqtBinsPerOctave: cqtPlan?.binsPerOctave,
     },
   };
   worker.postMessage(payload, [values.buffer]);
@@ -295,7 +340,7 @@ function assembleViewport(
   targetTicks: readonly number[],
   availableStepMs: number,
   rows: number,
-  fftSize: number,
+  segmentSize: number,
 ): Int16Array {
   const values = new Int16Array(targetTicks.length * rows);
   values.fill(quantizeDb(FLOOR_DB));
@@ -323,7 +368,7 @@ function assembleViewport(
   let right = -1;
   for (let column = targetTicks.length - 1; column >= 0; column -= 1) {
     if (resolved[column]) right = column;
-    if (!resolved[column] && isFrameAvailable(targetTicks[column], fftSize)) {
+    if (!resolved[column] && isFrameAvailable(targetTicks[column], segmentSize)) {
       const leftIndex = nearestLeft[column];
       const leftDistance = leftIndex < 0
         ? Number.POSITIVE_INFINITY
@@ -350,10 +395,10 @@ function createAlignedTicks(startTime: number, viewDuration: number, stepMs: num
   return Array.from({ length: count }, (_, index) => firstTick + index * stepMs);
 }
 
-function isFrameAvailable(tick: number, fftSize: number): boolean {
+function isFrameAvailable(tick: number, segmentSize: number): boolean {
   if (audioComplete) return true;
   const centerSample = Math.round((tick / 1000) * audioSampleRate);
-  return centerSample + fftSize / 2 <= audioAvailableSamples;
+  return centerSample + segmentSize / 2 <= audioAvailableSamples;
 }
 
 function createFrameStarts(ticks: readonly number[], sampleRate: number, fftSize: number): Int32Array {
@@ -434,7 +479,7 @@ async function getGpuContext(): Promise<GpuContext> {
       const device = await adapter.requestDevice();
       const pipelines = await createGpuPipelines(device);
       void device.lost.then(() => { gpuContextPromise = null; });
-      return { device, pipelines };
+      return { device, pipelines, cqtPlanBuffers: new Map() };
     })();
   }
   return gpuContextPromise;
@@ -482,6 +527,196 @@ async function analyzeFramesWithGpu(
   } finally {
     for (const buffer of stageParameters) buffer.destroy();
   }
+  return true;
+}
+
+function getCqtPlanBuffers(gpu: GpuContext, plan: CqtPlan): { meta: GPUBuffer; win: GPUBuffer } {
+  const key = `${plan.sampleRate}:${plan.L}`;
+  let buffers = gpu.cqtPlanBuffers.get(key);
+  if (!buffers) {
+    const meta = gpu.device.createBuffer({
+      size: plan.bandMeta.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    gpu.device.queue.writeBuffer(meta, 0, plan.bandMeta);
+    const win = gpu.device.createBuffer({
+      size: plan.winValues.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    gpu.device.queue.writeBuffer(win, 0, plan.winValues);
+    buffers = { meta, win };
+    gpu.cqtPlanBuffers.set(key, buffers);
+  }
+  return buffers;
+}
+
+async function analyzeCqtFramesWithGpu(
+  gpu: GpuContext,
+  ticks: readonly number[],
+  plan: CqtPlan,
+  id: number,
+  cacheGeneration: number,
+  report: (progress: number) => void,
+): Promise<boolean> {
+  if (!audioSamples || ticks.length === 0) return true;
+  const { device, pipelines } = gpu;
+  const stageParameters = createStageParameterBuffers(device, plan.L);
+  const planBuffers = getCqtPlanBuffers(gpu, plan);
+  const maxBatchFrames = Math.max(1, Math.floor(MAX_CQT_COMPLEX_VALUES_PER_BATCH / plan.L));
+
+  try {
+    for (let frameStart = 0; frameStart < ticks.length; frameStart += maxBatchFrames) {
+      if (id !== latestJobId || cacheGeneration !== frameCacheGeneration) return false;
+      const batchTicks = ticks.slice(frameStart, frameStart + maxBatchFrames);
+      const packedSamples = packFrameSamples(batchTicks, plan.L);
+      const batch = await runCqtGpuBatch(
+        device,
+        pipelines,
+        stageParameters,
+        planBuffers,
+        packedSamples,
+        plan,
+      );
+      if (id !== latestJobId || cacheGeneration !== frameCacheGeneration) return false;
+      for (let frameIndex = 0; frameIndex < batchTicks.length; frameIndex += 1) {
+        const frame = new Int16Array(plan.nBands);
+        const source = frameIndex * plan.nBands;
+        for (let row = 0; row < plan.nBands; row += 1) {
+          frame[row] = quantizeDb(batch[source + row]);
+        }
+        if (!cacheFrame(batchTicks[frameIndex], frame, cacheGeneration)) return false;
+      }
+      report((frameStart + batchTicks.length) / ticks.length);
+    }
+  } finally {
+    for (const buffer of stageParameters) buffer.destroy();
+  }
+  return true;
+}
+
+async function runCqtGpuBatch(
+  device: GPUDevice,
+  pipelines: GpuPipelines,
+  stageParameters: GPUBuffer[],
+  planBuffers: { meta: GPUBuffer; win: GPUBuffer },
+  samples: Float32Array,
+  plan: CqtPlan,
+): Promise<Float32Array> {
+  const frameCount = samples.length / plan.L;
+  const complexCount = frameCount * plan.L;
+  const outputCount = frameCount * plan.nBands;
+  const sampleBuffer = createMappedBuffer(device, samples, GPUBufferUsage.STORAGE);
+  const complexBuffer = device.createBuffer({ size: complexCount * 8, usage: GPUBufferUsage.STORAGE });
+  const outputBuffer = device.createBuffer({
+    size: outputCount * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const readbackBuffer = device.createBuffer({
+    size: outputCount * 4,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  // The initialize shader Hann-windows and bit-reverses each segment; rows
+  // and bins are unused on this path.
+  const parameters = createAnalysisParameters(plan.L, frameCount, 1, 1, samples.length);
+  const parameterBuffer = createMappedBuffer(device, parameters, GPUBufferUsage.UNIFORM);
+  const columnParameters = new Uint32Array([frameCount, plan.nBands, plan.L, 0]);
+  const columnParameterBuffer = createMappedBuffer(device, columnParameters, GPUBufferUsage.UNIFORM);
+  const frameCountValue = new Uint32Array([frameCount]);
+  for (const stageParameter of stageParameters) device.queue.writeBuffer(stageParameter, 8, frameCountValue);
+
+  const initializeGroup = device.createBindGroup({
+    layout: pipelines.initializeLayout,
+    entries: [
+      { binding: 0, resource: { buffer: sampleBuffer } },
+      { binding: 1, resource: { buffer: complexBuffer } },
+      { binding: 2, resource: { buffer: parameterBuffer } },
+    ],
+  });
+  const columnGroup = device.createBindGroup({
+    layout: pipelines.cqtColumnLayout,
+    entries: [
+      { binding: 0, resource: { buffer: complexBuffer } },
+      { binding: 1, resource: { buffer: planBuffers.meta } },
+      { binding: 2, resource: { buffer: planBuffers.win } },
+      { binding: 3, resource: { buffer: outputBuffer } },
+      { binding: 4, resource: { buffer: columnParameterBuffer } },
+    ],
+  });
+  const encoder = device.createCommandEncoder();
+  let pass = encoder.beginComputePass();
+  pass.setPipeline(pipelines.initialize);
+  pass.setBindGroup(0, initializeGroup);
+  pass.dispatchWorkgroups(Math.ceil(complexCount / WORKGROUP_SIZE));
+  pass.end();
+  for (const stageParameter of stageParameters) {
+    const stageGroup = device.createBindGroup({
+      layout: pipelines.stageLayout,
+      entries: [
+        { binding: 0, resource: { buffer: complexBuffer } },
+        { binding: 1, resource: { buffer: stageParameter } },
+      ],
+    });
+    pass = encoder.beginComputePass();
+    pass.setPipeline(pipelines.stage);
+    pass.setBindGroup(0, stageGroup);
+    pass.dispatchWorkgroups(Math.ceil((complexCount / 2) / WORKGROUP_SIZE));
+    pass.end();
+  }
+  pass = encoder.beginComputePass();
+  pass.setPipeline(pipelines.cqtColumn);
+  pass.setBindGroup(0, columnGroup);
+  pass.dispatchWorkgroups(Math.ceil(outputCount / WORKGROUP_SIZE));
+  pass.end();
+  encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputCount * 4);
+  device.queue.submit([encoder.finish()]);
+  await readbackBuffer.mapAsync(GPUMapMode.READ);
+  const result = new Float32Array(new Float32Array(readbackBuffer.getMappedRange()).slice());
+  readbackBuffer.unmap();
+  sampleBuffer.destroy();
+  complexBuffer.destroy();
+  outputBuffer.destroy();
+  readbackBuffer.destroy();
+  parameterBuffer.destroy();
+  columnParameterBuffer.destroy();
+  return result;
+}
+
+async function analyzeCqtFramesWithCpu(
+  ticks: readonly number[],
+  plan: CqtPlan,
+  id: number,
+  cacheGeneration: number,
+  report: (progress: number) => void,
+): Promise<boolean> {
+  if (!audioSamples || ticks.length === 0) return true;
+  const input = new Float64Array(plan.L);
+  const transform = new FFT(plan.L);
+  const spectrum = transform.createComplexArray();
+  const frameStarts = createFrameStarts(ticks, audioSampleRate, plan.L);
+  const window = new Float64Array(plan.L);
+  for (let index = 0; index < plan.L; index += 1) {
+    window[index] = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (plan.L - 1));
+  }
+
+  for (let column = 0; column < frameStarts.length; column += 1) {
+    if (column % 8 === 0) {
+      if (id !== latestJobId || cacheGeneration !== frameCacheGeneration) return false;
+      report(column / frameStarts.length);
+      await yieldToWorker();
+    }
+    input.fill(0);
+    const start = frameStarts[column];
+    for (let index = 0; index < plan.L; index += 1) {
+      const source = start + index;
+      input[index] = (source >= 0 && source < audioSamples.length ? audioSamples[source] : 0) * window[index];
+    }
+    transform.realTransform(spectrum, input);
+    const db = cqtColumnFromSpectrum(plan, spectrum);
+    const frame = new Int16Array(plan.nBands);
+    for (let row = 0; row < plan.nBands; row += 1) frame[row] = quantizeDb(db[row]);
+    if (!cacheFrame(ticks[column], frame, cacheGeneration)) return false;
+  }
+  report(1);
   return true;
 }
 
@@ -543,9 +778,11 @@ type GpuPipelines = {
   initialize: GPUComputePipeline;
   stage: GPUComputePipeline;
   magnitude: GPUComputePipeline;
+  cqtColumn: GPUComputePipeline;
   initializeLayout: GPUBindGroupLayout;
   stageLayout: GPUBindGroupLayout;
   magnitudeLayout: GPUBindGroupLayout;
+  cqtColumnLayout: GPUBindGroupLayout;
 };
 
 async function createGpuPipelines(device: GPUDevice): Promise<GpuPipelines> {
@@ -569,7 +806,16 @@ async function createGpuPipelines(device: GPUDevice): Promise<GpuPipelines> {
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     ],
   });
-  const [initialize, stage, magnitude] = await Promise.all([
+  const cqtColumnLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ],
+  });
+  const [initialize, stage, magnitude, cqtColumn] = await Promise.all([
     device.createComputePipelineAsync({
       layout: device.createPipelineLayout({ bindGroupLayouts: [initializeLayout] }),
       compute: { module: device.createShaderModule({ code: INITIALIZE_SHADER }), entryPoint: 'main' },
@@ -582,8 +828,15 @@ async function createGpuPipelines(device: GPUDevice): Promise<GpuPipelines> {
       layout: device.createPipelineLayout({ bindGroupLayouts: [magnitudeLayout] }),
       compute: { module: device.createShaderModule({ code: MAGNITUDE_SHADER }), entryPoint: 'main' },
     }),
+    device.createComputePipelineAsync({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [cqtColumnLayout] }),
+      compute: { module: device.createShaderModule({ code: CQT_COLUMN_SHADER }), entryPoint: 'main' },
+    }),
   ]);
-  return { initialize, stage, magnitude, initializeLayout, stageLayout, magnitudeLayout };
+  return {
+    initialize, stage, magnitude, cqtColumn,
+    initializeLayout, stageLayout, magnitudeLayout, cqtColumnLayout,
+  };
 }
 
 function createStageParameterBuffers(device: GPUDevice, fftSize: number): GPUBuffer[] {
