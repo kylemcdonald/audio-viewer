@@ -15,6 +15,7 @@
   --cyan: #72d9ff;
   --orange: #ff9b61;
   --mono: "Chivo Mono", ui-monospace, monospace;
+  --topbar-height: 78px;
 }
 
 * {
@@ -59,7 +60,7 @@ select:focus-visible {
 
 .workbench {
   display: grid;
-  grid-template-rows: 78px minmax(0, 1fr);
+  grid-template-rows: var(--topbar-height) minmax(0, 1fr);
   width: 100%;
   height: 100%;
   background: #000;
@@ -67,7 +68,7 @@ select:focus-visible {
 
 .topbar {
   position: relative;
-  z-index: 20;
+  z-index: 32;
   display: grid;
   grid-template-columns: minmax(170px, 1fr) auto minmax(170px, 1fr);
   align-items: center;
@@ -82,7 +83,6 @@ select:focus-visible {
 .file-meta-row,
 .transport,
 .header-actions,
-.settings-header,
 .slider-row,
 .control-heading,
 .open-button {
@@ -187,7 +187,6 @@ select:focus-visible {
 
 .icon-button svg,
 .header-icon-button svg,
-.settings-close svg,
 .open-button svg,
 .drop-icon svg {
   width: 100%;
@@ -371,8 +370,7 @@ select:focus-visible {
   padding: 0;
 }
 
-.header-icon-button,
-.settings-close {
+.header-icon-button {
   display: grid;
   padding: 0;
   border: 1px solid rgba(181, 207, 221, 0.2);
@@ -393,8 +391,7 @@ select:focus-visible {
   height: 18px;
 }
 
-.header-icon-button:hover,
-.settings-close:hover {
+.header-icon-button:hover {
   border-color: rgba(105, 235, 184, 0.38);
   color: #d9e5e0;
   background: #000;
@@ -417,46 +414,34 @@ select:focus-visible {
   background: #000;
 }
 
-.settings-modal {
-  width: min(410px, calc(100vw - 32px));
-  max-height: calc(100vh - 32px);
-  margin: auto;
-  padding: 0;
-  overflow: auto;
-  border: 1px solid rgba(180, 205, 219, 0.22);
-  border-radius: 9px;
+.settings-pane {
+  position: fixed;
+  z-index: 31;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: min(390px, 100vw);
+  padding-top: var(--topbar-height);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 0;
+  border-right: 1px solid rgba(180, 205, 219, 0.22);
+  border-radius: 0;
   color: var(--text);
   background: #000;
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.62);
+  box-shadow: 20px 0 48px rgba(0, 0, 0, 0.38);
 }
 
-.settings-modal::backdrop {
-  background: transparent;
-  backdrop-filter: none;
-}
-
-.settings-header {
-  justify-content: flex-end;
-  padding: 9px 11px;
-  border-bottom: 1px solid rgba(183, 205, 219, 0.12);
-}
-
-.settings-close {
-  width: 30px;
-  height: 30px;
-  border-radius: 5px;
-  background: #000;
-}
-
-.settings-close svg {
-  width: 16px;
-  height: 16px;
+.settings-pane[hidden] {
+  display: none;
 }
 
 .settings-controls {
   display: grid;
   gap: 13px;
-  padding: 16px 20px 18px;
+  min-height: 100%;
+  padding: 19px 20px 28px;
 }
 
 .settings-divider {
@@ -1119,8 +1104,7 @@ select:focus-visible {
 }
 
 :root[data-theme="light"] .open-button,
-:root[data-theme="light"] .header-icon-button,
-:root[data-theme="light"] .settings-close {
+:root[data-theme="light"] .header-icon-button {
   border-color: rgba(30, 39, 46, 0.32);
   color: #111417;
   background: #fff;
@@ -1132,8 +1116,7 @@ select:focus-visible {
 }
 
 :root[data-theme="light"] .open-button:hover,
-:root[data-theme="light"] .header-icon-button:hover,
-:root[data-theme="light"] .settings-close:hover {
+:root[data-theme="light"] .header-icon-button:hover {
   border-color: rgba(21, 145, 99, 0.65);
   color: #111417;
   background: #f4f7f5;
@@ -1163,15 +1146,10 @@ select:focus-visible {
   box-shadow: 0 4px 13px rgba(35, 47, 55, 0.16);
 }
 
-:root[data-theme="light"] .settings-modal {
+:root[data-theme="light"] .settings-pane {
   border-color: rgba(30, 39, 46, 0.32);
   background: #fff;
-  box-shadow: 0 24px 80px rgba(24, 34, 39, 0.2);
-}
-
-:root[data-theme="light"] .settings-header {
-  border-color: rgba(30, 39, 46, 0.14);
-  background: #fff;
+  box-shadow: 20px 0 48px rgba(24, 34, 39, 0.13);
 }
 
 :root[data-theme="light"] .settings-divider {
@@ -1313,8 +1291,12 @@ select:focus-visible {
 }
 
 @media (max-height: 650px) {
+  :root {
+    --topbar-height: 66px;
+  }
+
   .workbench {
-    grid-template-rows: 66px minmax(0, 1fr);
+    grid-template-rows: var(--topbar-height) minmax(0, 1fr);
   }
 
   .topbar {

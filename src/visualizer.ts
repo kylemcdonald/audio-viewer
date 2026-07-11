@@ -1,6 +1,7 @@
 import FFT from 'fft.js';
+import { buildCqtPlan, cqtColumnFromSpectrum, type CqtPlan } from './cqt';
 import { createPaletteLut, type PaletteName } from './palettes';
-import type { SpectrogramData } from './types';
+import type { AnalysisMode, SpectrogramData } from './types';
 
 const AXIS_WIDTH = 38;
 const AXIS_LABEL_INSET = 6;
@@ -200,6 +201,7 @@ export class AudioVisualizer {
   private readonly spectrumHoverFrequencyLabel: HTMLElement;
   private readonly spectrumHoverFrequencyMask: HTMLElement;
   private readonly playhead: HTMLElement;
+  private readonly nativeSpectralToBlob: HTMLCanvasElement['toBlob'];
   private readonly onSeek: (time: number) => void;
   private readonly onViewChange: (start: number, duration: number) => void;
   private readonly onSelectionChange?: (selection: SelectionRange | null) => void;
@@ -230,6 +232,9 @@ export class AudioVisualizer {
   private realtimeWindow = new Float64Array(0);
   private realtimeComplex: number[] = [];
   private realtimeDb = new Float32Array(0);
+  private analysisMode: AnalysisMode = 'fft';
+  private realtimeCqtPlan: CqtPlan | null = null;
+  private realtimeCqtDb = new Float32Array(0);
   private pinch: PinchGesture | null = null;
   private scrubbingPointer: number | null = null;
   private touchSeekTimer = 0;
@@ -250,6 +255,13 @@ export class AudioVisualizer {
     this.spectrumHoverFrequencyLabel = options.spectrumHoverFrequencyLabel;
     this.spectrumHoverFrequencyMask = options.spectrumHoverFrequencyMask;
     this.playhead = options.playhead;
+    this.nativeSpectralToBlob = this.spectralCanvas.toBlob.bind(this.spectralCanvas);
+    // The screenshot control serializes this canvas directly. Keep the live
+    // ruler labels on-screen, but route serialization through a clean
+    // offscreen redraw so selection-only labels remain UI chrome.
+    this.spectralCanvas.toBlob = (callback, type, quality) => {
+      this.exportSpectrogramToBlob(callback, type, quality);
+    };
     this.onSeek = options.onSeek;
     this.onViewChange = options.onViewChange;
     this.onSelectionChange = options.onSelectionChange;
@@ -271,6 +283,7 @@ export class AudioVisualizer {
     this.setSelection(null);
     this.samples = samples;
     this.sampleRate = sampleRate;
+    this.realtimeCqtPlan = null; // band grid depends on the sample rate
     this.duration = duration;
     this.peaks = new PeakPyramid(samples);
     this.availableSamples = samples.length;
@@ -297,6 +310,7 @@ export class AudioVisualizer {
     this.setSelection(null);
     this.samples = samples;
     this.sampleRate = sampleRate;
+    this.realtimeCqtPlan = null; // band grid depends on the sample rate
     this.duration = duration;
     this.peaks = new PeakPyramid(samples, false);
     this.availableSamples = 0;
@@ -362,6 +376,15 @@ export class AudioVisualizer {
     if (next === this.spectrumFftSize) return;
     this.spectrumFftSize = next;
     this.realtimeFft = null;
+    this.realtimeCqtPlan = null;
+    this.requestAnalyzerRender();
+  }
+
+  setAnalysisMode(mode: AnalysisMode): void {
+    if (mode === this.analysisMode) return;
+    this.analysisMode = mode;
+    this.realtimeFft = null;
+    this.realtimeCqtPlan = null;
     this.requestAnalyzerRender();
   }
 
@@ -826,8 +849,11 @@ export class AudioVisualizer {
     });
   }
 
-  private prepareCanvas(canvas: HTMLCanvasElement): CanvasSurface {
-    const bounds = canvas.getBoundingClientRect();
+  private prepareCanvas(
+    canvas: HTMLCanvasElement,
+    dimensions?: { width: number; height: number },
+  ): CanvasSurface {
+    const bounds = dimensions ?? canvas.getBoundingClientRect();
     const width = Math.max(1, bounds.width);
     const height = Math.max(1, bounds.height);
     const dpr = window.devicePixelRatio || 1;
@@ -978,9 +1004,12 @@ export class AudioVisualizer {
     context.fillText('L+R', 9, 14);
   }
 
-  private drawSpectrogram(): void {
-    const canvas = this.spectralCanvas;
-    const surface = this.prepareCanvas(canvas);
+  private drawSpectrogram(
+    canvas: HTMLCanvasElement = this.spectralCanvas,
+    includeSelectionTimeLabels = true,
+    dimensions?: { width: number; height: number },
+  ): void {
+    const surface = this.prepareCanvas(canvas, dimensions);
     const { context, width, height, pixelWidth, pixelHeight, scaleX, scaleY } = surface;
     const plotRight = width - AXIS_WIDTH;
     const plotBottom = height;
@@ -999,13 +1028,27 @@ export class AudioVisualizer {
       const maxFrequency = this.sampleRate / 2;
       const minFrequency = this.minimumFrequency;
       const minNormalized = minFrequency / maxFrequency;
-      const rowMap = new Uint16Array(pixelHeight);
+      const rowMap = new Int32Array(pixelHeight);
       const columnMap = new Int32Array(pixelWidth);
       const availableTime = this.availableSamples / this.sampleRate;
+      const isCqt = this.spectrogram.mode === 'cqt';
+      const cqtFmin = this.spectrogram.cqtFmin ?? 32.703;
+      const cqtBinsPerOctave = this.spectrogram.cqtBinsPerOctave ?? 24;
 
       for (let y = 0; y < pixelHeight; y += 1) {
         const scaled = 1 - y / Math.max(1, pixelHeight - 1);
         const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
+        if (isCqt) {
+          // CQT rows are log-spaced bands: row = B * log2(f / fmin).
+          // Clamp to the nearest band at both edges: pixels below the
+          // lowest band center show the lowest band (which, with the DC
+          // bin included, collects all sub-band energy), mirroring how the
+          // FFT view's bottom row stretches down to 0 Hz.
+          const hertz = Math.max(frequency * maxFrequency, 1e-6);
+          const row = Math.round(cqtBinsPerOctave * Math.log2(hertz / cqtFmin));
+          rowMap[y] = Math.min(rows - 1, Math.max(0, row));
+          continue;
+        }
         const row = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
         rowMap[y] = Math.min(rows - 1, Math.max(0, Math.round(row * (rows - 1))));
       }
@@ -1029,7 +1072,8 @@ export class AudioVisualizer {
             packed[offset + x] = UNLOADED_SPECTROGRAM_COLOR;
             continue;
           }
-          const db = values[column * rows + row] / 10;
+          // Rows outside the analysis band range (CQT) draw at the floor.
+          const db = row < 0 ? -this.spectralRangeDb : values[column * rows + row] / 10;
           const normalized = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
           const paletteIndex = Math.round(normalized * 255);
           packed[offset + x] = this.colorLut[this.isLightTheme ? 255 - paletteIndex : paletteIndex];
@@ -1056,6 +1100,7 @@ export class AudioVisualizer {
       scaleY,
       pixelWidth,
       pixelHeight,
+      includeSelectionTimeLabels,
     );
     this.drawFrequencyGrid(
       context,
@@ -1174,7 +1219,7 @@ export class AudioVisualizer {
     let nearestDistance = Number.POSITIVE_INFINITY;
 
     for (let index = 0; index < spectrum.length; index += 1) {
-      const normalizedBin = index / Math.max(1, spectrum.length - 1);
+      const normalizedBin = this.spectrumPointNormalized(index, spectrum.length);
       const scaled = scaleFrequency(normalizedBin, this.scaleBlend, maxFrequency, minFrequency);
       const pointY = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
       const pointDb = spectrum[index];
@@ -1190,7 +1235,7 @@ export class AudioVisualizer {
 
     return {
       bin,
-      frequency: (bin * this.sampleRate) / this.spectrumFftSize,
+      frequency: this.spectrumPointFrequency(bin),
       db,
       x,
       y,
@@ -1343,7 +1388,7 @@ export class AudioVisualizer {
     const minFrequency = this.minimumFrequency;
     context.beginPath();
     for (let bin = 0; bin < spectrum.length; bin += 1) {
-      const normalized = bin / Math.max(1, spectrum.length - 1);
+      const normalized = this.spectrumPointNormalized(bin, spectrum.length);
       const scaled = scaleFrequency(normalized, this.scaleBlend, maxFrequency, minFrequency);
       const x = spectrumPhysicalX(spectrum[bin], this.spectralRangeDb, physicalWidth);
       const y = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
@@ -1352,8 +1397,8 @@ export class AudioVisualizer {
       } else if (style === 'points') {
         context.rect(x, y, 1, 1);
       } else {
-        const lowerBoundary = Math.max(0, (bin - 0.5) / Math.max(1, spectrum.length - 1));
-        const upperBoundary = Math.min(1, (bin + 0.5) / Math.max(1, spectrum.length - 1));
+        const lowerBoundary = Math.max(0, this.spectrumPointNormalized(bin - 0.5, spectrum.length));
+        const upperBoundary = Math.min(1, this.spectrumPointNormalized(bin + 0.5, spectrum.length));
         const lowerY = this.spectrumBinBoundaryY(lowerBoundary, plotTop, plotHeight);
         const upperY = this.spectrumBinBoundaryY(upperBoundary, plotTop, plotHeight);
         const top = Math.min(lowerY, upperY);
@@ -1488,7 +1533,7 @@ export class AudioVisualizer {
       const scaled = 1 - row / Math.max(1, plotHeight - 1);
       const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
       const normalizedBin = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
-      const binPosition = Math.max(0, Math.min(spectrum.length - 1, normalizedBin * (spectrum.length - 1)));
+      const binPosition = this.spectrumNormalizedToPosition(normalizedBin, spectrum.length);
       let db: number;
       if (this.spectrumInterpolation === 'linear') {
         const lowBin = Math.floor(binPosition);
@@ -1531,7 +1576,7 @@ export class AudioVisualizer {
     let previousY = plotTop + plotHeight - 1;
     context.fillRect(previousX, previousY, 1, 1);
     for (let bin = 1; bin < spectrum.length; bin += 1) {
-      const normalized = bin / Math.max(1, spectrum.length - 1);
+      const normalized = this.spectrumPointNormalized(bin, spectrum.length);
       const scaled = scaleFrequency(normalized, this.scaleBlend, maxFrequency, minFrequency);
       const x = spectrumPhysicalX(spectrum[bin], this.spectralRangeDb, physicalWidth);
       const y = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
@@ -1547,35 +1592,90 @@ export class AudioVisualizer {
     }
     this.prepareRealtimeFft();
     const fft = this.realtimeFft!;
+    const frameSize = fft.size;
     const center = Math.round(this.cursorTime * this.sampleRate);
-    const start = center - Math.floor(this.spectrumFftSize / 2);
-    if (center >= this.availableSamples + this.spectrumFftSize / 2) return null;
+    const start = center - Math.floor(frameSize / 2);
+    if (center >= this.availableSamples + frameSize / 2) return null;
 
-    for (let index = 0; index < this.spectrumFftSize; index += 1) {
+    for (let index = 0; index < frameSize; index += 1) {
       const source = start + index;
       const sample = source >= 0 && source < this.availableSamples ? this.samples[source] : 0;
       this.realtimeInput[index] = sample * this.realtimeWindow[index];
     }
     fft.realTransform(this.realtimeComplex, this.realtimeInput);
+    if (this.realtimeCqtPlan) {
+      // Matched-mode analyzer: same constant-Q bands as the spectrogram.
+      const db = cqtColumnFromSpectrum(this.realtimeCqtPlan, this.realtimeComplex);
+      for (let band = 0; band < db.length; band += 1) this.realtimeCqtDb[band] = db[band];
+      return this.realtimeCqtDb;
+    }
     for (let bin = 0; bin < this.realtimeDb.length; bin += 1) {
       const real = this.realtimeComplex[bin * 2];
       const imaginary = this.realtimeComplex[bin * 2 + 1];
-      const magnitude = Math.sqrt(real * real + imaginary * imaginary) * (4 / this.spectrumFftSize);
+      const magnitude = Math.sqrt(real * real + imaginary * imaginary) * (4 / frameSize);
       this.realtimeDb[bin] = 20 * Math.log10(Math.max(magnitude, 1e-10));
     }
     return this.realtimeDb;
   }
 
   private prepareRealtimeFft(): void {
-    if (this.realtimeFft?.size === this.spectrumFftSize) return;
-    this.realtimeFft = new FFT(this.spectrumFftSize);
-    this.realtimeInput = new Float64Array(this.spectrumFftSize);
-    this.realtimeWindow = new Float64Array(this.spectrumFftSize);
-    this.realtimeComplex = this.realtimeFft.createComplexArray();
-    this.realtimeDb = new Float32Array(this.spectrumFftSize / 2);
-    for (let index = 0; index < this.spectrumFftSize; index += 1) {
-      this.realtimeWindow[index] = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (this.spectrumFftSize - 1));
+    if (this.analysisMode === 'cqt') {
+      if (this.realtimeCqtPlan && this.realtimeFft) return;
+      const plan = buildCqtPlan(this.sampleRate, this.spectrumFftSize);
+      this.realtimeCqtPlan = plan;
+      this.realtimeCqtDb = new Float32Array(plan.nBands);
+      this.allocateRealtimeFft(plan.L);
+      return;
     }
+    this.realtimeCqtPlan = null;
+    if (this.realtimeFft?.size === this.spectrumFftSize) return;
+    this.allocateRealtimeFft(this.spectrumFftSize);
+    this.realtimeDb = new Float32Array(this.spectrumFftSize / 2);
+  }
+
+  private allocateRealtimeFft(size: number): void {
+    if (this.realtimeFft?.size !== size) {
+      this.realtimeFft = new FFT(size);
+      this.realtimeInput = new Float64Array(size);
+      this.realtimeWindow = new Float64Array(size);
+      this.realtimeComplex = this.realtimeFft.createComplexArray();
+      for (let index = 0; index < size; index += 1) {
+        this.realtimeWindow[index] = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (size - 1));
+      }
+    }
+  }
+
+  /** Normalized frequency (f / Nyquist) of spectrum point `position`
+   * (fractional positions supported, for bar boundaries). Linear FFT bins
+   * in FFT mode; log-spaced constant-Q band centers in CQT mode. */
+  private spectrumPointNormalized(position: number, length: number): number {
+    const plan = this.realtimeCqtPlan;
+    if (plan) {
+      const hertz = plan.fMin * 2 ** (position / plan.binsPerOctave);
+      return Math.min(1, hertz / (this.sampleRate / 2));
+    }
+    return position / Math.max(1, length - 1);
+  }
+
+  /** Inverse of spectrumPointNormalized: fractional point position for a
+   * normalized frequency, clamped to the valid range. */
+  private spectrumNormalizedToPosition(normalized: number, length: number): number {
+    const plan = this.realtimeCqtPlan;
+    let position: number;
+    if (plan) {
+      const hertz = Math.max(1e-6, normalized * (this.sampleRate / 2));
+      position = plan.binsPerOctave * Math.log2(hertz / plan.fMin);
+    } else {
+      position = normalized * (length - 1);
+    }
+    return Math.max(0, Math.min(length - 1, position));
+  }
+
+  /** Frequency in Hz of spectrum point `index`. */
+  private spectrumPointFrequency(index: number): number {
+    const plan = this.realtimeCqtPlan;
+    if (plan) return plan.frequencies[index];
+    return (index * this.sampleRate) / this.spectrumFftSize;
   }
 
   private drawTimeGrid(
@@ -1589,6 +1689,7 @@ export class AudioVisualizer {
     scaleY: number,
     pixelWidth: number,
     pixelHeight: number,
+    includeSelectionTimeLabels = true,
   ): void {
     if (!this.duration) return;
     const plotWidth = plotRight;
@@ -1597,7 +1698,7 @@ export class AudioVisualizer {
     context.font = '10px "Chivo Mono", ui-monospace, monospace';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
-    const selectionLabels = withLabels
+    const selectionLabels = withLabels && includeSelectionTimeLabels
       ? this.selectionTimeAxisLabels(context, plotRight)
       : [];
 
@@ -1702,15 +1803,72 @@ export class AudioVisualizer {
     }
 
     if (labels.length === 2 && labelsIntersect(labels[0].bounds, labels[1].bounds)) {
-      labels[0].y = 1;
-      labels[0].baseline = 'top';
-      labels[0].bounds = labelBounds(context, labels[0]);
-      labels[1].y = SPECTRAL_RULER - 1;
-      labels[1].baseline = 'bottom';
-      labels[1].bounds = labelBounds(context, labels[1]);
+      this.layoutOverlappingSelectionTimeLabels(context, labels, plotRight);
     }
 
     return labels;
+  }
+
+  /**
+   * Short selections can place both endpoint labels at the same edge of the
+   * ruler. Keep them on its single baseline: shift the pair together just
+   * enough to fit, instead of moving one label to a second line.
+   */
+  private layoutOverlappingSelectionTimeLabels(
+    context: CanvasRenderingContext2D,
+    labels: SpectrumAxisLabel[],
+    plotRight: number,
+  ): void {
+    const [start, end] = labels;
+    const startWidth = start.bounds.right - start.bounds.left;
+    const endWidth = end.bounds.right - end.bounds.left;
+    const inset = 2;
+    const gap = 4;
+    const totalWidth = startWidth + gap + endWidth;
+    const availableWidth = Math.max(0, plotRight - inset * 2);
+
+    // A very narrow viewport cannot hold both exact strings. Prefer a single
+    // clean endpoint label to overlapping glyphs, while retaining the same
+    // one-line ruler treatment.
+    if (totalWidth > availableWidth) {
+      labels.splice(1, 1);
+      return;
+    }
+
+    const preferredCenter = (start.x + end.x) / 2;
+    const minimumCenter = inset + totalWidth / 2;
+    const maximumCenter = plotRight - inset - totalWidth / 2;
+    const center = Math.max(minimumCenter, Math.min(maximumCenter, preferredCenter));
+    const left = center - totalWidth / 2;
+    const y = SPECTRAL_RULER / 2 + 0.5;
+
+    start.x = left + startWidth;
+    start.y = y;
+    start.align = 'right';
+    start.baseline = 'middle';
+    start.bounds = labelBounds(context, start);
+
+    end.x = left + startWidth + gap;
+    end.y = y;
+    end.align = 'left';
+    end.baseline = 'middle';
+    end.bounds = labelBounds(context, end);
+  }
+
+  private exportSpectrogramToBlob(
+    callback: BlobCallback,
+    type?: string,
+    quality?: number,
+  ): void {
+    const bounds = this.spectralCanvas.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) {
+      this.nativeSpectralToBlob(callback, type, quality);
+      return;
+    }
+
+    const exportCanvas = document.createElement('canvas');
+    this.drawSpectrogram(exportCanvas, false, bounds);
+    exportCanvas.toBlob(callback, type, quality);
   }
 
   private drawSelectionTimeAxisLabels(
