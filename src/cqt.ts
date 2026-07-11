@@ -15,16 +15,31 @@
  * each band's effective response is the frequency window convolved with the
  * 3-bin segment-window kernel; the 2/L weight makes a full-scale tone at a
  * band center read ~0 dB, matching the FFT path's 4/fftSize convention.
- * The narrowest (lowest) bands read up to ~6 dB low where their support is
- * under ~3 bins — a display-grade compromise inherent to windowed segments.
+ * Bands whose constant-Q bandwidth falls below CQT_MIN_SUPPORT_BINS FFT
+ * bins are clamped to that width, transitioning smoothly to constant
+ * bandwidth at the low end (see CQT_MIN_SUPPORT_BINS); they may read a few
+ * dB low — a display-grade compromise inherent to windowed segments.
  *
  * This keeps the viewer's viewport-driven tick/column cache model intact:
  * only visible columns are computed, memory stays bounded by the existing
  * LRU frame cache, and multi-hour files work exactly as in FFT mode.
  */
 
-export const CQT_FMIN = 32.703; // C1
+// Below the audible floor on purpose: recordings often carry subsonic
+// energy the FFT view shows, and the log display reaches toward 0 Hz.
+export const CQT_FMIN = 10.0;
 export const CQT_MAX_SEGMENT = 65536;
+/**
+ * Minimum spectral support per band, in FFT bins. Without this clamp, bands
+ * whose constant-Q bandwidth falls below one bin degenerate to a single bin
+ * whose Hann weight depends on where the fractional band center lands —
+ * bands unlucky enough to center near a bin edge read ~0 (visible as black
+ * horizontal stripes below ~50 Hz). With a 3-bin floor, every band always
+ * straddles at least one well-weighted bin; bands below the constant-Q
+ * limit smoothly become constant-bandwidth (3 * sr / L Hz), which is
+ * exactly how linear FFT bins behave in that range.
+ */
+export const CQT_MIN_SUPPORT_BINS = 3;
 
 export type CqtPlan = {
   sampleRate: number;
@@ -68,12 +83,15 @@ export function buildCqtPlan(sampleRate: number, fftSize: number): CqtPlan {
   for (let k = 0; k < nBands; k += 1) {
     const f = CQT_FMIN * 2 ** (k / B);
     const nu = (f * L) / sampleRate;
-    const width = Math.max((f * (2 ** (1 / B) - 2 ** (-1 / B)) * L) / sampleRate, 1.0);
+    const width = Math.max(
+      (f * (2 ** (1 / B) - 2 ** (-1 / B)) * L) / sampleRate,
+      CQT_MIN_SUPPORT_BINS,
+    );
     let s = Math.floor(nu - 0.5 * width) + 1;
     let e = Math.ceil(nu + 0.5 * width) - 1;
-    s = Math.max(s, 0);
+    s = Math.max(s, 1); // skip the DC bin (segment-window skirt collects DC offset)
     e = Math.min(e, halfBins);
-    if (e < s) { s = Math.min(Math.max(Math.round(nu), 0), halfBins); e = s; }
+    if (e < s) { s = Math.min(Math.max(Math.round(nu), 1), halfBins); e = s; }
     const values: number[] = [];
     for (let bin = s; bin <= e; bin += 1) {
       const u = (bin - nu) / width;
