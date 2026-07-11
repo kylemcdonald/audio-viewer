@@ -34,7 +34,6 @@ const spectrumIcon = icon('<path d="M3 17.5h18M4 15l2.3-5 2.2 3.2L11 6l2.2 8 2.3
 const gearIcon = icon('<path d="M12 8.3a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4Zm7.7 4.9v-2.4l-2-.7a6.3 6.3 0 0 0-.7-1.6l.9-1.9-1.7-1.7-1.9.9a6.3 6.3 0 0 0-1.6-.7l-.7-2h-2.4l-.7 2a6.3 6.3 0 0 0-1.6.7l-1.9-.9-1.7 1.7.9 1.9a6.3 6.3 0 0 0-.7 1.6l-2 .7v2.4l2 .7c.2.6.4 1.1.7 1.6l-.9 1.9 1.7 1.7 1.9-.9c.5.3 1 .6 1.6.7l.7 2H13l.7-2c.6-.2 1.1-.4 1.6-.7l1.9.9 1.7-1.7-.9-1.9c.3-.5.6-1 .7-1.6l2-.7Z" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>');
 const downloadIcon = icon('<path d="M12 3.5v11m-4-4 4 4 4-4M5 19.5h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>');
 const imageIcon = icon('<rect x="3.5" y="4.5" width="17" height="15" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.55"/><circle cx="8.4" cy="9" r="1.35" fill="currentColor"/><path d="m5.5 17 4.3-4.4 2.8 2.6 2.2-2.1 3.7 3.9" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>');
-const closeIcon = icon('<path d="m7 7 10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>');
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <main class="workbench">
@@ -71,14 +70,11 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <button class="header-icon-button" id="spectrum-button" type="button" aria-label="Open spectrum analyzer" aria-controls="spectrum-analyzer" aria-expanded="false" aria-pressed="false" title="Spectrum analyzer">${spectrumIcon}</button>
         <button class="header-icon-button" id="screenshot-button" type="button" aria-label="Save spectrogram screenshot" title="Save spectrogram screenshot" disabled>${imageIcon}</button>
         <button class="header-icon-button" id="selection-download-button" type="button" aria-label="Download selected audio as WAV" title="Download selection as WAV" hidden>${downloadIcon}</button>
-        <button class="header-icon-button" id="settings-button" type="button" aria-label="Spectrogram settings" aria-haspopup="dialog" aria-controls="settings-modal" aria-expanded="false" title="Spectrogram settings">${gearIcon}</button>
+        <button class="header-icon-button" id="settings-button" type="button" aria-label="Show settings" aria-controls="settings-pane" aria-expanded="false" title="Show settings">${gearIcon}</button>
       </div>
     </header>
 
-    <dialog class="settings-modal" id="settings-modal" aria-label="Settings">
-      <div class="settings-header">
-        <button class="settings-close" id="settings-close" type="button" aria-label="Close settings">${closeIcon}</button>
-      </div>
+    <aside class="settings-pane" id="settings-pane" aria-label="Settings" hidden>
       <div class="settings-controls">
         <div class="control-group fft-control">
           <div class="control-heading">
@@ -195,7 +191,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
         </div>
       </div>
-    </dialog>
+    </aside>
 
     <section class="editor-shell" aria-label="Audio waveform and spectrogram editor">
       <div class="editor-stack" id="editor">
@@ -288,9 +284,8 @@ const panelDivider = get<HTMLElement>('panel-divider');
 const frequencyAxisControl = get<HTMLElement>('frequency-axis-control');
 const spectrumHoverFrequencyLabel = get<HTMLElement>('spectrum-hover-frequency');
 const spectrumHoverFrequencyMask = get<HTMLElement>('spectrum-hover-frequency-mask');
-const settingsModal = get<HTMLDialogElement>('settings-modal');
+const settingsPane = get<HTMLElement>('settings-pane');
 const settingsButton = get<HTMLButtonElement>('settings-button');
-const settingsClose = get<HTMLButtonElement>('settings-close');
 const spectrumButton = get<HTMLButtonElement>('spectrum-button');
 const screenshotButton = get<HTMLButtonElement>('screenshot-button');
 const selectionDownloadButton = get<HTMLButtonElement>('selection-download-button');
@@ -356,6 +351,7 @@ let overlayTimer = 0;
 let overlayToken = 0;
 let playbackFollowMode = playbackFollowSelect.value as PlaybackFollowMode;
 let themeMode: ThemeMode = themeToggle.checked ? 'light' : 'dark';
+let settingsPaneOpen = persistedSettings?.settingsPaneOpen === true;
 let lastPlaybackAnalysisCheck = 0;
 
 document.documentElement.dataset.theme = themeMode;
@@ -405,24 +401,8 @@ spectrumButton.addEventListener('click', () => {
 });
 
 settingsButton.addEventListener('click', () => {
-  if (settingsModal.open) return;
-  settingsModal.showModal();
-  settingsButton.setAttribute('aria-expanded', 'true');
-  requestAnimationFrame(() => fftSlider.focus());
-});
-
-settingsClose.addEventListener('click', () => settingsModal.close());
-settingsModal.addEventListener('close', () => {
-  settingsButton.setAttribute('aria-expanded', 'false');
-  persistSettings();
-  settingsButton.focus();
-});
-settingsModal.addEventListener('click', (event) => {
-  if (event.target !== settingsModal) return;
-  const rect = settingsModal.getBoundingClientRect();
-  const inside = event.clientX >= rect.left && event.clientX <= rect.right &&
-    event.clientY >= rect.top && event.clientY <= rect.bottom;
-  if (!inside) settingsModal.close();
+  setSettingsPaneOpen(!settingsPaneOpen);
+  scheduleSettingsSave();
 });
 
 fftSlider.addEventListener('input', () => {
@@ -1288,6 +1268,15 @@ function applyTheme(): void {
   visualizer.setTheme(themeMode);
 }
 
+function setSettingsPaneOpen(open: boolean): void {
+  settingsPaneOpen = open;
+  settingsPane.hidden = !open;
+  settingsButton.classList.toggle('is-active', open);
+  settingsButton.setAttribute('aria-expanded', open.toString());
+  settingsButton.setAttribute('aria-label', open ? 'Hide settings' : 'Show settings');
+  settingsButton.title = open ? 'Hide settings' : 'Show settings';
+}
+
 function updateRangeFill(input: HTMLInputElement): void {
   const min = Number(input.min) || 0;
   const max = Number(input.max) || 100;
@@ -1317,6 +1306,7 @@ type PersistedSettings = {
   spectrumAnalyzerOpen: boolean;
   spectrumAnalyzerWidth: number;
   theme: ThemeMode;
+  settingsPaneOpen?: boolean;
 };
 
 function readPersistedSettings(): PersistedSettings | null {
@@ -1415,6 +1405,7 @@ function persistSettings(): void {
     spectrumAnalyzerOpen,
     spectrumAnalyzerWidth,
     theme: themeMode,
+    settingsPaneOpen,
   };
   try {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
@@ -1641,6 +1632,7 @@ function initialize(): void {
   visualizer.setColorPalette(isPaletteName(paletteSelect.value) ? paletteSelect.value : 'viridis');
   setFrequencyScale(frequencyScaleBlend);
   applySpectrumAnalyzerLayout();
+  setSettingsPaneOpen(settingsPaneOpen);
   updateDownloadState();
   updateSelectionDownloadState();
   updateDropOverlayState();
