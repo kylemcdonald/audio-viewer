@@ -40,8 +40,6 @@ export type AnalysisRequest = {
   id: number;
   fftSize: number;
   analysisMode: AnalysisMode;
-  /** CQT only: include the DC bin in band supports (default false). */
-  cqtIncludeDc: boolean;
   startTime: number;
   viewDuration: number;
   columns: number;

@@ -1,6 +1,6 @@
 import './style.css';
 import { AudioEngine } from './audio-engine';
-import { cqtBinsPerOctave } from './cqt';
+import { cqtBinsPerOctave, cqtSegmentSize } from './cqt';
 import { isPaletteName, type PaletteName } from './palettes';
 import type {
   AnalysisAppend,
@@ -94,20 +94,6 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
         </div>
         <div class="settings-divider" aria-hidden="true"></div>
-        <div class="control-group dc-bin-control">
-          <div class="control-heading">
-            <label for="dc-bin-toggle">CQT DC bin</label>
-          </div>
-          <div class="theme-toggle-row">
-            <span>Exclude</span>
-            <label class="theme-switch">
-              <input id="dc-bin-toggle" type="checkbox" role="switch" aria-label="Include the DC bin in CQT analysis" />
-              <span aria-hidden="true"></span>
-            </label>
-            <span>Include</span>
-          </div>
-        </div>
-        <div class="settings-divider" aria-hidden="true"></div>
         <div class="control-group fft-control">
           <div class="control-heading">
             <label for="fft-slider">Spectrogram resolution</label>
@@ -115,7 +101,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
           <div class="slider-row">
             <span>TIME</span>
-            <input id="fft-slider" class="range-input stepped" type="range" min="0" max="4" step="1" value="2" aria-label="Spectrogram resolution" />
+            <input id="fft-slider" class="range-input stepped" type="range" min="0" max="5" step="1" value="4" aria-label="Spectrogram resolution" />
             <span>FREQ</span>
           </div>
         </div>
@@ -298,7 +284,6 @@ const dbRangeOutput = get<HTMLOutputElement>('db-range-output');
 const frequencyScaleSlider = get<HTMLInputElement>('frequency-scale-slider');
 const frequencyScaleOutput = get<HTMLOutputElement>('frequency-scale-output');
 const analysisModeSelect = get<HTMLSelectElement>('analysis-mode-select');
-const dcBinToggle = get<HTMLInputElement>('dc-bin-toggle');
 const spectrumStyleSelect = get<HTMLSelectElement>('spectrum-style-select');
 const spectrumInterpolationSelect = get<HTMLSelectElement>('spectrum-interpolation-select');
 const paletteSelect = get<HTMLSelectElement>('palette-select');
@@ -329,7 +314,7 @@ const spectrumAnalyzer = get<HTMLElement>('spectrum-analyzer');
 
 const SETTINGS_STORAGE_KEY = 'audio-spectrogram.settings.v1';
 const persistedSettings = readPersistedSettings();
-fftSlider.value = Math.round(clampNumber(persistedSettings?.fftIndex, 2, 0, 4)).toString();
+fftSlider.value = Math.round(clampNumber(persistedSettings?.fftIndex, 4, 0, 5)).toString();
 spectrumFftSlider.value = Math.round(clampNumber(persistedSettings?.spectrumFftIndex, 4, 0, 8)).toString();
 dbRangeSlider.value = clampNumber(persistedSettings?.dbRange, 120, 60, 140).toString();
 spectrumStyleSelect.value = isSpectrumDrawStyle(persistedSettings?.spectrumDrawStyle)
@@ -339,7 +324,6 @@ spectrumInterpolationSelect.value = isSpectrumInterpolation(persistedSettings?.s
   ? persistedSettings.spectrumInterpolation
   : 'linear';
 analysisModeSelect.value = persistedSettings?.analysisMode === 'cqt' ? 'cqt' : 'fft';
-dcBinToggle.checked = persistedSettings?.cqtIncludeDc === true;
 paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSettings.palette : 'viridis';
 playbackFollowSelect.value = isPlaybackFollowMode(persistedSettings?.playbackFollowMode)
   ? persistedSettings.playbackFollowMode
@@ -438,6 +422,10 @@ spectrumButton.addEventListener('click', () => {
 
 settingsButton.addEventListener('click', () => {
   if (settingsModal.open) return;
+  // CQT labels include the segment duration, which depends on the loaded
+  // file's sample rate — refresh on open.
+  updateFftControl();
+  updateSpectrumFftControl();
   settingsModal.showModal();
   settingsButton.setAttribute('aria-expanded', 'true');
   requestAnimationFrame(() => fftSlider.focus());
@@ -466,13 +454,10 @@ fftSlider.addEventListener('input', () => {
 
 analysisModeSelect.addEventListener('change', () => {
   updateFftControl();
+  updateSpectrumFftControl();
+  visualizer.setAnalysisMode(analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft');
   scheduleSettingsSave();
   analyzeCurrentAudio({ force: true });
-});
-
-dcBinToggle.addEventListener('change', () => {
-  scheduleSettingsSave();
-  if (analysisModeSelect.value === 'cqt') analyzeCurrentAudio({ force: true });
 });
 
 spectrumFftSlider.addEventListener('input', () => {
@@ -1197,7 +1182,6 @@ function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean 
     id: analysisId,
     fftSize,
     analysisMode,
-    cqtIncludeDc: dcBinToggle.checked,
     startTime: requestStart,
     viewDuration: requestDuration,
     columns: requestColumns,
@@ -1283,10 +1267,18 @@ function coverageIncludes(
     coverage.endTime >= endTime - tolerance;
 }
 
+function cqtSettingLabel(fftSize: number): string {
+  // B alone is degenerate across the lowest slider positions; the segment
+  // duration is what still changes there (time vs low-end resolution).
+  const ms = (cqtSegmentSize(fftSize) / audioSampleRate) * 1000;
+  const duration = ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`;
+  return `${cqtBinsPerOctave(fftSize)} bands/oct · ${duration}`;
+}
+
 function updateFftControl(): void {
   const bins = fftBins[Number(fftSlider.value)];
   fftOutput.value = analysisModeSelect.value === 'cqt'
-    ? `${cqtBinsPerOctave(bins * 2)} bands/octave`
+    ? cqtSettingLabel(bins * 2)
     : `${bins.toLocaleString()} bins`;
   fftSlider.setAttribute('aria-valuetext', fftOutput.value);
   updateRangeFill(fftSlider);
@@ -1294,7 +1286,9 @@ function updateFftControl(): void {
 
 function updateSpectrumFftControl(): void {
   const bins = fftBins[Number(spectrumFftSlider.value)];
-  spectrumFftOutput.value = `${bins.toLocaleString()} bins`;
+  spectrumFftOutput.value = analysisModeSelect.value === 'cqt'
+    ? cqtSettingLabel(bins * 2)
+    : `${bins.toLocaleString()} bins`;
   spectrumFftSlider.setAttribute('aria-valuetext', spectrumFftOutput.value);
   updateRangeFill(spectrumFftSlider);
 }
@@ -1363,7 +1357,6 @@ type PersistedSettings = {
   frequencyScale: number;
   fftIndex: number;
   analysisMode?: AnalysisMode;
-  cqtIncludeDc?: boolean;
   spectrumFftIndex: number;
   dbRange: number;
   spectrumDrawStyle: SpectrumDrawStyle;
@@ -1461,7 +1454,6 @@ function persistSettings(): void {
     frequencyScale: frequencyScaleBlend,
     fftIndex: Number(fftSlider.value),
     analysisMode: analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft',
-    cqtIncludeDc: dcBinToggle.checked,
     spectrumFftIndex: Number(spectrumFftSlider.value),
     dbRange: Number(dbRangeSlider.value),
     spectrumDrawStyle: isSpectrumDrawStyle(spectrumStyleSelect.value) ? spectrumStyleSelect.value : 'filled',
@@ -1686,6 +1678,7 @@ function initialize(): void {
   applyTheme();
   updateFftControl();
   updateSpectrumFftControl();
+  visualizer.setAnalysisMode(analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft');
   visualizer.setSpectrumFftSize(fftBins[Number(spectrumFftSlider.value)] * 2);
   visualizer.setSpectrumDrawStyle(
     isSpectrumDrawStyle(spectrumStyleSelect.value) ? spectrumStyleSelect.value : 'filled',

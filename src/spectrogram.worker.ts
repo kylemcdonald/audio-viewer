@@ -36,11 +36,11 @@ let frameCacheGeneration = 0;
 const frameCache = new Map<number, Int16Array>();
 const cqtPlans = new Map<string, CqtPlan>();
 
-function getCqtPlan(sampleRate: number, fftSize: number, includeDc: boolean): CqtPlan {
-  const key = `${sampleRate}:${cqtSegmentSize(fftSize)}:${cqtBinsPerOctave(fftSize)}:${includeDc ? 'dc' : 'nodc'}`;
+function getCqtPlan(sampleRate: number, fftSize: number): CqtPlan {
+  const key = `${sampleRate}:${cqtSegmentSize(fftSize)}:${cqtBinsPerOctave(fftSize)}`;
   let plan = cqtPlans.get(key);
   if (!plan) {
-    plan = buildCqtPlan(sampleRate, fftSize, includeDc);
+    plan = buildCqtPlan(sampleRate, fftSize);
     cqtPlans.set(key, plan);
   }
   return plan;
@@ -105,9 +105,7 @@ worker.onmessage = (event: MessageEvent<AnalysisInput>) => {
 async function analyzeViewport(request: AnalysisRequest): Promise<void> {
   if (!audioSamples) return;
   const mode: AnalysisMode = request.analysisMode === 'cqt' ? 'cqt' : 'fft';
-  const cqtPlan = mode === 'cqt'
-    ? getCqtPlan(audioSampleRate, request.fftSize, request.cqtIncludeDc === true)
-    : null;
+  const cqtPlan = mode === 'cqt' ? getCqtPlan(audioSampleRate, request.fftSize) : null;
   // The analysis segment per column: the FFT frame, or the (longer) CQT one.
   const segmentSize = cqtPlan ? cqtPlan.L : request.fftSize;
   // FFT rows follow the transform size so higher resolution settings reach
@@ -116,13 +114,9 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
   // cache's column count correspondingly (MAX_CACHE_VALUES is unchanged).
   const layout: AnalysisLayout = cqtPlan
     ? { bins: cqtPlan.nBands, rows: cqtPlan.nBands }
-    : { bins: request.fftSize / 2, rows: Math.min(request.fftSize / 2, 4096) };
-  // Negative key namespaces CQT cache entries away from FFT sizes; the +1
-  // separates DC-included frames (L is a power of two, so no collision).
-  const cacheGeneration = prepareFrameCache(
-    cqtPlan ? -(cqtPlan.L + (cqtPlan.includeDc ? 1 : 0)) : request.fftSize,
-    layout.rows,
-  );
+    : { bins: request.fftSize / 2, rows: Math.min(request.fftSize / 2, 8192) };
+  // Negative key namespaces CQT cache entries away from FFT sizes.
+  const cacheGeneration = prepareFrameCache(cqtPlan ? -cqtPlan.L : request.fftSize, layout.rows);
   const plan = createAnalysisPlan(request, segmentSize);
   if (plan.targetTicks.length === 0) return;
   const fullyCached = plan.targetTicks.every((tick) => frameCache.has(tick));
@@ -542,7 +536,7 @@ async function analyzeFramesWithGpu(
 }
 
 function getCqtPlanBuffers(gpu: GpuContext, plan: CqtPlan): { meta: GPUBuffer; win: GPUBuffer } {
-  const key = `${plan.sampleRate}:${plan.L}:${plan.binsPerOctave}:${plan.includeDc ? 'dc' : 'nodc'}`;
+  const key = `${plan.sampleRate}:${plan.L}:${plan.binsPerOctave}`;
   let buffers = gpu.cqtPlanBuffers.get(key);
   if (!buffers) {
     const meta = gpu.device.createBuffer({

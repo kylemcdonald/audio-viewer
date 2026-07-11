@@ -28,7 +28,7 @@
 // Below the audible floor on purpose: recordings often carry subsonic
 // energy the FFT view shows, and the log display reaches toward 0 Hz.
 export const CQT_FMIN = 10.0;
-export const CQT_MAX_SEGMENT = 65536;
+export const CQT_MAX_SEGMENT = 131072;
 /**
  * Minimum spectral support per band, in FFT bins. Without this clamp, bands
  * whose constant-Q bandwidth falls below one bin degenerate to a single bin
@@ -48,7 +48,6 @@ export type CqtPlan = {
   nBands: number;
   fMin: number;
   binsPerOctave: number;
-  includeDc: boolean;
   /** Per band: start bin, support length, offset into winValues, 0. */
   bandMeta: Uint32Array<ArrayBuffer>;
   /** Concatenated per-band window values (2/L * hann in frequency). */
@@ -66,12 +65,13 @@ export function cqtSegmentSize(fftSize: number): number {
  * slider positions provide (band supports halve as B doubles).
  */
 export function cqtBinsPerOctave(fftSize: number): number {
+  if (fftSize >= 16384) return 60;
   if (fftSize >= 8192) return 48;
   if (fftSize >= 4096) return 36;
   return 24;
 }
 
-export function buildCqtPlan(sampleRate: number, fftSize: number, includeDc = false): CqtPlan {
+export function buildCqtPlan(sampleRate: number, fftSize: number): CqtPlan {
   const L = cqtSegmentSize(fftSize);
   const B = cqtBinsPerOctave(fftSize);
   const fMax = (sampleRate / 2) * 2 ** (-0.5 / B);
@@ -97,25 +97,9 @@ export function buildCqtPlan(sampleRate: number, fftSize: number, includeDc = fa
     e = Math.min(e, halfBins);
     if (e < s) { s = Math.min(Math.max(Math.round(nu), 1), halfBins); e = s; }
     const values: number[] = [];
-    if (k === 0 && includeDc) {
-      // DC-inclusive mode: the lowest band becomes a lowpass collector —
-      // full weight from DC up to the band center, normal window skirt
-      // above — folding DC and all sub-fMin energy into the bottom band,
-      // matching how the FFT view's bottom row behaves. Bin 0 gets half
-      // weight: it has no conjugate mirror, so the analytic 2/L scaling
-      // would otherwise read a DC offset 6 dB high.
-      s = 0;
-      for (let bin = 0; bin <= e; bin += 1) {
-        const u = (bin - nu) / width;
-        let w = u <= 0 ? 1 : (u <= 0.5 ? 0.5 + 0.5 * Math.cos(2 * Math.PI * u) : 0);
-        if (bin === 0) w *= 0.5;
-        values.push((2 / L) * w);
-      }
-    } else {
-      for (let bin = s; bin <= e; bin += 1) {
-        const u = (bin - nu) / width;
-        values.push(Math.abs(u) <= 0.5 ? (2 / L) * (0.5 + 0.5 * Math.cos(2 * Math.PI * u)) : 0);
-      }
+    for (let bin = s; bin <= e; bin += 1) {
+      const u = (bin - nu) / width;
+      values.push(Math.abs(u) <= 0.5 ? (2 / L) * (0.5 + 0.5 * Math.cos(2 * Math.PI * u)) : 0);
     }
     starts.push(s);
     supports.push(values.length);
@@ -135,7 +119,7 @@ export function buildCqtPlan(sampleRate: number, fftSize: number, includeDc = fa
   }
   return {
     sampleRate, L, logL: Math.log2(L), nBands,
-    fMin: CQT_FMIN, binsPerOctave: B, includeDc,
+    fMin: CQT_FMIN, binsPerOctave: B,
     bandMeta, winValues,
     frequencies: Float64Array.from(frequencies),
   };

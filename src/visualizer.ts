@@ -1,6 +1,7 @@
 import FFT from 'fft.js';
+import { buildCqtPlan, cqtColumnFromSpectrum, type CqtPlan } from './cqt';
 import { createPaletteLut, type PaletteName } from './palettes';
-import type { SpectrogramData } from './types';
+import type { AnalysisMode, SpectrogramData } from './types';
 
 const AXIS_WIDTH = 38;
 const AXIS_LABEL_INSET = 6;
@@ -230,6 +231,9 @@ export class AudioVisualizer {
   private realtimeWindow = new Float64Array(0);
   private realtimeComplex: number[] = [];
   private realtimeDb = new Float32Array(0);
+  private analysisMode: AnalysisMode = 'fft';
+  private realtimeCqtPlan: CqtPlan | null = null;
+  private realtimeCqtDb = new Float32Array(0);
   private pinch: PinchGesture | null = null;
   private scrubbingPointer: number | null = null;
   private touchSeekTimer = 0;
@@ -271,6 +275,7 @@ export class AudioVisualizer {
     this.setSelection(null);
     this.samples = samples;
     this.sampleRate = sampleRate;
+    this.realtimeCqtPlan = null; // band grid depends on the sample rate
     this.duration = duration;
     this.peaks = new PeakPyramid(samples);
     this.availableSamples = samples.length;
@@ -297,6 +302,7 @@ export class AudioVisualizer {
     this.setSelection(null);
     this.samples = samples;
     this.sampleRate = sampleRate;
+    this.realtimeCqtPlan = null; // band grid depends on the sample rate
     this.duration = duration;
     this.peaks = new PeakPyramid(samples, false);
     this.availableSamples = 0;
@@ -362,6 +368,15 @@ export class AudioVisualizer {
     if (next === this.spectrumFftSize) return;
     this.spectrumFftSize = next;
     this.realtimeFft = null;
+    this.realtimeCqtPlan = null;
+    this.requestAnalyzerRender();
+  }
+
+  setAnalysisMode(mode: AnalysisMode): void {
+    if (mode === this.analysisMode) return;
+    this.analysisMode = mode;
+    this.realtimeFft = null;
+    this.realtimeCqtPlan = null;
     this.requestAnalyzerRender();
   }
 
@@ -1189,7 +1204,7 @@ export class AudioVisualizer {
     let nearestDistance = Number.POSITIVE_INFINITY;
 
     for (let index = 0; index < spectrum.length; index += 1) {
-      const normalizedBin = index / Math.max(1, spectrum.length - 1);
+      const normalizedBin = this.spectrumPointNormalized(index, spectrum.length);
       const scaled = scaleFrequency(normalizedBin, this.scaleBlend, maxFrequency, minFrequency);
       const pointY = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
       const pointDb = spectrum[index];
@@ -1205,7 +1220,7 @@ export class AudioVisualizer {
 
     return {
       bin,
-      frequency: (bin * this.sampleRate) / this.spectrumFftSize,
+      frequency: this.spectrumPointFrequency(bin),
       db,
       x,
       y,
@@ -1358,7 +1373,7 @@ export class AudioVisualizer {
     const minFrequency = this.minimumFrequency;
     context.beginPath();
     for (let bin = 0; bin < spectrum.length; bin += 1) {
-      const normalized = bin / Math.max(1, spectrum.length - 1);
+      const normalized = this.spectrumPointNormalized(bin, spectrum.length);
       const scaled = scaleFrequency(normalized, this.scaleBlend, maxFrequency, minFrequency);
       const x = spectrumPhysicalX(spectrum[bin], this.spectralRangeDb, physicalWidth);
       const y = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
@@ -1367,8 +1382,8 @@ export class AudioVisualizer {
       } else if (style === 'points') {
         context.rect(x, y, 1, 1);
       } else {
-        const lowerBoundary = Math.max(0, (bin - 0.5) / Math.max(1, spectrum.length - 1));
-        const upperBoundary = Math.min(1, (bin + 0.5) / Math.max(1, spectrum.length - 1));
+        const lowerBoundary = Math.max(0, this.spectrumPointNormalized(bin - 0.5, spectrum.length));
+        const upperBoundary = Math.min(1, this.spectrumPointNormalized(bin + 0.5, spectrum.length));
         const lowerY = this.spectrumBinBoundaryY(lowerBoundary, plotTop, plotHeight);
         const upperY = this.spectrumBinBoundaryY(upperBoundary, plotTop, plotHeight);
         const top = Math.min(lowerY, upperY);
@@ -1503,7 +1518,7 @@ export class AudioVisualizer {
       const scaled = 1 - row / Math.max(1, plotHeight - 1);
       const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
       const normalizedBin = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
-      const binPosition = Math.max(0, Math.min(spectrum.length - 1, normalizedBin * (spectrum.length - 1)));
+      const binPosition = this.spectrumNormalizedToPosition(normalizedBin, spectrum.length);
       let db: number;
       if (this.spectrumInterpolation === 'linear') {
         const lowBin = Math.floor(binPosition);
@@ -1546,7 +1561,7 @@ export class AudioVisualizer {
     let previousY = plotTop + plotHeight - 1;
     context.fillRect(previousX, previousY, 1, 1);
     for (let bin = 1; bin < spectrum.length; bin += 1) {
-      const normalized = bin / Math.max(1, spectrum.length - 1);
+      const normalized = this.spectrumPointNormalized(bin, spectrum.length);
       const scaled = scaleFrequency(normalized, this.scaleBlend, maxFrequency, minFrequency);
       const x = spectrumPhysicalX(spectrum[bin], this.spectralRangeDb, physicalWidth);
       const y = plotTop + plotHeight - 1 - Math.round(scaled * Math.max(1, plotHeight - 1));
@@ -1562,35 +1577,90 @@ export class AudioVisualizer {
     }
     this.prepareRealtimeFft();
     const fft = this.realtimeFft!;
+    const frameSize = fft.size;
     const center = Math.round(this.cursorTime * this.sampleRate);
-    const start = center - Math.floor(this.spectrumFftSize / 2);
-    if (center >= this.availableSamples + this.spectrumFftSize / 2) return null;
+    const start = center - Math.floor(frameSize / 2);
+    if (center >= this.availableSamples + frameSize / 2) return null;
 
-    for (let index = 0; index < this.spectrumFftSize; index += 1) {
+    for (let index = 0; index < frameSize; index += 1) {
       const source = start + index;
       const sample = source >= 0 && source < this.availableSamples ? this.samples[source] : 0;
       this.realtimeInput[index] = sample * this.realtimeWindow[index];
     }
     fft.realTransform(this.realtimeComplex, this.realtimeInput);
+    if (this.realtimeCqtPlan) {
+      // Matched-mode analyzer: same constant-Q bands as the spectrogram.
+      const db = cqtColumnFromSpectrum(this.realtimeCqtPlan, this.realtimeComplex);
+      for (let band = 0; band < db.length; band += 1) this.realtimeCqtDb[band] = db[band];
+      return this.realtimeCqtDb;
+    }
     for (let bin = 0; bin < this.realtimeDb.length; bin += 1) {
       const real = this.realtimeComplex[bin * 2];
       const imaginary = this.realtimeComplex[bin * 2 + 1];
-      const magnitude = Math.sqrt(real * real + imaginary * imaginary) * (4 / this.spectrumFftSize);
+      const magnitude = Math.sqrt(real * real + imaginary * imaginary) * (4 / frameSize);
       this.realtimeDb[bin] = 20 * Math.log10(Math.max(magnitude, 1e-10));
     }
     return this.realtimeDb;
   }
 
   private prepareRealtimeFft(): void {
-    if (this.realtimeFft?.size === this.spectrumFftSize) return;
-    this.realtimeFft = new FFT(this.spectrumFftSize);
-    this.realtimeInput = new Float64Array(this.spectrumFftSize);
-    this.realtimeWindow = new Float64Array(this.spectrumFftSize);
-    this.realtimeComplex = this.realtimeFft.createComplexArray();
-    this.realtimeDb = new Float32Array(this.spectrumFftSize / 2);
-    for (let index = 0; index < this.spectrumFftSize; index += 1) {
-      this.realtimeWindow[index] = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (this.spectrumFftSize - 1));
+    if (this.analysisMode === 'cqt') {
+      if (this.realtimeCqtPlan && this.realtimeFft) return;
+      const plan = buildCqtPlan(this.sampleRate, this.spectrumFftSize);
+      this.realtimeCqtPlan = plan;
+      this.realtimeCqtDb = new Float32Array(plan.nBands);
+      this.allocateRealtimeFft(plan.L);
+      return;
     }
+    this.realtimeCqtPlan = null;
+    if (this.realtimeFft?.size === this.spectrumFftSize) return;
+    this.allocateRealtimeFft(this.spectrumFftSize);
+    this.realtimeDb = new Float32Array(this.spectrumFftSize / 2);
+  }
+
+  private allocateRealtimeFft(size: number): void {
+    if (this.realtimeFft?.size !== size) {
+      this.realtimeFft = new FFT(size);
+      this.realtimeInput = new Float64Array(size);
+      this.realtimeWindow = new Float64Array(size);
+      this.realtimeComplex = this.realtimeFft.createComplexArray();
+      for (let index = 0; index < size; index += 1) {
+        this.realtimeWindow[index] = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (size - 1));
+      }
+    }
+  }
+
+  /** Normalized frequency (f / Nyquist) of spectrum point `position`
+   * (fractional positions supported, for bar boundaries). Linear FFT bins
+   * in FFT mode; log-spaced constant-Q band centers in CQT mode. */
+  private spectrumPointNormalized(position: number, length: number): number {
+    const plan = this.realtimeCqtPlan;
+    if (plan) {
+      const hertz = plan.fMin * 2 ** (position / plan.binsPerOctave);
+      return Math.min(1, hertz / (this.sampleRate / 2));
+    }
+    return position / Math.max(1, length - 1);
+  }
+
+  /** Inverse of spectrumPointNormalized: fractional point position for a
+   * normalized frequency, clamped to the valid range. */
+  private spectrumNormalizedToPosition(normalized: number, length: number): number {
+    const plan = this.realtimeCqtPlan;
+    let position: number;
+    if (plan) {
+      const hertz = Math.max(1e-6, normalized * (this.sampleRate / 2));
+      position = plan.binsPerOctave * Math.log2(hertz / plan.fMin);
+    } else {
+      position = normalized * (length - 1);
+    }
+    return Math.max(0, Math.min(length - 1, position));
+  }
+
+  /** Frequency in Hz of spectrum point `index`. */
+  private spectrumPointFrequency(index: number): number {
+    const plan = this.realtimeCqtPlan;
+    if (plan) return plan.frequencies[index];
+    return (index * this.sampleRate) / this.spectrumFftSize;
   }
 
   private drawTimeGrid(
