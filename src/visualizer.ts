@@ -1011,10 +1011,13 @@ export class AudioVisualizer {
         const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
         if (isCqt) {
           // CQT rows are log-spaced bands: row = B * log2(f / fmin).
-          // Pixels outside the band range render at the display floor.
-          const hertz = frequency * maxFrequency;
-          const row = hertz > 0 ? Math.round(cqtBinsPerOctave * Math.log2(hertz / cqtFmin)) : -1;
-          rowMap[y] = row >= 0 && row < rows ? row : -1;
+          // Clamp to the nearest band at both edges: pixels below the
+          // lowest band center show the lowest band (which, with the DC
+          // bin included, collects all sub-band energy), mirroring how the
+          // FFT view's bottom row stretches down to 0 Hz.
+          const hertz = Math.max(frequency * maxFrequency, 1e-6);
+          const row = Math.round(cqtBinsPerOctave * Math.log2(hertz / cqtFmin));
+          rowMap[y] = Math.min(rows - 1, Math.max(0, row));
           continue;
         }
         const row = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
