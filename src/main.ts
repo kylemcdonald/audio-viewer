@@ -21,7 +21,7 @@ import {
   type ThemeMode,
 } from './visualizer';
 import { decodeWavChunk, parseWavHeader, preferredWavChunkBytes, type WavHeader } from './wav-reader';
-import { trimAudioBufferToFloatWav, trimWavFile } from './wav-export';
+import { encodeAudioBufferToMp3, encodeAudioBufferToWav, trimWavFile } from './wav-export';
 import type { Mp4AudioSession } from './mp4-reader';
 
 const icon = (path: string, viewBox = '0 0 24 24') => `
@@ -36,12 +36,12 @@ const spectrumIcon = icon('<path d="M3 17.5h18M4 15l2.3-5 2.2 3.2L11 6l2.2 8 2.3
 const gearIcon = icon('<path d="M12 8.3a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4Zm7.7 4.9v-2.4l-2-.7a6.3 6.3 0 0 0-.7-1.6l.9-1.9-1.7-1.7-1.9.9a6.3 6.3 0 0 0-1.6-.7l-.7-2h-2.4l-.7 2a6.3 6.3 0 0 0-1.6.7l-1.9-.9-1.7 1.7.9 1.9a6.3 6.3 0 0 0-.7 1.6l-2 .7v2.4l2 .7c.2.6.4 1.1.7 1.6l-.9 1.9 1.7 1.7 1.9-.9c.5.3 1 .6 1.6.7l.7 2H13l.7-2c.6-.2 1.1-.4 1.6-.7l1.9.9 1.7-1.7-.9-1.9c.3-.5.6-1 .7-1.6l2-.7Z" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>');
 const downloadIcon = icon('<path d="M12 3.5v11m-4-4 4 4 4-4M5 19.5h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>');
 const imageIcon = icon('<rect x="3.5" y="4.5" width="17" height="15" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.55"/><circle cx="8.4" cy="9" r="1.35" fill="currentColor"/><path d="m5.5 17 4.3-4.4 2.8 2.6 2.2-2.1 3.7 3.9" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>');
-const closeIcon = icon('<path d="m7 7 10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>');
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <main class="workbench">
     <header class="topbar">
       <div class="header-leading">
+        <button class="header-icon-button" id="settings-button" type="button" aria-label="Show settings" aria-controls="settings-pane" aria-expanded="false" title="Show settings">${gearIcon}</button>
         <label class="open-button icon-only" for="file-input" role="button" tabindex="0" aria-label="Import audio" title="Import audio">
           ${importIcon}
         </label>
@@ -72,15 +72,11 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <div class="header-actions">
         <button class="header-icon-button" id="spectrum-button" type="button" aria-label="Open spectrum analyzer" aria-controls="spectrum-analyzer" aria-expanded="false" aria-pressed="false" title="Spectrum analyzer">${spectrumIcon}</button>
         <button class="header-icon-button" id="screenshot-button" type="button" aria-label="Save spectrogram screenshot" title="Save spectrogram screenshot" disabled>${imageIcon}</button>
-        <button class="header-icon-button" id="selection-download-button" type="button" aria-label="Download selected audio as WAV" title="Download selection as WAV" hidden>${downloadIcon}</button>
-        <button class="header-icon-button" id="settings-button" type="button" aria-label="Spectrogram settings" aria-haspopup="dialog" aria-controls="settings-modal" aria-expanded="false" title="Spectrogram settings">${gearIcon}</button>
+        <button class="header-icon-button" id="selection-download-button" type="button" aria-label="Download selected audio" title="Download selection" hidden>${downloadIcon}</button>
       </div>
     </header>
 
-    <dialog class="settings-modal" id="settings-modal" aria-label="Settings">
-      <div class="settings-header">
-        <button class="settings-close" id="settings-close" type="button" aria-label="Close settings">${closeIcon}</button>
-      </div>
+    <aside class="settings-pane" id="settings-pane" aria-label="Settings" hidden>
       <div class="settings-controls">
         <div class="control-group analysis-mode-control">
           <div class="control-heading">
@@ -195,6 +191,33 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
         </div>
         <div class="settings-divider" aria-hidden="true"></div>
+        <div class="control-group output-format-control">
+          <div class="control-heading">
+            <label for="output-format-select">Download format</label>
+          </div>
+          <div class="palette-select-row">
+            <select id="output-format-select" class="palette-select" aria-label="Selection download format">
+              <option value="auto" selected>Auto (MP3 for .mp3; WAV otherwise)</option>
+              <option value="wav">.wav</option>
+              <option value="mp3">.mp3</option>
+            </select>
+          </div>
+        </div>
+        <div class="settings-divider" aria-hidden="true"></div>
+        <div class="control-group normalize-output-control">
+          <div class="control-heading">
+            <label for="normalize-output-toggle">Peak normalize</label>
+          </div>
+          <div class="theme-toggle-row">
+            <span>Off</span>
+            <label class="theme-switch">
+              <input id="normalize-output-toggle" type="checkbox" role="switch" aria-label="Peak normalize downloaded selections" />
+              <span aria-hidden="true"></span>
+            </label>
+            <span>On</span>
+          </div>
+        </div>
+        <div class="settings-divider" aria-hidden="true"></div>
         <div class="control-group appearance-control">
           <div class="control-heading">
             <label for="theme-toggle">Appearance</label>
@@ -209,7 +232,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
         </div>
       </div>
-    </dialog>
+    </aside>
 
     <section class="editor-shell" aria-label="Audio waveform and spectrogram editor">
       <div class="editor-stack" id="editor">
@@ -288,6 +311,8 @@ const spectrumStyleSelect = get<HTMLSelectElement>('spectrum-style-select');
 const spectrumInterpolationSelect = get<HTMLSelectElement>('spectrum-interpolation-select');
 const paletteSelect = get<HTMLSelectElement>('palette-select');
 const playbackFollowSelect = get<HTMLSelectElement>('playback-follow-select');
+const outputFormatSelect = get<HTMLSelectElement>('output-format-select');
+const normalizeOutputToggle = get<HTMLInputElement>('normalize-output-toggle');
 const themeToggle = get<HTMLInputElement>('theme-toggle');
 const analysisOverlay = get<HTMLElement>('analysis-overlay');
 const analysisTitle = get<HTMLElement>('analysis-title');
@@ -303,9 +328,8 @@ const panelDivider = get<HTMLElement>('panel-divider');
 const frequencyAxisControl = get<HTMLElement>('frequency-axis-control');
 const spectrumHoverFrequencyLabel = get<HTMLElement>('spectrum-hover-frequency');
 const spectrumHoverFrequencyMask = get<HTMLElement>('spectrum-hover-frequency-mask');
-const settingsModal = get<HTMLDialogElement>('settings-modal');
+const settingsPane = get<HTMLElement>('settings-pane');
 const settingsButton = get<HTMLButtonElement>('settings-button');
-const settingsClose = get<HTMLButtonElement>('settings-close');
 const spectrumButton = get<HTMLButtonElement>('spectrum-button');
 const screenshotButton = get<HTMLButtonElement>('screenshot-button');
 const selectionDownloadButton = get<HTMLButtonElement>('selection-download-button');
@@ -330,6 +354,10 @@ paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSetti
 playbackFollowSelect.value = isPlaybackFollowMode(persistedSettings?.playbackFollowMode)
   ? persistedSettings.playbackFollowMode
   : 'page';
+outputFormatSelect.value = isDownloadOutputFormat(persistedSettings?.downloadFormat)
+  ? persistedSettings.downloadFormat
+  : 'auto';
+normalizeOutputToggle.checked = persistedSettings?.normalizeOutput === true;
 themeToggle.checked = isThemeMode(persistedSettings?.theme) && persistedSettings.theme === 'light';
 
 let monoSamples: Float32Array | null = null;
@@ -373,7 +401,10 @@ let spectrumDividerGrabOffset = 0;
 let overlayTimer = 0;
 let overlayToken = 0;
 let playbackFollowMode = playbackFollowSelect.value as PlaybackFollowMode;
+let downloadFormat = outputFormatSelect.value as DownloadOutputFormat;
+let normalizeOutput = normalizeOutputToggle.checked;
 let themeMode: ThemeMode = themeToggle.checked ? 'light' : 'dark';
+let settingsPaneOpen = persistedSettings?.settingsPaneOpen === true;
 let lastPlaybackAnalysisCheck = 0;
 
 document.documentElement.dataset.theme = themeMode;
@@ -415,7 +446,7 @@ engine.onEnded = () => {
 
 playButton.addEventListener('click', () => void togglePlayback());
 screenshotButton.addEventListener('click', downloadSpectrogramPng);
-selectionDownloadButton.addEventListener('click', () => void downloadSelectionWav());
+selectionDownloadButton.addEventListener('click', () => void downloadSelectionAudio());
 spectrumButton.addEventListener('click', () => {
   spectrumAnalyzerOpen = !spectrumAnalyzerOpen;
   applySpectrumAnalyzerLayout();
@@ -423,28 +454,14 @@ spectrumButton.addEventListener('click', () => {
 });
 
 settingsButton.addEventListener('click', () => {
-  if (settingsModal.open) return;
-  // CQT labels include the segment duration, which depends on the loaded
-  // file's sample rate — refresh on open.
-  updateFftControl();
-  updateSpectrumFftControl();
-  settingsModal.showModal();
-  settingsButton.setAttribute('aria-expanded', 'true');
-  requestAnimationFrame(() => fftSlider.focus());
-});
-
-settingsClose.addEventListener('click', () => settingsModal.close());
-settingsModal.addEventListener('close', () => {
-  settingsButton.setAttribute('aria-expanded', 'false');
-  persistSettings();
-  settingsButton.focus();
-});
-settingsModal.addEventListener('click', (event) => {
-  if (event.target !== settingsModal) return;
-  const rect = settingsModal.getBoundingClientRect();
-  const inside = event.clientX >= rect.left && event.clientX <= rect.right &&
-    event.clientY >= rect.top && event.clientY <= rect.bottom;
-  if (!inside) settingsModal.close();
+  if (!settingsPaneOpen) {
+    // CQT labels include the segment duration, which depends on the loaded
+    // file's sample rate — refresh when the pane opens.
+    updateFftControl();
+    updateSpectrumFftControl();
+  }
+  setSettingsPaneOpen(!settingsPaneOpen);
+  scheduleSettingsSave();
 });
 
 fftSlider.addEventListener('input', () => {
@@ -488,6 +505,17 @@ spectrumStyleSelect.addEventListener('change', () => {
 spectrumInterpolationSelect.addEventListener('change', () => {
   if (!isSpectrumInterpolation(spectrumInterpolationSelect.value)) return;
   visualizer.setSpectrumInterpolation(spectrumInterpolationSelect.value);
+  scheduleSettingsSave();
+});
+
+outputFormatSelect.addEventListener('change', () => {
+  if (!isDownloadOutputFormat(outputFormatSelect.value)) return;
+  downloadFormat = outputFormatSelect.value;
+  scheduleSettingsSave();
+});
+
+normalizeOutputToggle.addEventListener('change', () => {
+  normalizeOutput = normalizeOutputToggle.checked;
   scheduleSettingsSave();
 });
 
@@ -1337,12 +1365,23 @@ function applyTheme(): void {
   visualizer.setTheme(themeMode);
 }
 
+function setSettingsPaneOpen(open: boolean): void {
+  settingsPaneOpen = open;
+  settingsPane.hidden = !open;
+  settingsButton.classList.toggle('is-active', open);
+  settingsButton.setAttribute('aria-expanded', open.toString());
+  settingsButton.setAttribute('aria-label', open ? 'Hide settings' : 'Show settings');
+  settingsButton.title = open ? 'Hide settings' : 'Show settings';
+}
+
 function updateRangeFill(input: HTMLInputElement): void {
   const min = Number(input.min) || 0;
   const max = Number(input.max) || 100;
   const progress = ((Number(input.value) - min) / Math.max(1, max - min)) * 100;
   input.style.setProperty('--fill', `${progress}%`);
 }
+
+type DownloadOutputFormat = 'auto' | 'wav' | 'mp3';
 
 type AnalysisCoverage = {
   id: number;
@@ -1368,6 +1407,9 @@ type PersistedSettings = {
   spectrumAnalyzerOpen: boolean;
   spectrumAnalyzerWidth: number;
   theme: ThemeMode;
+  settingsPaneOpen?: boolean;
+  downloadFormat?: DownloadOutputFormat;
+  normalizeOutput?: boolean;
 };
 
 function readPersistedSettings(): PersistedSettings | null {
@@ -1467,6 +1509,9 @@ function persistSettings(): void {
     spectrumAnalyzerOpen,
     spectrumAnalyzerWidth,
     theme: themeMode,
+    settingsPaneOpen,
+    downloadFormat,
+    normalizeOutput,
   };
   try {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
@@ -1477,6 +1522,10 @@ function persistSettings(): void {
 
 function isPlaybackFollowMode(value: unknown): value is PlaybackFollowMode {
   return value === 'center' || value === 'right' || value === 'page';
+}
+
+function isDownloadOutputFormat(value: unknown): value is DownloadOutputFormat {
+  return value === 'auto' || value === 'wav' || value === 'mp3';
 }
 
 function isSpectrumDrawStyle(value: unknown): value is SpectrumDrawStyle {
@@ -1632,36 +1681,83 @@ function downloadSpectrogramPng(): void {
   }, 'image/png');
 }
 
-async function downloadSelectionWav(): Promise<void> {
+async function downloadSelectionAudio(): Promise<void> {
   const currentSelection = selection;
   if (!currentSelection || currentSelection.end <= currentSelection.start) return;
+  // Snapshot source metadata before the first await. An export can take long
+  // enough for the user to begin loading another file in the meantime.
+  const exportSourceFile = sourceFile;
+  const exportSourceHeader = sourceWavHeader;
+  const exportFormat = downloadFormat;
+  const exportNormalize = normalizeOutput;
 
   selectionDownloadButton.disabled = true;
   try {
-    let wav: Blob;
-    if (sourceFile && sourceWavHeader) {
+    const format = resolvedDownloadFormat(exportSourceFile, exportFormat);
+    let output: Blob;
+    if (format === 'wav' && !exportNormalize && exportSourceFile && exportSourceHeader) {
       // This preserves source PCM/float samples byte-for-byte, including the
       // original channel count, sample rate, and bit depth.
-      wav = await trimWavFile(
-        sourceFile,
-        sourceWavHeader,
+      output = await trimWavFile(
+        exportSourceFile,
+        exportSourceHeader,
         currentSelection.start,
         currentSelection.end,
       );
-    } else if (engine.buffer) {
-      wav = trimAudioBufferToFloatWav(engine.buffer, currentSelection.start, currentSelection.end);
     } else {
-      throw new Error('The selected audio is not decoded enough to export yet.');
+      const buffer = await audioBufferForSelectionExport(currentSelection, exportSourceFile);
+      output = format === 'mp3'
+        ? await encodeAudioBufferToMp3(buffer, currentSelection.start, currentSelection.end, {
+          normalizePeak: exportNormalize,
+        })
+        : encodeAudioBufferToWav(buffer, currentSelection.start, currentSelection.end, {
+          sourceHeader: exportSourceHeader,
+          normalizePeak: exportNormalize,
+        });
     }
 
-    const sourceName = sourceFile?.name || fileNameElement.textContent?.trim() || 'audio';
+    const sourceName = exportSourceFile?.name || fileNameElement.textContent?.trim() || 'audio';
     const baseName = sourceName.replace(/\.[^.]+$/, '') || 'audio';
-    triggerDownload(wav, `${baseName}-trim.wav`);
+    triggerDownload(output, `${baseName}-trim.${format}`);
   } catch (error) {
-    showToast(error instanceof Error ? error.message : 'Could not create the selected WAV file.');
+    showToast(error instanceof Error ? error.message : 'Could not create the selected audio file.');
   } finally {
     updateSelectionDownloadState();
   }
+}
+
+function resolvedDownloadFormat(
+  file: File | null,
+  outputFormat: DownloadOutputFormat,
+): Exclude<DownloadOutputFormat, 'auto'> {
+  if (outputFormat !== 'auto') return outputFormat;
+  return /\.mp3$/i.test(file?.name ?? '') ? 'mp3' : 'wav';
+}
+
+async function audioBufferForSelectionExport(
+  currentSelection: SelectionRange,
+  file: File | null,
+): Promise<AudioBuffer> {
+  const buffer = engine.buffer;
+  if (buffer) {
+    const decodedDuration = availableAudioSamples / Math.max(1, audioSampleRate);
+    if (isReadingFile && currentSelection.end > decodedDuration + 1e-6) {
+      throw new Error('Wait for the selected audio to finish loading before re-encoding it.');
+    }
+    return buffer;
+  }
+
+  // Progressive MP4 playback uses an HTML media element rather than an
+  // AudioBuffer. Decode a temporary buffer only when an export needs it, so
+  // Auto/WAV/MP3 downloads also work for that path and other media sources.
+  if (!file) {
+    throw new Error('The selected audio is not available for re-encoding yet.');
+  }
+  const decoded = await engine.decode(await file.arrayBuffer());
+  if (currentSelection.end > decoded.duration + 1e-6) {
+    throw new Error('The selected range is outside the decoded audio.');
+  }
+  return decoded;
 }
 
 function triggerDownload(blob: Blob, fileName: string): void {
@@ -1694,6 +1790,7 @@ function initialize(): void {
   visualizer.setColorPalette(isPaletteName(paletteSelect.value) ? paletteSelect.value : 'viridis');
   setFrequencyScale(frequencyScaleBlend);
   applySpectrumAnalyzerLayout();
+  setSettingsPaneOpen(settingsPaneOpen);
   updateDownloadState();
   updateSelectionDownloadState();
   updateDropOverlayState();

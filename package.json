@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mediabunny/mp3-encoder": "^1.50.8",
     "fft.js": "^4.0.4",
     "mediabunny": "1.50.8"
   },

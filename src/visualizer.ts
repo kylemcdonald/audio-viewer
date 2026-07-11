@@ -201,6 +201,7 @@ export class AudioVisualizer {
   private readonly spectrumHoverFrequencyLabel: HTMLElement;
   private readonly spectrumHoverFrequencyMask: HTMLElement;
   private readonly playhead: HTMLElement;
+  private readonly nativeSpectralToBlob: HTMLCanvasElement['toBlob'];
   private readonly onSeek: (time: number) => void;
   private readonly onViewChange: (start: number, duration: number) => void;
   private readonly onSelectionChange?: (selection: SelectionRange | null) => void;
@@ -254,6 +255,13 @@ export class AudioVisualizer {
     this.spectrumHoverFrequencyLabel = options.spectrumHoverFrequencyLabel;
     this.spectrumHoverFrequencyMask = options.spectrumHoverFrequencyMask;
     this.playhead = options.playhead;
+    this.nativeSpectralToBlob = this.spectralCanvas.toBlob.bind(this.spectralCanvas);
+    // The screenshot control serializes this canvas directly. Keep the live
+    // ruler labels on-screen, but route serialization through a clean
+    // offscreen redraw so selection-only labels remain UI chrome.
+    this.spectralCanvas.toBlob = (callback, type, quality) => {
+      this.exportSpectrogramToBlob(callback, type, quality);
+    };
     this.onSeek = options.onSeek;
     this.onViewChange = options.onViewChange;
     this.onSelectionChange = options.onSelectionChange;
@@ -841,8 +849,11 @@ export class AudioVisualizer {
     });
   }
 
-  private prepareCanvas(canvas: HTMLCanvasElement): CanvasSurface {
-    const bounds = canvas.getBoundingClientRect();
+  private prepareCanvas(
+    canvas: HTMLCanvasElement,
+    dimensions?: { width: number; height: number },
+  ): CanvasSurface {
+    const bounds = dimensions ?? canvas.getBoundingClientRect();
     const width = Math.max(1, bounds.width);
     const height = Math.max(1, bounds.height);
     const dpr = window.devicePixelRatio || 1;
@@ -993,9 +1004,12 @@ export class AudioVisualizer {
     context.fillText('L+R', 9, 14);
   }
 
-  private drawSpectrogram(): void {
-    const canvas = this.spectralCanvas;
-    const surface = this.prepareCanvas(canvas);
+  private drawSpectrogram(
+    canvas: HTMLCanvasElement = this.spectralCanvas,
+    includeSelectionTimeLabels = true,
+    dimensions?: { width: number; height: number },
+  ): void {
+    const surface = this.prepareCanvas(canvas, dimensions);
     const { context, width, height, pixelWidth, pixelHeight, scaleX, scaleY } = surface;
     const plotRight = width - AXIS_WIDTH;
     const plotBottom = height;
@@ -1086,6 +1100,7 @@ export class AudioVisualizer {
       scaleY,
       pixelWidth,
       pixelHeight,
+      includeSelectionTimeLabels,
     );
     this.drawFrequencyGrid(
       context,
@@ -1674,6 +1689,7 @@ export class AudioVisualizer {
     scaleY: number,
     pixelWidth: number,
     pixelHeight: number,
+    includeSelectionTimeLabels = true,
   ): void {
     if (!this.duration) return;
     const plotWidth = plotRight;
@@ -1682,7 +1698,7 @@ export class AudioVisualizer {
     context.font = '10px "Chivo Mono", ui-monospace, monospace';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
-    const selectionLabels = withLabels
+    const selectionLabels = withLabels && includeSelectionTimeLabels
       ? this.selectionTimeAxisLabels(context, plotRight)
       : [];
 
@@ -1787,15 +1803,72 @@ export class AudioVisualizer {
     }
 
     if (labels.length === 2 && labelsIntersect(labels[0].bounds, labels[1].bounds)) {
-      labels[0].y = 1;
-      labels[0].baseline = 'top';
-      labels[0].bounds = labelBounds(context, labels[0]);
-      labels[1].y = SPECTRAL_RULER - 1;
-      labels[1].baseline = 'bottom';
-      labels[1].bounds = labelBounds(context, labels[1]);
+      this.layoutOverlappingSelectionTimeLabels(context, labels, plotRight);
     }
 
     return labels;
+  }
+
+  /**
+   * Short selections can place both endpoint labels at the same edge of the
+   * ruler. Keep them on its single baseline: shift the pair together just
+   * enough to fit, instead of moving one label to a second line.
+   */
+  private layoutOverlappingSelectionTimeLabels(
+    context: CanvasRenderingContext2D,
+    labels: SpectrumAxisLabel[],
+    plotRight: number,
+  ): void {
+    const [start, end] = labels;
+    const startWidth = start.bounds.right - start.bounds.left;
+    const endWidth = end.bounds.right - end.bounds.left;
+    const inset = 2;
+    const gap = 4;
+    const totalWidth = startWidth + gap + endWidth;
+    const availableWidth = Math.max(0, plotRight - inset * 2);
+
+    // A very narrow viewport cannot hold both exact strings. Prefer a single
+    // clean endpoint label to overlapping glyphs, while retaining the same
+    // one-line ruler treatment.
+    if (totalWidth > availableWidth) {
+      labels.splice(1, 1);
+      return;
+    }
+
+    const preferredCenter = (start.x + end.x) / 2;
+    const minimumCenter = inset + totalWidth / 2;
+    const maximumCenter = plotRight - inset - totalWidth / 2;
+    const center = Math.max(minimumCenter, Math.min(maximumCenter, preferredCenter));
+    const left = center - totalWidth / 2;
+    const y = SPECTRAL_RULER / 2 + 0.5;
+
+    start.x = left + startWidth;
+    start.y = y;
+    start.align = 'right';
+    start.baseline = 'middle';
+    start.bounds = labelBounds(context, start);
+
+    end.x = left + startWidth + gap;
+    end.y = y;
+    end.align = 'left';
+    end.baseline = 'middle';
+    end.bounds = labelBounds(context, end);
+  }
+
+  private exportSpectrogramToBlob(
+    callback: BlobCallback,
+    type?: string,
+    quality?: number,
+  ): void {
+    const bounds = this.spectralCanvas.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) {
+      this.nativeSpectralToBlob(callback, type, quality);
+      return;
+    }
+
+    const exportCanvas = document.createElement('canvas');
+    this.drawSpectrogram(exportCanvas, false, bounds);
+    exportCanvas.toBlob(callback, type, quality);
   }
 
   private drawSelectionTimeAxisLabels(
