@@ -418,7 +418,7 @@ select:focus-visible {
   position: fixed;
   z-index: 31;
   top: 0;
-  right: 0;
+  left: 0;
   bottom: 0;
   width: min(390px, 100vw);
   padding-top: var(--topbar-height);
@@ -426,11 +426,11 @@ select:focus-visible {
   overflow-y: auto;
   overscroll-behavior: contain;
   border: 0;
-  border-left: 1px solid rgba(180, 205, 219, 0.22);
+  border-right: 1px solid rgba(180, 205, 219, 0.22);
   border-radius: 0;
   color: var(--text);
   background: #000;
-  box-shadow: -20px 0 48px rgba(0, 0, 0, 0.38);
+  box-shadow: 20px 0 48px rgba(0, 0, 0, 0.38);
 }
 
 .settings-pane[hidden] {
@@ -1149,7 +1149,7 @@ select:focus-visible {
 :root[data-theme="light"] .settings-pane {
   border-color: rgba(30, 39, 46, 0.32);
   background: #fff;
-  box-shadow: -20px 0 48px rgba(24, 34, 39, 0.13);
+  box-shadow: 20px 0 48px rgba(24, 34, 39, 0.13);
 }
 
 :root[data-theme="light"] .settings-divider {
