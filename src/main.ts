@@ -88,8 +88,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
           <div class="palette-select-row">
             <select id="analysis-mode-select" class="palette-select" aria-label="Spectrogram analysis mode">
-              <option value="fft" selected>FFT — linear bins</option>
-              <option value="cqt">CQT — constant-Q log bands</option>
+              <option value="fft">FFT — linear bins</option>
+              <option value="cqt" selected>CQT — constant-Q log bands</option>
             </select>
           </div>
         </div>
@@ -101,7 +101,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
           <div class="slider-row">
             <span>TIME</span>
-            <input id="fft-slider" class="range-input stepped" type="range" min="0" max="5" step="1" value="4" aria-label="Spectrogram resolution" />
+            <input id="fft-slider" class="range-input stepped" type="range" min="0" max="5" step="1" value="2" aria-label="Spectrogram resolution" />
             <span>FREQ</span>
           </div>
         </div>
@@ -314,7 +314,9 @@ const spectrumAnalyzer = get<HTMLElement>('spectrum-analyzer');
 
 const SETTINGS_STORAGE_KEY = 'audio-spectrogram.settings.v1';
 const persistedSettings = readPersistedSettings();
-fftSlider.value = Math.round(clampNumber(persistedSettings?.fftIndex, 4, 0, 5)).toString();
+// Default: CQT at 24 bands/octave with a 16,384-sample analysis segment
+// (slider index 2; 341 ms at 48 kHz).
+fftSlider.value = Math.round(clampNumber(persistedSettings?.fftIndex, 2, 0, 5)).toString();
 spectrumFftSlider.value = Math.round(clampNumber(persistedSettings?.spectrumFftIndex, 4, 0, 8)).toString();
 dbRangeSlider.value = clampNumber(persistedSettings?.dbRange, 120, 60, 140).toString();
 spectrumStyleSelect.value = isSpectrumDrawStyle(persistedSettings?.spectrumDrawStyle)
@@ -323,7 +325,7 @@ spectrumStyleSelect.value = isSpectrumDrawStyle(persistedSettings?.spectrumDrawS
 spectrumInterpolationSelect.value = isSpectrumInterpolation(persistedSettings?.spectrumInterpolation)
   ? persistedSettings.spectrumInterpolation
   : 'linear';
-analysisModeSelect.value = persistedSettings?.analysisMode === 'cqt' ? 'cqt' : 'fft';
+analysisModeSelect.value = persistedSettings?.analysisMode === 'fft' ? 'fft' : 'cqt';
 paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSettings.palette : 'viridis';
 playbackFollowSelect.value = isPlaybackFollowMode(persistedSettings?.playbackFollowMode)
   ? persistedSettings.playbackFollowMode
