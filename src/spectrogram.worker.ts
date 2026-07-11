@@ -4,6 +4,7 @@ import FFT from 'fft.js';
 import type { AnalysisInput, AnalysisMode, AnalysisRequest } from './types';
 import {
   buildCqtPlan,
+  cqtBinsPerOctave,
   cqtColumnFromSpectrum,
   cqtSegmentSize,
   CQT_COLUMN_SHADER,
@@ -36,7 +37,7 @@ const frameCache = new Map<number, Int16Array>();
 const cqtPlans = new Map<string, CqtPlan>();
 
 function getCqtPlan(sampleRate: number, fftSize: number): CqtPlan {
-  const key = `${sampleRate}:${cqtSegmentSize(fftSize)}`;
+  const key = `${sampleRate}:${cqtSegmentSize(fftSize)}:${cqtBinsPerOctave(fftSize)}`;
   let plan = cqtPlans.get(key);
   if (!plan) {
     plan = buildCqtPlan(sampleRate, fftSize);
@@ -107,9 +108,13 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
   const cqtPlan = mode === 'cqt' ? getCqtPlan(audioSampleRate, request.fftSize) : null;
   // The analysis segment per column: the FFT frame, or the (longer) CQT one.
   const segmentSize = cqtPlan ? cqtPlan.L : request.fftSize;
+  // FFT rows follow the transform size so higher resolution settings reach
+  // the image (previously capped at 1024, which max-pooled away all bin
+  // detail beyond the 1,024-bin setting). Larger frames shrink the LRU
+  // cache's column count correspondingly (MAX_CACHE_VALUES is unchanged).
   const layout: AnalysisLayout = cqtPlan
     ? { bins: cqtPlan.nBands, rows: cqtPlan.nBands }
-    : { bins: request.fftSize / 2, rows: Math.min(request.fftSize / 2, 1024) };
+    : { bins: request.fftSize / 2, rows: Math.min(request.fftSize / 2, 4096) };
   // Negative key namespaces CQT cache entries away from FFT sizes.
   const cacheGeneration = prepareFrameCache(cqtPlan ? -cqtPlan.L : request.fftSize, layout.rows);
   const plan = createAnalysisPlan(request, segmentSize);
@@ -531,7 +536,7 @@ async function analyzeFramesWithGpu(
 }
 
 function getCqtPlanBuffers(gpu: GpuContext, plan: CqtPlan): { meta: GPUBuffer; win: GPUBuffer } {
-  const key = `${plan.sampleRate}:${plan.L}`;
+  const key = `${plan.sampleRate}:${plan.L}:${plan.binsPerOctave}`;
   let buffers = gpu.cqtPlanBuffers.get(key);
   if (!buffers) {
     const meta = gpu.device.createBuffer({

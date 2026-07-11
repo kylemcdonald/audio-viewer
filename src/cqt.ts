@@ -3,7 +3,7 @@
  *
  * Each spectrogram column is a constant-Q frame: one Hann-windowed FFT of a
  * segment centered on the column's tick (length L = 8x the UI FFT size,
- * capped at 32768), followed by, for every log-spaced band, a windowed dot
+ * capped at CQT_MAX_SEGMENT), followed by, for every log-spaced band, a windowed dot
  * product over the band's spectral support evaluated at the segment center.
  * The center-time phase factor e^{2*pi*i*bin*(L/2)/L} degenerates to
  * (-1)^bin, so no per-band inverse transform is needed — a CQT column costs
@@ -24,8 +24,7 @@
  */
 
 export const CQT_FMIN = 32.703; // C1
-export const CQT_BINS_PER_OCTAVE = 24;
-export const CQT_MAX_SEGMENT = 32768;
+export const CQT_MAX_SEGMENT = 65536;
 
 export type CqtPlan = {
   sampleRate: number;
@@ -45,9 +44,20 @@ export function cqtSegmentSize(fftSize: number): number {
   return Math.max(4096, Math.min(CQT_MAX_SEGMENT, fftSize * 8));
 }
 
+/**
+ * Vertical resolution follows the UI resolution slider: more bands per
+ * octave at higher settings. Higher B needs the longer segments the same
+ * slider positions provide (band supports halve as B doubles).
+ */
+export function cqtBinsPerOctave(fftSize: number): number {
+  if (fftSize >= 8192) return 48;
+  if (fftSize >= 4096) return 36;
+  return 24;
+}
+
 export function buildCqtPlan(sampleRate: number, fftSize: number): CqtPlan {
   const L = cqtSegmentSize(fftSize);
-  const B = CQT_BINS_PER_OCTAVE;
+  const B = cqtBinsPerOctave(fftSize);
   const fMax = (sampleRate / 2) * 2 ** (-0.5 / B);
   const nBands = 1 + Math.floor(B * Math.log2(fMax / CQT_FMIN) + 1e-9);
   const halfBins = Math.floor(L / 2);

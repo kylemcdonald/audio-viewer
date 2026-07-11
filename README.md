@@ -25,7 +25,7 @@ Open [http://vibecheck.local:5173/](http://vibecheck.local:5173/).
 - Download the visible spectrogram canvas as a full-resolution PNG from the header.
 - Choose centered, right-edge, or paged playback scrolling in the gear menu.
 - Blend continuously between linear and logarithmic frequency scales.
-- Switch the spectrogram between FFT analysis (linear bins) and constant-Q analysis (log-spaced bands, 24 per octave) in the gear menu; CQT mode resolves low frequencies far more sharply and pairs naturally with the logarithmic scale.
+- Switch the spectrogram between FFT analysis (linear bins) and constant-Q analysis (log-spaced bands, 24-48 per octave following the resolution slider) in the gear menu; CQT mode resolves low frequencies far more sharply and pairs naturally with the logarithmic scale.
 - Select 256–4,096 FFT bins to trade time resolution for frequency resolution.
 - Set the spectrogram dynamic range from 60–140 dB in the gear menu.
 - Switch among the Viridis, Magma, and Inferno palettes without recomputing the FFT.

@@ -1,5 +1,6 @@
 import './style.css';
 import { AudioEngine } from './audio-engine';
+import { cqtBinsPerOctave } from './cqt';
 import { isPaletteName, type PaletteName } from './palettes';
 import type {
   AnalysisAppend,
@@ -448,6 +449,7 @@ fftSlider.addEventListener('input', () => {
 });
 
 analysisModeSelect.addEventListener('change', () => {
+  updateFftControl();
   scheduleSettingsSave();
   analyzeCurrentAudio({ force: true });
 });
@@ -1261,7 +1263,9 @@ function coverageIncludes(
 
 function updateFftControl(): void {
   const bins = fftBins[Number(fftSlider.value)];
-  fftOutput.value = `${bins.toLocaleString()} bins`;
+  fftOutput.value = analysisModeSelect.value === 'cqt'
+    ? `${cqtBinsPerOctave(bins * 2)} bands/octave`
+    : `${bins.toLocaleString()} bins`;
   fftSlider.setAttribute('aria-valuetext', fftOutput.value);
   updateRangeFill(fftSlider);
 }
