@@ -94,6 +94,20 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           </div>
         </div>
         <div class="settings-divider" aria-hidden="true"></div>
+        <div class="control-group dc-bin-control">
+          <div class="control-heading">
+            <label for="dc-bin-toggle">CQT DC bin</label>
+          </div>
+          <div class="theme-toggle-row">
+            <span>Exclude</span>
+            <label class="theme-switch">
+              <input id="dc-bin-toggle" type="checkbox" role="switch" aria-label="Include the DC bin in CQT analysis" />
+              <span aria-hidden="true"></span>
+            </label>
+            <span>Include</span>
+          </div>
+        </div>
+        <div class="settings-divider" aria-hidden="true"></div>
         <div class="control-group fft-control">
           <div class="control-heading">
             <label for="fft-slider">Spectrogram resolution</label>
@@ -284,6 +298,7 @@ const dbRangeOutput = get<HTMLOutputElement>('db-range-output');
 const frequencyScaleSlider = get<HTMLInputElement>('frequency-scale-slider');
 const frequencyScaleOutput = get<HTMLOutputElement>('frequency-scale-output');
 const analysisModeSelect = get<HTMLSelectElement>('analysis-mode-select');
+const dcBinToggle = get<HTMLInputElement>('dc-bin-toggle');
 const spectrumStyleSelect = get<HTMLSelectElement>('spectrum-style-select');
 const spectrumInterpolationSelect = get<HTMLSelectElement>('spectrum-interpolation-select');
 const paletteSelect = get<HTMLSelectElement>('palette-select');
@@ -324,6 +339,7 @@ spectrumInterpolationSelect.value = isSpectrumInterpolation(persistedSettings?.s
   ? persistedSettings.spectrumInterpolation
   : 'linear';
 analysisModeSelect.value = persistedSettings?.analysisMode === 'cqt' ? 'cqt' : 'fft';
+dcBinToggle.checked = persistedSettings?.cqtIncludeDc === true;
 paletteSelect.value = isPaletteName(persistedSettings?.palette) ? persistedSettings.palette : 'viridis';
 playbackFollowSelect.value = isPlaybackFollowMode(persistedSettings?.playbackFollowMode)
   ? persistedSettings.playbackFollowMode
@@ -452,6 +468,11 @@ analysisModeSelect.addEventListener('change', () => {
   updateFftControl();
   scheduleSettingsSave();
   analyzeCurrentAudio({ force: true });
+});
+
+dcBinToggle.addEventListener('change', () => {
+  scheduleSettingsSave();
+  if (analysisModeSelect.value === 'cqt') analyzeCurrentAudio({ force: true });
 });
 
 spectrumFftSlider.addEventListener('input', () => {
@@ -1176,6 +1197,7 @@ function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean 
     id: analysisId,
     fftSize,
     analysisMode,
+    cqtIncludeDc: dcBinToggle.checked,
     startTime: requestStart,
     viewDuration: requestDuration,
     columns: requestColumns,
@@ -1341,6 +1363,7 @@ type PersistedSettings = {
   frequencyScale: number;
   fftIndex: number;
   analysisMode?: AnalysisMode;
+  cqtIncludeDc?: boolean;
   spectrumFftIndex: number;
   dbRange: number;
   spectrumDrawStyle: SpectrumDrawStyle;
@@ -1438,6 +1461,7 @@ function persistSettings(): void {
     frequencyScale: frequencyScaleBlend,
     fftIndex: Number(fftSlider.value),
     analysisMode: analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft',
+    cqtIncludeDc: dcBinToggle.checked,
     spectrumFftIndex: Number(spectrumFftSlider.value),
     dbRange: Number(dbRangeSlider.value),
     spectrumDrawStyle: isSpectrumDrawStyle(spectrumStyleSelect.value) ? spectrumStyleSelect.value : 'filled',
