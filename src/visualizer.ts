@@ -11,6 +11,10 @@ export type PlaybackFollowMode = 'center' | 'right' | 'page';
 export type SpectrumDrawStyle = 'outline' | 'filled' | 'bars' | 'lines' | 'points';
 export type SpectrumInterpolation = 'nearest' | 'linear';
 export type ThemeMode = 'dark' | 'light';
+export type SelectionRange = {
+  start: number;
+  end: number;
+};
 
 type PeakLevel = {
   blockSize: number;
@@ -79,6 +83,14 @@ type FrequencyAxisTick = {
   baseline: CanvasTextBaseline;
 };
 
+type SelectionDrag = {
+  pointerId: number;
+  kind: 'range' | 'start' | 'end';
+  anchor: number;
+  startX: number;
+  moved: boolean;
+};
+
 export type VisualizerOptions = {
   editor: HTMLElement;
   waveCanvas: HTMLCanvasElement;
@@ -89,6 +101,7 @@ export type VisualizerOptions = {
   playhead: HTMLElement;
   onSeek: (time: number) => void;
   onViewChange: (start: number, duration: number) => void;
+  onSelectionChange?: (selection: SelectionRange | null) => void;
 };
 
 class PeakPyramid {
@@ -189,6 +202,7 @@ export class AudioVisualizer {
   private readonly playhead: HTMLElement;
   private readonly onSeek: (time: number) => void;
   private readonly onViewChange: (start: number, duration: number) => void;
+  private readonly onSelectionChange?: (selection: SelectionRange | null) => void;
   private readonly pointers = new Map<number, PointerPoint>();
   private colorLut = createPaletteLut('viridis');
   private resizeObserver: ResizeObserver;
@@ -224,6 +238,9 @@ export class AudioVisualizer {
   private playbackFollowMode: PlaybackFollowMode = 'page';
   private rulerLock: RulerLock | null = null;
   private frequencyAxisTicks: FrequencyAxisTick[] = [];
+  private selectionRange: SelectionRange | null = null;
+  private selectionDraft: SelectionRange | null = null;
+  private selectionDrag: SelectionDrag | null = null;
 
   constructor(options: VisualizerOptions) {
     this.editor = options.editor;
@@ -235,6 +252,7 @@ export class AudioVisualizer {
     this.playhead = options.playhead;
     this.onSeek = options.onSeek;
     this.onViewChange = options.onViewChange;
+    this.onSelectionChange = options.onSelectionChange;
 
     this.resizeObserver = new ResizeObserver(() => {
       this.requestRender();
@@ -250,6 +268,7 @@ export class AudioVisualizer {
   }
 
   setAudio(samples: Float32Array, sampleRate: number, duration: number): void {
+    this.setSelection(null);
     this.samples = samples;
     this.sampleRate = sampleRate;
     this.duration = duration;
@@ -262,6 +281,7 @@ export class AudioVisualizer {
   }
 
   clearAudio(): void {
+    this.setSelection(null);
     this.samples = null;
     this.peaks = null;
     this.spectrogram = null;
@@ -274,6 +294,7 @@ export class AudioVisualizer {
   }
 
   beginProgressiveAudio(samples: Float32Array, sampleRate: number, duration: number): void {
+    this.setSelection(null);
     this.samples = samples;
     this.sampleRate = sampleRate;
     this.duration = duration;
@@ -295,6 +316,19 @@ export class AudioVisualizer {
     this.spectrogram = data;
     this.requestRender();
     this.requestAnalyzerRender();
+  }
+
+  get selection(): SelectionRange | null {
+    return this.selectionRange ? { ...this.selectionRange } : null;
+  }
+
+  setSelection(selection: SelectionRange | null): void {
+    const next = this.normalizeSelection(selection);
+    if (selectionRangesEqual(this.selectionRange, next)) return;
+    this.selectionRange = next;
+    this.selectionDraft = null;
+    this.onSelectionChange?.(next ? { ...next } : null);
+    this.requestRender();
   }
 
   setSpectralRange(value: number): void {
@@ -477,6 +511,9 @@ export class AudioVisualizer {
     this.editor.addEventListener('pointermove', (event) => this.pointerMove(event));
     this.editor.addEventListener('pointerup', (event) => this.pointerUp(event));
     this.editor.addEventListener('pointercancel', (event) => this.pointerUp(event));
+    this.waveCanvas.addEventListener('pointerleave', () => {
+      if (!this.selectionDrag) this.setWaveformSelectionCursor(false);
+    });
     this.editor.addEventListener('wheel', (event) => this.wheel(event), { passive: false });
     this.editor.addEventListener('dblclick', (event) => {
       if (!this.isTimelineEvent(event)) return;
@@ -493,6 +530,7 @@ export class AudioVisualizer {
     if (this.pointers.size === 2) {
       window.clearTimeout(this.touchSeekTimer);
       this.scrubbingPointer = null;
+      this.cancelSelectionDrag();
       this.wasPinching = true;
       const [a, b] = [...this.pointers.values()];
       const centerX = (a.x + b.x) / 2;
@@ -505,6 +543,12 @@ export class AudioVisualizer {
     }
 
     this.wasPinching = false;
+    if (this.isWaveformPlotEvent(event)) {
+      event.preventDefault();
+      this.beginSelectionDrag(event.pointerId, this.waveformEventX(event));
+      return;
+    }
+
     if (event.pointerType === 'touch') {
       this.touchSeekTimer = window.setTimeout(() => {
         if (this.pointers.size !== 1) return;
@@ -518,8 +562,19 @@ export class AudioVisualizer {
   }
 
   private pointerMove(event: PointerEvent): void {
-    if (!this.pointers.has(event.pointerId)) return;
-    this.pointers.set(event.pointerId, this.eventPoint(event));
+    const isTracked = this.pointers.has(event.pointerId);
+    if (isTracked) this.pointers.set(event.pointerId, this.eventPoint(event));
+
+    if (this.selectionDrag?.pointerId === event.pointerId) {
+      this.updateSelectionDrag(this.waveformEventX(event));
+      return;
+    }
+
+    if (this.isWaveformPlotEvent(event)) {
+      this.setWaveformSelectionCursor(this.selectionEndpointAtX(this.waveformEventX(event)) !== null);
+    }
+
+    if (!isTracked) return;
 
     if (this.pointers.size >= 2 && this.pinch) {
       const [a, b] = [...this.pointers.values()];
@@ -539,6 +594,14 @@ export class AudioVisualizer {
   }
 
   private pointerUp(event: PointerEvent): void {
+    if (this.selectionDrag?.pointerId === event.pointerId) {
+      if (event.type === 'pointercancel') this.cancelSelectionDrag();
+      else {
+        this.updateSelectionDrag(this.waveformEventX(event));
+        this.commitSelectionDrag();
+      }
+    }
+
     const hadTwo = this.pointers.size >= 2;
     this.pointers.delete(event.pointerId);
     if (this.scrubbingPointer === event.pointerId) this.scrubbingPointer = null;
@@ -549,6 +612,97 @@ export class AudioVisualizer {
       this.wasPinching = true;
     }
     if (this.pointers.size === 0) this.wasPinching = false;
+  }
+
+  private beginSelectionDrag(pointerId: number, x: number): void {
+    const endpoint = this.selectionEndpointAtX(x);
+    const current = this.timeAtX(x);
+    if (endpoint && this.selectionRange) {
+      this.selectionDraft = { ...this.selectionRange };
+      this.selectionDrag = {
+        pointerId,
+        kind: endpoint,
+        anchor: endpoint === 'start' ? this.selectionRange.end : this.selectionRange.start,
+        startX: x,
+        moved: false,
+      };
+      this.setWaveformSelectionCursor(true);
+      return;
+    }
+
+    this.selectionDraft = { start: current, end: current };
+    this.selectionDrag = {
+      pointerId,
+      kind: 'range',
+      anchor: current,
+      startX: x,
+      moved: false,
+    };
+    this.setWaveformSelectionCursor(false);
+    this.requestRender();
+  }
+
+  private updateSelectionDrag(x: number): void {
+    const drag = this.selectionDrag;
+    if (!drag) return;
+    if (!drag.moved && Math.abs(x - drag.startX) < 2) return;
+    drag.moved = true;
+    const current = this.timeAtX(x);
+    this.selectionDraft = selectionFromEndpoints(drag.anchor, current);
+    this.setWaveformSelectionCursor(drag.kind === 'start' || drag.kind === 'end');
+    this.requestRender();
+  }
+
+  private commitSelectionDrag(): void {
+    const drag = this.selectionDrag;
+    const draft = this.selectionDraft;
+    this.selectionDrag = null;
+    this.selectionDraft = null;
+    this.setWaveformSelectionCursor(false);
+
+    if (!drag) return;
+    if (drag.kind === 'range' && !drag.moved) {
+      this.setSelection(null);
+      this.seekAtX(drag.startX);
+      return;
+    }
+    this.setSelection(draft);
+  }
+
+  private cancelSelectionDrag(): void {
+    if (!this.selectionDrag && !this.selectionDraft) return;
+    this.selectionDrag = null;
+    this.selectionDraft = null;
+    this.setWaveformSelectionCursor(false);
+    this.requestRender();
+  }
+
+  private isWaveformPlotEvent(event: PointerEvent): boolean {
+    if (event.target !== this.waveCanvas) return false;
+    const rect = this.waveCanvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    return x >= 0 && x < rect.width - AXIS_WIDTH && y >= 0 && y <= rect.height;
+  }
+
+  private waveformEventX(event: PointerEvent): number {
+    return event.clientX - this.waveCanvas.getBoundingClientRect().left;
+  }
+
+  private selectionEndpointAtX(x: number): 'start' | 'end' | null {
+    const selection = this.selectionRange;
+    if (!selection) return null;
+    const hitRadius = 8;
+    const startX = this.timeToX(selection.start);
+    const endX = this.timeToX(selection.end);
+    const startDistance = Math.abs(x - startX);
+    const endDistance = Math.abs(x - endX);
+    if (startDistance > hitRadius && endDistance > hitRadius) return null;
+    return startDistance <= endDistance ? 'start' : 'end';
+  }
+
+  private setWaveformSelectionCursor(overEndpoint: boolean): void {
+    this.waveCanvas.style.cursor = overEndpoint ? 'ew-resize' : '';
   }
 
   private updateSpectrumHover(event: PointerEvent): void {
@@ -604,6 +758,24 @@ export class AudioVisualizer {
     const plotWidth = this.timelinePlotWidth;
     const ratio = Math.max(0, Math.min(1, x / plotWidth));
     return this.viewStart + ratio * this.viewDuration;
+  }
+
+  private timeToX(time: number): number {
+    return ((time - this.viewStart) / this.viewDuration) * this.timelinePlotWidth;
+  }
+
+  private get renderedSelection(): SelectionRange | null {
+    const selection = this.selectionDraft ?? this.selectionRange;
+    if (!selection || selection.end - selection.start <= 1e-9) return null;
+    return selection;
+  }
+
+  private normalizeSelection(selection: SelectionRange | null): SelectionRange | null {
+    if (!selection || !this.duration) return null;
+    if (!Number.isFinite(selection.start) || !Number.isFinite(selection.end)) return null;
+    const start = Math.max(0, Math.min(this.duration, Math.min(selection.start, selection.end)));
+    const end = Math.max(0, Math.min(this.duration, Math.max(selection.start, selection.end)));
+    return end - start > 1e-9 ? { start, end } : null;
   }
 
   private eventPoint(event: PointerEvent): PointerPoint {
@@ -798,6 +970,7 @@ export class AudioVisualizer {
       context.restore();
     }
 
+    this.drawWaveformSelection(surface, plotRight);
     this.drawWaveformBorder(surface, plotRight);
     context.fillStyle = light ? '#68747d' : '#74818d';
     context.font = '600 9px Inter, ui-sans-serif, system-ui, sans-serif';
@@ -1424,6 +1597,9 @@ export class AudioVisualizer {
     context.font = '10px "Chivo Mono", ui-monospace, monospace';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
+    const selectionLabels = withLabels
+      ? this.selectionTimeAxisLabels(context, plotRight)
+      : [];
 
     context.save();
     context.setTransform(1, 0, 0, 1, 0, 0);
@@ -1469,12 +1645,86 @@ export class AudioVisualizer {
       context.fillStyle = this.isLightTheme ? '#68747d' : '#83909c';
       for (const { time, x } of ticks) {
         if (x < -1 || x > plotRight + 1) continue;
-        context.textAlign = x < 24 ? 'left' : x > plotRight - 24 ? 'right' : 'center';
-        context.fillText(formatRuler(time, step), x, SPECTRAL_RULER / 2 + 0.5);
+        const label: SpectrumAxisLabel = {
+          label: formatRuler(time, step),
+          x,
+          y: SPECTRAL_RULER / 2 + 0.5,
+          align: x < 24 ? 'left' : x > plotRight - 24 ? 'right' : 'center',
+          baseline: 'middle',
+          font: context.font,
+          bounds: { left: 0, top: 0, right: 0, bottom: 0 },
+        };
+        label.bounds = labelBounds(context, label);
+        if (selectionLabels.some((selectionLabel) => labelsIntersect(label.bounds, selectionLabel.bounds))) {
+          continue;
+        }
+        context.textAlign = label.align;
+        context.fillText(label.label, label.x, label.y);
       }
+      this.drawSelectionTimeAxisLabels(context, selectionLabels);
     }
 
     void height;
+  }
+
+  private selectionTimeAxisLabels(
+    context: CanvasRenderingContext2D,
+    plotRight: number,
+  ): SpectrumAxisLabel[] {
+    const selection = this.renderedSelection;
+    if (!selection) return [];
+    const viewEnd = this.viewStart + this.viewDuration;
+    const endpoints: Array<{ time: number; side: 'start' | 'end' }> = [
+      { time: selection.start, side: 'start' },
+      { time: selection.end, side: 'end' },
+    ];
+    const labels: SpectrumAxisLabel[] = [];
+
+    for (const { time, side } of endpoints) {
+      if (time < this.viewStart - 1e-9 || time > viewEnd + 1e-9) continue;
+      const x = Math.max(0, Math.min(plotRight, this.timeToX(time)));
+      const labelText = formatSelectionClock(time);
+      const width = context.measureText(labelText).width;
+      const align: CanvasTextAlign = side === 'start'
+        ? x - width < 2 ? 'left' : 'right'
+        : x + width > plotRight - 2 ? 'right' : 'left';
+      const label: SpectrumAxisLabel = {
+        label: labelText,
+        x,
+        y: SPECTRAL_RULER / 2 + 0.5,
+        align,
+        baseline: 'middle',
+        font: context.font,
+        bounds: { left: 0, top: 0, right: 0, bottom: 0 },
+      };
+      label.bounds = labelBounds(context, label);
+      labels.push(label);
+    }
+
+    if (labels.length === 2 && labelsIntersect(labels[0].bounds, labels[1].bounds)) {
+      labels[0].y = 1;
+      labels[0].baseline = 'top';
+      labels[0].bounds = labelBounds(context, labels[0]);
+      labels[1].y = SPECTRAL_RULER - 1;
+      labels[1].baseline = 'bottom';
+      labels[1].bounds = labelBounds(context, labels[1]);
+    }
+
+    return labels;
+  }
+
+  private drawSelectionTimeAxisLabels(
+    context: CanvasRenderingContext2D,
+    labels: SpectrumAxisLabel[],
+  ): void {
+    if (!labels.length) return;
+    context.fillStyle = this.signalColor;
+    for (const label of labels) {
+      context.font = label.font;
+      context.textAlign = label.align;
+      context.textBaseline = label.baseline;
+      context.fillText(label.label, label.x, label.y);
+    }
   }
 
   private timeTicks(plotWidth: number, step: number): Array<{ time: number; x: number }> {
@@ -1580,6 +1830,30 @@ export class AudioVisualizer {
       context.textBaseline = baseline;
       context.fillText(formatFrequency(frequency), plotRight + AXIS_LABEL_INSET, y);
     }
+  }
+
+  private drawWaveformSelection(surface: CanvasSurface, plotRight: number): void {
+    const selection = this.renderedSelection;
+    if (!selection) return;
+
+    const { context, pixelWidth, pixelHeight, scaleX } = surface;
+    const plotWidth = Math.max(1, plotRight);
+    const startX = ((selection.start - this.viewStart) / this.viewDuration) * plotWidth;
+    const endX = ((selection.end - this.viewStart) / this.viewDuration) * plotWidth;
+    const plotPhysicalRight = clampDeviceBoundary(Math.round(plotRight * scaleX), pixelWidth);
+    const left = Math.max(0, Math.min(plotPhysicalRight, Math.round(Math.min(startX, endX) * scaleX)));
+    const right = Math.max(0, Math.min(plotPhysicalRight, Math.round(Math.max(startX, endX) * scaleX)));
+    if (right <= 0 || left >= plotPhysicalRight || right <= left) return;
+
+    // Keep the translucent range as a device-aligned rectangle in the backing
+    // store. This avoids a softened edge on high-DPI displays while leaving
+    // the waveform frame itself to be redrawn above it.
+    context.save();
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.fillStyle = this.isLightTheme ? 'rgba(23, 123, 87, .16)' : 'rgba(99, 239, 180, .17)';
+    context.fillRect(left, 0, right - left, pixelHeight);
+    context.restore();
   }
 
   private drawWaveformBorder(surface: CanvasSurface, plotRight: number): void {
@@ -1748,6 +2022,30 @@ function formatRuler(time: number, step: number): string {
   const seconds = rounded - minutes * 60;
   const width = precision > 0 ? precision + 3 : 2;
   return `${minutes}:${seconds.toFixed(precision).padStart(width, '0')}`;
+}
+
+function formatSelectionClock(time: number): string {
+  const milliseconds = Math.max(0, Math.round(time * 1000));
+  const minutes = Math.floor(milliseconds / 60_000);
+  const seconds = Math.floor((milliseconds % 60_000) / 1000);
+  const remainder = milliseconds % 1000;
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${remainder.toString().padStart(3, '0')}`;
+}
+
+function selectionFromEndpoints(first: number, second: number): SelectionRange {
+  return {
+    start: Math.min(first, second),
+    end: Math.max(first, second),
+  };
+}
+
+function selectionRangesEqual(
+  first: SelectionRange | null,
+  second: SelectionRange | null,
+): boolean {
+  if (first === second) return true;
+  if (!first || !second) return false;
+  return Math.abs(first.start - second.start) < 1e-9 && Math.abs(first.end - second.end) < 1e-9;
 }
 
 export function formatClock(time: number, precise = true): string {

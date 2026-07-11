@@ -13,11 +13,13 @@ import {
   AudioVisualizer,
   formatClock,
   type PlaybackFollowMode,
+  type SelectionRange,
   type SpectrumDrawStyle,
   type SpectrumInterpolation,
   type ThemeMode,
 } from './visualizer';
 import { decodeWavChunk, parseWavHeader, preferredWavChunkBytes, type WavHeader } from './wav-reader';
+import { trimAudioBufferToFloatWav, trimWavFile } from './wav-export';
 import type { Mp4AudioSession } from './mp4-reader';
 
 const icon = (path: string, viewBox = '0 0 24 24') => `
@@ -31,6 +33,7 @@ const importIcon = icon('<path d="M13.5 4H18a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4.5
 const spectrumIcon = icon('<path d="M3 17.5h18M4 15l2.3-5 2.2 3.2L11 6l2.2 8 2.3-5.6 1.8 4.2L20 5.5" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>');
 const gearIcon = icon('<path d="M12 8.3a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4Zm7.7 4.9v-2.4l-2-.7a6.3 6.3 0 0 0-.7-1.6l.9-1.9-1.7-1.7-1.9.9a6.3 6.3 0 0 0-1.6-.7l-.7-2h-2.4l-.7 2a6.3 6.3 0 0 0-1.6.7l-1.9-.9-1.7 1.7.9 1.9a6.3 6.3 0 0 0-.7 1.6l-2 .7v2.4l2 .7c.2.6.4 1.1.7 1.6l-.9 1.9 1.7 1.7 1.9-.9c.5.3 1 .6 1.6.7l.7 2H13l.7-2c.6-.2 1.1-.4 1.6-.7l1.9.9 1.7-1.7-.9-1.9c.3-.5.6-1 .7-1.6l2-.7Z" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>');
 const downloadIcon = icon('<path d="M12 3.5v11m-4-4 4 4 4-4M5 19.5h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>');
+const imageIcon = icon('<rect x="3.5" y="4.5" width="17" height="15" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.55"/><circle cx="8.4" cy="9" r="1.35" fill="currentColor"/><path d="m5.5 17 4.3-4.4 2.8 2.6 2.2-2.1 3.7 3.9" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>');
 const closeIcon = icon('<path d="m7 7 10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>');
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
@@ -66,7 +69,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 
       <div class="header-actions">
         <button class="header-icon-button" id="spectrum-button" type="button" aria-label="Open spectrum analyzer" aria-controls="spectrum-analyzer" aria-expanded="false" aria-pressed="false" title="Spectrum analyzer">${spectrumIcon}</button>
-        <button class="header-icon-button" id="download-button" type="button" aria-label="Download spectrogram as PNG" title="Download spectrogram as PNG" disabled>${downloadIcon}</button>
+        <button class="header-icon-button" id="screenshot-button" type="button" aria-label="Save spectrogram screenshot" title="Save spectrogram screenshot" disabled>${imageIcon}</button>
+        <button class="header-icon-button" id="selection-download-button" type="button" aria-label="Download selected audio as WAV" title="Download selection as WAV" hidden>${downloadIcon}</button>
         <button class="header-icon-button" id="settings-button" type="button" aria-label="Spectrogram settings" aria-haspopup="dialog" aria-controls="settings-modal" aria-expanded="false" title="Spectrogram settings">${gearIcon}</button>
       </div>
     </header>
@@ -288,7 +292,8 @@ const settingsModal = get<HTMLDialogElement>('settings-modal');
 const settingsButton = get<HTMLButtonElement>('settings-button');
 const settingsClose = get<HTMLButtonElement>('settings-close');
 const spectrumButton = get<HTMLButtonElement>('spectrum-button');
-const downloadButton = get<HTMLButtonElement>('download-button');
+const screenshotButton = get<HTMLButtonElement>('screenshot-button');
+const selectionDownloadButton = get<HTMLButtonElement>('selection-download-button');
 const spectrumDivider = get<HTMLElement>('spectrum-divider');
 const spectrumAnalyzer = get<HTMLElement>('spectrum-analyzer');
 
@@ -322,6 +327,9 @@ let analysisViewStart = 0;
 let analysisViewDuration = 1;
 let latestSpectrogram: SpectrogramData | null = null;
 let activeAnalysisRequest: AnalysisCoverage | null = null;
+let sourceFile: File | null = null;
+let sourceWavHeader: WavHeader | null = null;
+let selection: SelectionRange | null = null;
 let toastTimer = 0;
 let settingsSaveTimer = 0;
 let dragDepth = 0;
@@ -375,6 +383,11 @@ const visualizer = new AudioVisualizer({
     analysisViewDuration = duration;
     scheduleViewportAnalysis(engine.isPlaying ? playbackAnalysisInterval() : 24);
   },
+  onSelectionChange: (nextSelection) => {
+    selection = nextSelection;
+    engine.setPlaybackRange(nextSelection ? [nextSelection.start, nextSelection.end] : null);
+    updateSelectionDownloadState();
+  },
 });
 
 engine.onEnded = () => {
@@ -383,7 +396,8 @@ engine.onEnded = () => {
 };
 
 playButton.addEventListener('click', () => void togglePlayback());
-downloadButton.addEventListener('click', downloadSpectrogramPng);
+screenshotButton.addEventListener('click', downloadSpectrogramPng);
+selectionDownloadButton.addEventListener('click', () => void downloadSelectionWav());
 spectrumButton.addEventListener('click', () => {
   spectrumAnalyzerOpen = !spectrumAnalyzerOpen;
   applySpectrumAnalyzerLayout();
@@ -648,17 +662,32 @@ window.addEventListener('pagehide', persistSettings);
 
 async function togglePlayback(): Promise<void> {
   if (!engine.hasAudio) return;
-  const restartingFromEnd = !engine.isPlaying && (
-    engine.hasEnded ||
-    (audioDuration > 0 && engine.currentTime >= audioDuration - 0.001)
-  );
-  if (restartingFromEnd) {
-    engine.seek(0);
-    visualizer.moveViewportToStart();
-    updateTimecode(0);
-  }
   try {
-    await engine.toggle();
+    if (engine.isPlaying) {
+      engine.pause();
+      updateTransportState();
+      return;
+    }
+
+    if (selection) {
+      // A selection is its own transport range: every fresh play starts at
+      // the in point, then AudioEngine finishes normally at the out point.
+      const selectionRange = [selection.start, selection.end] as const;
+      const start = engine.seek(selection.start, selectionRange);
+      visualizer.showPlayhead(start);
+      updateTimecode(start);
+      await engine.play(selectionRange);
+    } else {
+      const restartingFromEnd = engine.hasEnded || (
+        audioDuration > 0 && engine.currentTime >= audioDuration - 0.001
+      );
+      if (restartingFromEnd) {
+        engine.seek(0);
+        visualizer.moveViewportToStart();
+        updateTimecode(0);
+      }
+      await engine.play(null);
+    }
     updateTransportState();
   } catch (error) {
     updateTransportState();
@@ -723,6 +752,7 @@ async function loadFile(file: File): Promise<void> {
     if (loadId !== fileLoadId) return;
 
     if (header) {
+      sourceWavHeader = header;
       await loadProgressiveWav(file, header, loadId);
     } else if (mp4SessionPromise && mp4ModulePromise) {
       const result = await mp4SessionPromise;
@@ -754,6 +784,8 @@ async function loadFile(file: File): Promise<void> {
     monoSamples = null;
     activeMp4Session?.dispose();
     activeMp4Session = null;
+    sourceFile = null;
+    sourceWavHeader = null;
     engine.clear();
     analysisWorker?.terminate();
     analysisWorker = null;
@@ -772,6 +804,10 @@ async function loadFile(file: File): Promise<void> {
 function prepareFileLoad(file: File): void {
   isReadingFile = true;
   hasLoadedAudio = true;
+  sourceFile = file;
+  sourceWavHeader = null;
+  selection = null;
+  updateSelectionDownloadState();
   availableAudioSamples = 0;
   audioDuration = 0;
   monoSamples = null;
@@ -1518,7 +1554,13 @@ function applySpectrumAnalyzerLayout(): void {
 }
 
 function updateDownloadState(): void {
-  downloadButton.disabled = latestSpectrogram === null;
+  screenshotButton.disabled = latestSpectrogram === null;
+}
+
+function updateSelectionDownloadState(): void {
+  const hasSelection = Boolean(selection && selection.end > selection.start + 1e-9);
+  selectionDownloadButton.hidden = !hasSelection;
+  selectionDownloadButton.disabled = !hasSelection;
 }
 
 function downloadSpectrogramPng(): void {
@@ -1534,16 +1576,52 @@ function downloadSpectrogramPng(): void {
     }
     const sourceName = fileNameElement.textContent?.trim() || 'spectrogram';
     const baseName = sourceName.replace(/\.[^.]+$/, '') || 'spectrogram';
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${baseName}-spectrogram.png`;
-    link.hidden = true;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    triggerDownload(blob, `${baseName}-spectrogram.png`);
   }, 'image/png');
+}
+
+async function downloadSelectionWav(): Promise<void> {
+  const currentSelection = selection;
+  if (!currentSelection || currentSelection.end <= currentSelection.start) return;
+
+  selectionDownloadButton.disabled = true;
+  try {
+    let wav: Blob;
+    if (sourceFile && sourceWavHeader) {
+      // This preserves source PCM/float samples byte-for-byte, including the
+      // original channel count, sample rate, and bit depth.
+      wav = await trimWavFile(
+        sourceFile,
+        sourceWavHeader,
+        currentSelection.start,
+        currentSelection.end,
+      );
+    } else if (engine.buffer) {
+      wav = trimAudioBufferToFloatWav(engine.buffer, currentSelection.start, currentSelection.end);
+    } else {
+      throw new Error('The selected audio is not decoded enough to export yet.');
+    }
+
+    const sourceName = sourceFile?.name || fileNameElement.textContent?.trim() || 'audio';
+    const baseName = sourceName.replace(/\.[^.]+$/, '') || 'audio';
+    triggerDownload(wav, `${baseName}-trim.wav`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : 'Could not create the selected WAV file.');
+  } finally {
+    updateSelectionDownloadState();
+  }
+}
+
+function triggerDownload(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  link.hidden = true;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function initialize(): void {
@@ -1564,6 +1642,7 @@ function initialize(): void {
   setFrequencyScale(frequencyScaleBlend);
   applySpectrumAnalyzerLayout();
   updateDownloadState();
+  updateSelectionDownloadState();
   updateDropOverlayState();
   requestAnimationFrame(applyPanelRatio);
   requestAnimationFrame(animationLoop);
