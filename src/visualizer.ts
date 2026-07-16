@@ -323,6 +323,7 @@ export class AudioVisualizer {
   private duration = 0;
   private viewStart = 0;
   private viewDuration = 1;
+  private waveformAmplitudeGainDb = 0;
   private scaleBlend = 1;
   private spectralRangeDb = 120;
   private renderFrame = 0;
@@ -665,6 +666,26 @@ export class AudioVisualizer {
 
   get zoomRatio(): number {
     return this.duration ? this.duration / this.viewDuration : 1;
+  }
+
+  get waveformAmplitudeDb(): number {
+    return this.waveformAmplitudeGainDb;
+  }
+
+  get waveformAmplitudeScale(): number {
+    return 10 ** (this.waveformAmplitudeGainDb / 20);
+  }
+
+  setWaveformAmplitudeDb(value: number): void {
+    if (!Number.isFinite(value)) return;
+    const next = Math.max(0, value);
+    if (Math.abs(next - this.waveformAmplitudeGainDb) < 1e-9) return;
+    this.waveformAmplitudeGainDb = next;
+    this.requestRender(RENDER_WAVEFORM);
+  }
+
+  resetWaveformAmplitude(): void {
+    this.setWaveformAmplitudeDb(0);
   }
 
   get analysisColumnCount(): number {
@@ -1089,12 +1110,17 @@ export class AudioVisualizer {
       physicalHeight,
     );
 
-    const dbTicks = selectWaveformDbTicks(waveHalfHeight);
-    const dbRules: Array<{ y: number; db: number; sign: number }> = [];
-    for (const db of dbTicks) {
-      const amplitude = 10 ** (db / 20);
+    const displayDbTicks = selectWaveformDbTicks(waveHalfHeight);
+    const dbRules: Array<{ y: number; db: number; sign: number; maximum: boolean }> = [];
+    for (const displayDb of displayDbTicks) {
+      const amplitude = 10 ** (displayDb / 20);
       for (const sign of [-1, 1]) {
-        dbRules.push({ y: mid + sign * amplitude * waveHalfHeight, db, sign });
+        dbRules.push({
+          y: mid + sign * amplitude * waveHalfHeight,
+          db: displayDb - this.waveformAmplitudeGainDb,
+          sign,
+          maximum: displayDb === 0,
+        });
       }
     }
 
@@ -1105,7 +1131,7 @@ export class AudioVisualizer {
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.imageSmoothingEnabled = false;
     for (const rule of dbRules) {
-      context.fillStyle = rule.db === 0
+      context.fillStyle = rule.maximum
         ? (light ? 'rgba(56, 67, 75, .26)' : 'rgba(158, 181, 196, .14)')
         : (light ? 'rgba(56, 67, 75, .13)' : 'rgba(158, 181, 196, .08)');
       drawDeviceHorizontalLine(
@@ -1136,13 +1162,13 @@ export class AudioVisualizer {
     context.textAlign = 'left';
     context.textBaseline = 'middle';
     for (const rule of dbRules) {
-      if (rule.sign < 0 || rule.db !== 0) {
-        context.fillStyle = rule.db === 0
+      if (rule.sign < 0 || !rule.maximum) {
+        context.fillStyle = rule.maximum
           ? (light ? '#56616a' : '#9aa6b2')
           : (light ? '#76818a' : '#687581');
         const labelY = Math.max(7, Math.min(height - 7, rule.y));
         context.fillText(
-          rule.db === 0 ? '0 dB' : `${rule.db}`,
+          formatWaveformDb(rule.db, rule.maximum),
           plotRight + AXIS_LABEL_INSET,
           labelY,
         );
@@ -1154,7 +1180,7 @@ export class AudioVisualizer {
     if (this.peaks && this.samples) {
       const physicalWidth = Math.max(1, Math.round(plotWidth * scaleX));
       const physicalMid = physicalHeight / 2;
-      const physicalHalfHeight = physicalHeight / 2;
+      const physicalHalfHeight = (physicalHeight / 2) * this.waveformAmplitudeScale;
       const sampleStart = this.viewStart * this.sampleRate;
       const samplesPerPhysicalPixel = (this.viewDuration * this.sampleRate) / physicalWidth;
       context.save();
@@ -2450,6 +2476,12 @@ function verticalBoundsIntersect(
 function fontPixelSize(font: string): number {
   const match = /([0-9.]+)px/.exec(font);
   return match ? Number(match[1]) : 10;
+}
+
+function formatWaveformDb(value: number, includeUnit: boolean): string {
+  const rounded = Math.abs(value) < 0.05 ? 0 : Math.round(value * 10) / 10;
+  const label = Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1);
+  return includeUnit ? `${label} dB` : label;
 }
 
 function selectWaveformDbTicks(halfHeight: number): number[] {

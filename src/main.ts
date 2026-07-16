@@ -239,6 +239,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <section class="editor-panel wave-panel" aria-label="Waveform view">
           <canvas id="wave-canvas"></canvas>
           <canvas id="wave-overlay-canvas" class="canvas-overlay" aria-hidden="true"></canvas>
+          <div class="waveform-axis-control" id="waveform-axis-control" role="slider" aria-label="Waveform amplitude magnification" aria-valuemin="1" aria-valuenow="1" aria-valuetext="1×" tabindex="0" title="Drag vertically to scale waveform amplitude; double-click to reset" data-timeline-exempt></div>
         </section>
         <div class="panel-divider" id="panel-divider" role="separator" aria-label="Resize waveform and spectrogram panels" aria-orientation="horizontal" aria-valuemin="10" aria-valuemax="75" tabindex="0"><span></span></div>
         <section class="editor-panel spectral-panel" aria-label="Spectrogram view">
@@ -329,6 +330,7 @@ const channelStatus = get<HTMLElement>('channel-status');
 const toast = get<HTMLElement>('toast');
 const toastMessage = get<HTMLElement>('toast-message');
 const panelDivider = get<HTMLElement>('panel-divider');
+const waveformAxisControl = get<HTMLElement>('waveform-axis-control');
 const frequencyAxisControl = get<HTMLElement>('frequency-axis-control');
 const spectrumHoverFrequencyLabel = get<HTMLElement>('spectrum-hover-frequency');
 const spectrumHoverFrequencyMask = get<HTMLElement>('spectrum-hover-frequency-mask');
@@ -391,6 +393,7 @@ let wavePanelRatio = clampNumber(persistedSettings?.paneRatio, 0.25, 0.1, 0.75);
 let dividerPointer: number | null = null;
 let frequencyScaleBlend = clampNumber(persistedSettings?.frequencyScale, 1, 0, 1);
 let frequencyScaleDrag: { pointerId: number; anchorFrequency: number } | null = null;
+let waveformScaleDrag: { pointerId: number; startY: number; startDb: number } | null = null;
 let spectrumAnalyzerOpen = typeof persistedSettings?.spectrumAnalyzerOpen === 'boolean'
   ? persistedSettings.spectrumAnalyzerOpen
   : true;
@@ -544,6 +547,57 @@ themeToggle.addEventListener('change', () => {
   themeMode = themeToggle.checked ? 'light' : 'dark';
   applyTheme();
   scheduleSettingsSave();
+});
+
+waveformAxisControl.addEventListener('pointerdown', (event) => {
+  if (event.button > 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  waveformScaleDrag = {
+    pointerId: event.pointerId,
+    startY: event.clientY,
+    startDb: visualizer.waveformAmplitudeDb,
+  };
+  waveformAxisControl.setPointerCapture(event.pointerId);
+  waveformAxisControl.classList.add('is-dragging');
+});
+
+waveformAxisControl.addEventListener('pointermove', (event) => {
+  if (waveformScaleDrag?.pointerId !== event.pointerId) return;
+  event.preventDefault();
+  event.stopPropagation();
+  visualizer.setWaveformAmplitudeDb(
+    waveformScaleDrag.startDb + (waveformScaleDrag.startY - event.clientY) * 0.1,
+  );
+  updateWaveformAxisControl();
+});
+
+const finishWaveformScaleDrag = (event: PointerEvent) => {
+  if (waveformScaleDrag?.pointerId !== event.pointerId) return;
+  event.stopPropagation();
+  waveformScaleDrag = null;
+  waveformAxisControl.classList.remove('is-dragging');
+};
+
+waveformAxisControl.addEventListener('pointerup', finishWaveformScaleDrag);
+waveformAxisControl.addEventListener('pointercancel', finishWaveformScaleDrag);
+waveformAxisControl.addEventListener('dblclick', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  visualizer.resetWaveformAmplitude();
+  updateWaveformAxisControl();
+});
+waveformAxisControl.addEventListener('keydown', (event) => {
+  const direction = event.key === 'ArrowUp' || event.key === 'ArrowRight'
+    ? 1
+    : event.key === 'ArrowDown' || event.key === 'ArrowLeft'
+      ? -1
+      : 0;
+  if (!direction && event.key !== 'Home') return;
+  event.preventDefault();
+  if (event.key === 'Home') visualizer.resetWaveformAmplitude();
+  else visualizer.setWaveformAmplitudeDb(visualizer.waveformAmplitudeDb + direction);
+  updateWaveformAxisControl();
 });
 
 frequencyAxisControl.addEventListener('pointerdown', (event) => {
@@ -1383,6 +1437,21 @@ function setFrequencyScale(value: number): void {
   scheduleSettingsSave();
 }
 
+function updateWaveformAxisControl(): void {
+  const scale = visualizer.waveformAmplitudeScale;
+  const label = formatWaveformAmplitudeScale(scale);
+  waveformAxisControl.setAttribute('aria-valuenow', Number.isFinite(scale) ? scale.toString() : '1e308');
+  waveformAxisControl.setAttribute('aria-valuetext', `${label} waveform amplitude`);
+}
+
+function formatWaveformAmplitudeScale(scale: number): string {
+  if (!Number.isFinite(scale)) return 'Extremely magnified';
+  if (scale < 10) return `${Number(scale.toFixed(2))}×`;
+  if (scale < 100) return `${Number(scale.toFixed(1))}×`;
+  if (scale < 10_000) return `${Math.round(scale).toLocaleString()}×`;
+  return `${scale.toExponential(1)}×`;
+}
+
 function applyTheme(): void {
   document.documentElement.dataset.theme = themeMode;
   themeToggle.checked = themeMode === 'light';
@@ -1823,6 +1892,7 @@ function initialize(): void {
   updateDownloadState();
   updateSelectionDownloadState();
   updateDropOverlayState();
+  updateWaveformAxisControl();
   requestAnimationFrame(applyPanelRatio);
   updateTimecode(0);
 }

@@ -633,10 +633,10 @@ select:focus-visible {
   background: #000;
 }
 
+.waveform-axis-control,
 .frequency-axis-control {
   position: absolute;
   z-index: 6;
-  top: 25px;
   bottom: 0;
   right: 0;
   width: 38px;
@@ -645,12 +645,23 @@ select:focus-visible {
   transition: background 120ms ease, box-shadow 120ms ease;
 }
 
+.waveform-axis-control {
+  top: 0;
+}
+
+.frequency-axis-control {
+  top: 25px;
+}
+
+.waveform-axis-control:hover,
+.waveform-axis-control.is-dragging,
 .frequency-axis-control:hover,
 .frequency-axis-control.is-dragging {
   background: rgba(94, 239, 181, 0.025);
   box-shadow: inset -1px 0 rgba(94, 239, 181, 0.28);
 }
 
+.waveform-axis-control:focus-visible,
 .frequency-axis-control:focus-visible {
   outline: 1px solid rgba(94, 239, 181, 0.55);
   outline-offset: -2px;
