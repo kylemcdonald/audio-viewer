@@ -262,6 +262,27 @@ function resizeCanvasSurface(surface: CanvasSurface, width: number, height: numb
   return changed;
 }
 
+function setCanvasSurfaceSize(surface: CanvasSurface, width: number, height: number): boolean {
+  const nextWidth = Math.max(1, width);
+  const nextHeight = Math.max(1, height);
+  const dpr = window.devicePixelRatio || 1;
+  const pixelWidth = Math.max(1, Math.round(nextWidth * dpr));
+  const pixelHeight = Math.max(1, Math.round(nextHeight * dpr));
+  const changed =
+    surface.width !== nextWidth ||
+    surface.height !== nextHeight ||
+    surface.pixelWidth !== pixelWidth ||
+    surface.pixelHeight !== pixelHeight;
+
+  // Keep the existing backing store alive until its next render. Updating a
+  // canvas's width or height clears it immediately, which otherwise exposes a
+  // black frame between ResizeObserver and requestAnimationFrame while a pane
+  // divider is being dragged.
+  surface.width = nextWidth;
+  surface.height = nextHeight;
+  return changed;
+}
+
 function prepareCanvasSurface(surface: CanvasSurface): CanvasSurface {
   resizeCanvasSurface(surface, surface.width, surface.height);
   const { context, scaleX, scaleY } = surface;
@@ -366,20 +387,20 @@ export class AudioVisualizer {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
         if (entry.target === this.waveCanvas) {
-          const baseChanged = resizeCanvasSurface(this.waveSurface, width, height);
-          const overlayChanged = resizeCanvasSurface(this.waveOverlaySurface, width, height);
+          const baseChanged = setCanvasSurfaceSize(this.waveSurface, width, height);
+          const overlayChanged = setCanvasSurfaceSize(this.waveOverlaySurface, width, height);
           if (baseChanged || overlayChanged) {
             renderMask |= RENDER_WAVEFORM | RENDER_WAVEFORM_OVERLAY;
             this.showPlayhead(this.cursorTime);
           }
         } else if (entry.target === this.spectralCanvas) {
-          const baseChanged = resizeCanvasSurface(this.spectralSurface, width, height);
-          const overlayChanged = resizeCanvasSurface(this.spectralOverlaySurface, width, height);
+          const baseChanged = setCanvasSurfaceSize(this.spectralSurface, width, height);
+          const overlayChanged = setCanvasSurfaceSize(this.spectralOverlaySurface, width, height);
           if (baseChanged || overlayChanged) {
             renderMask |= RENDER_SPECTROGRAM | RENDER_SPECTROGRAM_OVERLAY;
           }
         } else if (entry.target === this.spectrumCanvas) {
-          analyzerChanged = resizeCanvasSurface(this.spectrumSurface, width, height);
+          analyzerChanged = setCanvasSurfaceSize(this.spectrumSurface, width, height);
         }
       }
       if (renderMask) this.requestRender(renderMask);
@@ -999,11 +1020,11 @@ export class AudioVisualizer {
 
   private refreshDevicePixelRatio(): void {
     let renderMask = 0;
-    if (resizeCanvasSurface(this.waveSurface, this.waveSurface.width, this.waveSurface.height)) {
+    if (setCanvasSurfaceSize(this.waveSurface, this.waveSurface.width, this.waveSurface.height)) {
       renderMask |= RENDER_WAVEFORM;
     }
     if (
-      resizeCanvasSurface(
+      setCanvasSurfaceSize(
         this.waveOverlaySurface,
         this.waveOverlaySurface.width,
         this.waveOverlaySurface.height,
@@ -1012,12 +1033,12 @@ export class AudioVisualizer {
       renderMask |= RENDER_WAVEFORM_OVERLAY;
     }
     if (
-      resizeCanvasSurface(this.spectralSurface, this.spectralSurface.width, this.spectralSurface.height)
+      setCanvasSurfaceSize(this.spectralSurface, this.spectralSurface.width, this.spectralSurface.height)
     ) {
       renderMask |= RENDER_SPECTROGRAM;
     }
     if (
-      resizeCanvasSurface(
+      setCanvasSurfaceSize(
         this.spectralOverlaySurface,
         this.spectralOverlaySurface.width,
         this.spectralOverlaySurface.height,
@@ -1025,7 +1046,7 @@ export class AudioVisualizer {
     ) {
       renderMask |= RENDER_SPECTROGRAM_OVERLAY;
     }
-    if (resizeCanvasSurface(this.spectrumSurface, this.spectrumSurface.width, this.spectrumSurface.height)) {
+    if (setCanvasSurfaceSize(this.spectrumSurface, this.spectrumSurface.width, this.spectrumSurface.height)) {
       this.requestAnalyzerRender();
     }
     if (renderMask) {
@@ -1188,38 +1209,97 @@ export class AudioVisualizer {
     const raster = data ? this.getSpectrogramRaster(data, physicalPlotHeight) : null;
     if (!data || !raster) return;
 
-    const secondsPerColumn = Math.max(1e-9, data.secondsPerColumn);
-    const coverageStart = data.startTime - secondsPerColumn / 2;
-    const coverageEnd = coverageStart + data.columns * secondsPerColumn;
-    const viewEnd = this.viewStart + this.viewDuration;
-    const availableEnd = isStreaming
-      ? this.availableSamples / this.sampleRate
-      : Number.POSITIVE_INFINITY;
-    const drawStart = Math.max(this.viewStart, coverageStart);
-    const drawEnd = Math.min(viewEnd, coverageEnd, availableEnd);
-    if (drawEnd <= drawStart) return;
-
-    const sourceLeft = Math.max(0, Math.min(data.columns, (drawStart - coverageStart) / secondsPerColumn));
-    const sourceRight = Math.max(0, Math.min(data.columns, (drawEnd - coverageStart) / secondsPerColumn));
-    const sourceWidth = sourceRight - sourceLeft;
-    if (sourceWidth <= 0) return;
-
     const physicalPlotWidth = Math.max(1, Math.round(plotWidth * scaleX));
-    const destinationLeft = ((drawStart - this.viewStart) / this.viewDuration) * physicalPlotWidth;
-    const destinationRight = ((drawEnd - this.viewStart) / this.viewDuration) * physicalPlotWidth;
+    const secondsPerColumn = Math.max(1e-9, data.secondsPerColumn);
+    const sourceColumnsPerPixel = this.viewDuration / (physicalPlotWidth * secondsPerColumn);
+    const sourceColumnAtLeft = (this.viewStart - data.startTime) / secondsPerColumn;
+    let drawWidth = physicalPlotWidth;
+    if (isStreaming) {
+      const availableTime = this.availableSamples / this.sampleRate;
+      const availablePixel = Math.floor(
+        ((availableTime - this.viewStart) / this.viewDuration) * physicalPlotWidth,
+      );
+      drawWidth = Math.max(0, Math.min(physicalPlotWidth, availablePixel + 1));
+    }
+    if (drawWidth <= 0) return;
+
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.imageSmoothingEnabled = false;
-    context.drawImage(
-      raster.canvas,
-      sourceLeft,
-      0,
-      sourceWidth,
-      raster.height,
-      destinationLeft,
-      Math.round(SPECTRAL_RULER * scaleY),
-      destinationRight - destinationLeft,
-      physicalPlotHeight,
-    );
+    const destinationTop = Math.round(SPECTRAL_RULER * scaleY);
+
+    if (data.columns === 1) {
+      context.drawImage(
+        raster.canvas,
+        1,
+        0,
+        1,
+        raster.height,
+        0,
+        destinationTop,
+        drawWidth,
+        physicalPlotHeight,
+      );
+      return;
+    }
+
+    const boundaryEpsilon = 1e-9;
+    const firstInteriorPixel = Math.max(0, Math.min(
+      drawWidth,
+      Math.ceil((0.5 - sourceColumnAtLeft) / sourceColumnsPerPixel - boundaryEpsilon),
+    ));
+    const lastInteriorPixel = Math.max(firstInteriorPixel, Math.min(
+      drawWidth,
+      Math.ceil(
+        (data.columns - 1.5 - sourceColumnAtLeft) / sourceColumnsPerPixel - boundaryEpsilon,
+      ),
+    ));
+
+    if (firstInteriorPixel > 0) {
+      context.drawImage(
+        raster.canvas,
+        1,
+        0,
+        1,
+        raster.height,
+        0,
+        destinationTop,
+        firstInteriorPixel,
+        physicalPlotHeight,
+      );
+    }
+
+    if (lastInteriorPixel > firstInteriorPixel) {
+      const sourceLeft =
+        sourceColumnAtLeft +
+        1.5 -
+        sourceColumnsPerPixel / 2 +
+        firstInteriorPixel * sourceColumnsPerPixel;
+      context.drawImage(
+        raster.canvas,
+        sourceLeft,
+        0,
+        (lastInteriorPixel - firstInteriorPixel) * sourceColumnsPerPixel,
+        raster.height,
+        firstInteriorPixel,
+        destinationTop,
+        lastInteriorPixel - firstInteriorPixel,
+        physicalPlotHeight,
+      );
+    }
+
+    if (lastInteriorPixel < drawWidth) {
+      context.drawImage(
+        raster.canvas,
+        data.columns,
+        0,
+        1,
+        raster.height,
+        lastInteriorPixel,
+        destinationTop,
+        drawWidth - lastInteriorPixel,
+        physicalPlotHeight,
+      );
+    }
   }
 
   private drawSpectrogramOverlay(
@@ -1282,9 +1362,12 @@ export class AudioVisualizer {
     const canvas = cached?.canvas ?? document.createElement('canvas');
     const context = cached?.context ?? canvas.getContext('2d', { alpha: false });
     if (!context) return null;
-    canvas.width = data.columns;
+    // Duplicate the first and last time columns so native nearest-neighbor
+    // scaling can preserve the waveform's left-edge pixel/time convention at
+    // both ends without exposing transparent source pixels.
+    canvas.width = data.columns + 2;
     canvas.height = height;
-    const image = context.createImageData(data.columns, height);
+    const image = context.createImageData(data.columns + 2, height);
     const packed = new Uint32Array(image.data.buffer);
     const maxFrequency = data.sampleRate / 2;
     const minFrequency = this.minimumFrequency;
@@ -1305,15 +1388,17 @@ export class AudioVisualizer {
         row = Math.round(normalizedRow * (data.rows - 1));
       }
       row = Math.min(data.rows - 1, Math.max(0, row));
-      const destinationOffset = y * data.columns;
+      const destinationOffset = y * (data.columns + 2);
       for (let column = 0; column < data.columns; column += 1) {
         const db = data.values[column * data.rows + row] / 10;
         const normalized = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
         const paletteIndex = Math.round(normalized * 255);
-        packed[destinationOffset + column] = this.colorLut[
+        packed[destinationOffset + column + 1] = this.colorLut[
           this.isLightTheme ? 255 - paletteIndex : paletteIndex
         ];
       }
+      packed[destinationOffset] = packed[destinationOffset + 1];
+      packed[destinationOffset + data.columns + 1] = packed[destinationOffset + data.columns];
     }
     context.putImageData(image, 0, 0);
 
