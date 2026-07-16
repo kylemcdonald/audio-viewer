@@ -6,7 +6,15 @@ import type { AnalysisMode, SpectrogramData } from './types';
 const AXIS_WIDTH = 38;
 const AXIS_LABEL_INSET = 6;
 const SPECTRAL_RULER = 25;
-const UNLOADED_SPECTROGRAM_COLOR = 0xff000000;
+const RENDER_WAVEFORM = 1 << 0;
+const RENDER_WAVEFORM_OVERLAY = 1 << 1;
+const RENDER_SPECTROGRAM = 1 << 2;
+const RENDER_SPECTROGRAM_OVERLAY = 1 << 3;
+const RENDER_TIMELINE =
+  RENDER_WAVEFORM |
+  RENDER_WAVEFORM_OVERLAY |
+  RENDER_SPECTROGRAM |
+  RENDER_SPECTROGRAM_OVERLAY;
 
 export type PlaybackFollowMode = 'center' | 'right' | 'page';
 export type SpectrumDrawStyle = 'outline' | 'filled' | 'bars' | 'lines' | 'points';
@@ -39,6 +47,7 @@ type RulerLock = {
 };
 
 type CanvasSurface = {
+  canvas: HTMLCanvasElement;
   context: CanvasRenderingContext2D;
   width: number;
   height: number;
@@ -46,6 +55,17 @@ type CanvasSurface = {
   pixelHeight: number;
   scaleX: number;
   scaleY: number;
+};
+
+type SpectrogramRaster = {
+  canvas: HTMLCanvasElement;
+  context: CanvasRenderingContext2D;
+  data: SpectrogramData;
+  colorLut: Uint32Array;
+  height: number;
+  scaleBlend: number;
+  spectralRangeDb: number;
+  theme: ThemeMode;
 };
 
 type SpectrumHover = {
@@ -95,7 +115,9 @@ type SelectionDrag = {
 export type VisualizerOptions = {
   editor: HTMLElement;
   waveCanvas: HTMLCanvasElement;
+  waveOverlayCanvas: HTMLCanvasElement;
   spectralCanvas: HTMLCanvasElement;
+  spectralOverlayCanvas: HTMLCanvasElement;
   spectrumCanvas: HTMLCanvasElement;
   spectrumHoverFrequencyLabel: HTMLElement;
   spectrumHoverFrequencyMask: HTMLElement;
@@ -193,11 +215,74 @@ class PeakPyramid {
   }
 }
 
+function createCanvasSurface(
+  canvas: HTMLCanvasElement,
+  alpha: boolean,
+  dimensions?: { width: number; height: number },
+): CanvasSurface {
+  const context = canvas.getContext('2d', { alpha });
+  if (!context) throw new Error('Failed to get 2D canvas context.');
+  const bounds = dimensions ?? canvas.getBoundingClientRect();
+  const surface: CanvasSurface = {
+    canvas,
+    context,
+    width: 1,
+    height: 1,
+    pixelWidth: 1,
+    pixelHeight: 1,
+    scaleX: 1,
+    scaleY: 1,
+  };
+  resizeCanvasSurface(surface, bounds.width, bounds.height);
+  return surface;
+}
+
+function resizeCanvasSurface(surface: CanvasSurface, width: number, height: number): boolean {
+  const nextWidth = Math.max(1, width);
+  const nextHeight = Math.max(1, height);
+  const dpr = window.devicePixelRatio || 1;
+  const pixelWidth = Math.max(1, Math.round(nextWidth * dpr));
+  const pixelHeight = Math.max(1, Math.round(nextHeight * dpr));
+  const changed =
+    surface.width !== nextWidth ||
+    surface.height !== nextHeight ||
+    surface.pixelWidth !== pixelWidth ||
+    surface.pixelHeight !== pixelHeight;
+
+  if (surface.canvas.width !== pixelWidth || surface.canvas.height !== pixelHeight) {
+    surface.canvas.width = pixelWidth;
+    surface.canvas.height = pixelHeight;
+  }
+  surface.width = nextWidth;
+  surface.height = nextHeight;
+  surface.pixelWidth = pixelWidth;
+  surface.pixelHeight = pixelHeight;
+  surface.scaleX = pixelWidth / nextWidth;
+  surface.scaleY = pixelHeight / nextHeight;
+  return changed;
+}
+
+function prepareCanvasSurface(surface: CanvasSurface): CanvasSurface {
+  resizeCanvasSurface(surface, surface.width, surface.height);
+  const { context, scaleX, scaleY } = surface;
+  context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
+  context.imageSmoothingEnabled = false;
+  context.globalAlpha = 1;
+  context.globalCompositeOperation = 'source-over';
+  context.filter = 'none';
+  return surface;
+}
+
 export class AudioVisualizer {
   private readonly editor: HTMLElement;
   private readonly waveCanvas: HTMLCanvasElement;
   private readonly spectralCanvas: HTMLCanvasElement;
   private readonly spectrumCanvas: HTMLCanvasElement;
+  private readonly waveSurface: CanvasSurface;
+  private readonly waveOverlaySurface: CanvasSurface;
+  private readonly spectralSurface: CanvasSurface;
+  private readonly spectralOverlaySurface: CanvasSurface;
+  private readonly spectrumSurface: CanvasSurface;
   private readonly spectrumHoverFrequencyLabel: HTMLElement;
   private readonly spectrumHoverFrequencyMask: HTMLElement;
   private readonly playhead: HTMLElement;
@@ -206,6 +291,7 @@ export class AudioVisualizer {
   private readonly onViewChange: (start: number, duration: number) => void;
   private readonly onSelectionChange?: (selection: SelectionRange | null) => void;
   private readonly pointers = new Map<number, PointerPoint>();
+  private readonly eventAbortController = new AbortController();
   private colorLut = createPaletteLut('viridis');
   private resizeObserver: ResizeObserver;
   private samples: Float32Array | null = null;
@@ -219,7 +305,10 @@ export class AudioVisualizer {
   private scaleBlend = 1;
   private spectralRangeDb = 120;
   private renderFrame = 0;
+  private renderMask = 0;
   private analyzerFrame = 0;
+  private spectrogramRaster: SpectrogramRaster | null = null;
+  private disposed = false;
   private cursorTime = 0;
   private spectrumAnalyzerOpen = false;
   private spectrumFftSize = 2048;
@@ -252,6 +341,11 @@ export class AudioVisualizer {
     this.waveCanvas = options.waveCanvas;
     this.spectralCanvas = options.spectralCanvas;
     this.spectrumCanvas = options.spectrumCanvas;
+    this.waveSurface = createCanvasSurface(this.waveCanvas, false);
+    this.waveOverlaySurface = createCanvasSurface(options.waveOverlayCanvas, true);
+    this.spectralSurface = createCanvasSurface(this.spectralCanvas, false);
+    this.spectralOverlaySurface = createCanvasSurface(options.spectralOverlayCanvas, true);
+    this.spectrumSurface = createCanvasSurface(this.spectrumCanvas, false);
     this.spectrumHoverFrequencyLabel = options.spectrumHoverFrequencyLabel;
     this.spectrumHoverFrequencyMask = options.spectrumHoverFrequencyMask;
     this.playhead = options.playhead;
@@ -266,17 +360,59 @@ export class AudioVisualizer {
     this.onViewChange = options.onViewChange;
     this.onSelectionChange = options.onSelectionChange;
 
-    this.resizeObserver = new ResizeObserver(() => {
-      this.requestRender();
-      this.requestAnalyzerRender();
+    this.resizeObserver = new ResizeObserver((entries) => {
+      let renderMask = 0;
+      let analyzerChanged = false;
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        if (entry.target === this.waveCanvas) {
+          const baseChanged = resizeCanvasSurface(this.waveSurface, width, height);
+          const overlayChanged = resizeCanvasSurface(this.waveOverlaySurface, width, height);
+          if (baseChanged || overlayChanged) {
+            renderMask |= RENDER_WAVEFORM | RENDER_WAVEFORM_OVERLAY;
+            this.showPlayhead(this.cursorTime);
+          }
+        } else if (entry.target === this.spectralCanvas) {
+          const baseChanged = resizeCanvasSurface(this.spectralSurface, width, height);
+          const overlayChanged = resizeCanvasSurface(this.spectralOverlaySurface, width, height);
+          if (baseChanged || overlayChanged) {
+            renderMask |= RENDER_SPECTROGRAM | RENDER_SPECTROGRAM_OVERLAY;
+          }
+        } else if (entry.target === this.spectrumCanvas) {
+          analyzerChanged = resizeCanvasSurface(this.spectrumSurface, width, height);
+        }
+      }
+      if (renderMask) this.requestRender(renderMask);
+      if (analyzerChanged) this.requestAnalyzerRender();
     });
     this.resizeObserver.observe(this.waveCanvas);
     this.resizeObserver.observe(this.spectralCanvas);
     this.resizeObserver.observe(this.spectrumCanvas);
     this.bindInteractions();
-    this.spectrumCanvas.addEventListener('pointermove', (event) => this.updateSpectrumHover(event));
-    this.spectrumCanvas.addEventListener('pointerleave', () => this.setSpectrumHover(null));
+    const signal = this.eventAbortController.signal;
+    this.spectrumCanvas.addEventListener(
+      'pointermove',
+      (event) => this.updateSpectrumHover(event),
+      { signal },
+    );
+    this.spectrumCanvas.addEventListener('pointerleave', () => this.setSpectrumHover(null), { signal });
+    window.addEventListener('resize', () => this.refreshDevicePixelRatio(), { signal });
     this.requestRender();
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.eventAbortController.abort();
+    this.resizeObserver.disconnect();
+    window.clearTimeout(this.touchSeekTimer);
+    if (this.renderFrame) cancelAnimationFrame(this.renderFrame);
+    if (this.analyzerFrame) cancelAnimationFrame(this.analyzerFrame);
+    this.renderFrame = 0;
+    this.renderMask = 0;
+    this.analyzerFrame = 0;
+    this.spectrogramRaster = null;
+    this.spectralCanvas.toBlob = this.nativeSpectralToBlob;
   }
 
   setAudio(samples: Float32Array, sampleRate: number, duration: number): void {
@@ -291,6 +427,7 @@ export class AudioVisualizer {
     this.viewDuration = Math.max(duration, 0.01);
     this.emitView();
     this.requestRender();
+    this.requestAnalyzerRender();
   }
 
   clearAudio(): void {
@@ -302,8 +439,10 @@ export class AudioVisualizer {
     this.viewStart = 0;
     this.viewDuration = 1;
     this.availableSamples = 0;
+    this.spectrogramRaster = null;
     this.hideSpectrumHoverFrequencyLabel();
     this.requestRender();
+    this.requestAnalyzerRender();
   }
 
   beginProgressiveAudio(samples: Float32Array, sampleRate: number, duration: number): void {
@@ -318,17 +457,20 @@ export class AudioVisualizer {
     this.viewDuration = Math.max(duration, 0.01);
     this.emitView();
     this.requestRender();
+    this.requestAnalyzerRender();
   }
 
   updateProgressiveAudio(start: number, end: number): void {
     this.peaks?.update(start, end);
     this.availableSamples = Math.max(this.availableSamples, Math.min(this.samples?.length ?? 0, end));
-    this.requestRender();
+    this.requestRender(RENDER_WAVEFORM | RENDER_SPECTROGRAM);
+    this.requestAnalyzerRender();
   }
 
   setSpectrogram(data: SpectrogramData | null): void {
     this.spectrogram = data;
-    this.requestRender();
+    if (!data) this.spectrogramRaster = null;
+    this.requestRender(RENDER_SPECTROGRAM);
     this.requestAnalyzerRender();
   }
 
@@ -342,23 +484,23 @@ export class AudioVisualizer {
     this.selectionRange = next;
     this.selectionDraft = null;
     this.onSelectionChange?.(next ? { ...next } : null);
-    this.requestRender();
+    this.requestRender(RENDER_WAVEFORM_OVERLAY | RENDER_SPECTROGRAM_OVERLAY);
   }
 
   setSpectralRange(value: number): void {
     this.spectralRangeDb = Math.max(60, Math.min(140, value));
-    this.requestRender();
+    this.requestRender(RENDER_SPECTROGRAM);
     this.requestAnalyzerRender();
   }
 
   setColorPalette(palette: PaletteName): void {
     this.colorLut = createPaletteLut(palette);
-    this.requestRender();
+    this.requestRender(RENDER_SPECTROGRAM);
   }
 
   setScaleBlend(value: number): void {
     this.scaleBlend = Math.max(0, Math.min(1, value));
-    this.requestRender();
+    this.requestRender(RENDER_SPECTROGRAM | RENDER_SPECTROGRAM_OVERLAY);
     this.requestAnalyzerRender();
   }
 
@@ -413,7 +555,7 @@ export class AudioVisualizer {
     this.playbackFollowMode = mode;
     this.rulerLock = null;
     this.showPlayhead(this.cursorTime);
-    this.requestRender();
+    this.requestRender(RENDER_WAVEFORM | RENDER_SPECTROGRAM_OVERLAY);
     this.requestAnalyzerRender();
   }
 
@@ -510,7 +652,7 @@ export class AudioVisualizer {
   }
 
   private get timelinePlotWidth(): number {
-    return Math.max(1, this.waveCanvas.getBoundingClientRect().width - AXIS_WIDTH);
+    return Math.max(1, this.waveSurface.width - AXIS_WIDTH);
   }
 
   private get minimumFrequency(): number {
@@ -530,18 +672,19 @@ export class AudioVisualizer {
   }
 
   private bindInteractions(): void {
-    this.editor.addEventListener('pointerdown', (event) => this.pointerDown(event));
-    this.editor.addEventListener('pointermove', (event) => this.pointerMove(event));
-    this.editor.addEventListener('pointerup', (event) => this.pointerUp(event));
-    this.editor.addEventListener('pointercancel', (event) => this.pointerUp(event));
+    const signal = this.eventAbortController.signal;
+    this.editor.addEventListener('pointerdown', (event) => this.pointerDown(event), { signal });
+    this.editor.addEventListener('pointermove', (event) => this.pointerMove(event), { signal });
+    this.editor.addEventListener('pointerup', (event) => this.pointerUp(event), { signal });
+    this.editor.addEventListener('pointercancel', (event) => this.pointerUp(event), { signal });
     this.waveCanvas.addEventListener('pointerleave', () => {
       if (!this.selectionDrag) this.setWaveformSelectionCursor(false);
-    });
-    this.editor.addEventListener('wheel', (event) => this.wheel(event), { passive: false });
+    }, { signal });
+    this.editor.addEventListener('wheel', (event) => this.wheel(event), { passive: false, signal });
     this.editor.addEventListener('dblclick', (event) => {
       if (!this.isTimelineEvent(event)) return;
       this.resetView();
-    });
+    }, { signal });
   }
 
   private pointerDown(event: PointerEvent): void {
@@ -662,7 +805,7 @@ export class AudioVisualizer {
       moved: false,
     };
     this.setWaveformSelectionCursor(false);
-    this.requestRender();
+    this.requestRender(RENDER_WAVEFORM_OVERLAY | RENDER_SPECTROGRAM_OVERLAY);
   }
 
   private updateSelectionDrag(x: number): void {
@@ -673,7 +816,7 @@ export class AudioVisualizer {
     const current = this.timeAtX(x);
     this.selectionDraft = selectionFromEndpoints(drag.anchor, current);
     this.setWaveformSelectionCursor(drag.kind === 'start' || drag.kind === 'end');
-    this.requestRender();
+    this.requestRender(RENDER_WAVEFORM_OVERLAY | RENDER_SPECTROGRAM_OVERLAY);
   }
 
   private commitSelectionDrag(): void {
@@ -697,7 +840,7 @@ export class AudioVisualizer {
     this.selectionDrag = null;
     this.selectionDraft = null;
     this.setWaveformSelectionCursor(false);
-    this.requestRender();
+    this.requestRender(RENDER_WAVEFORM_OVERLAY | RENDER_SPECTROGRAM_OVERLAY);
   }
 
   private isWaveformPlotEvent(event: PointerEvent): boolean {
@@ -831,52 +974,68 @@ export class AudioVisualizer {
     this.onViewChange(this.viewStart, this.viewDuration);
   }
 
-  private requestRender(): void {
+  private requestRender(mask = RENDER_TIMELINE): void {
+    if (this.disposed) return;
+    this.renderMask |= mask;
     if (this.renderFrame) return;
     this.renderFrame = requestAnimationFrame(() => {
       this.renderFrame = 0;
-      this.drawWaveform();
-      this.drawSpectrogram();
-      this.requestAnalyzerRender();
+      const nextMask = this.renderMask;
+      this.renderMask = 0;
+      if (nextMask & RENDER_WAVEFORM) this.drawWaveform();
+      if (nextMask & RENDER_WAVEFORM_OVERLAY) this.drawWaveformOverlay();
+      if (nextMask & RENDER_SPECTROGRAM) this.drawSpectrogram();
+      if (nextMask & RENDER_SPECTROGRAM_OVERLAY) this.drawSpectrogramOverlay();
     });
   }
 
   private requestAnalyzerRender(): void {
-    if (!this.spectrumAnalyzerOpen || this.analyzerFrame) return;
+    if (this.disposed || !this.spectrumAnalyzerOpen || this.analyzerFrame) return;
     this.analyzerFrame = requestAnimationFrame(() => {
       this.analyzerFrame = 0;
       this.drawSpectrumAnalyzer();
     });
   }
 
-  private prepareCanvas(
-    canvas: HTMLCanvasElement,
-    dimensions?: { width: number; height: number },
-  ): CanvasSurface {
-    const bounds = dimensions ?? canvas.getBoundingClientRect();
-    const width = Math.max(1, bounds.width);
-    const height = Math.max(1, bounds.height);
-    const dpr = window.devicePixelRatio || 1;
-    const pixelWidth = Math.max(1, Math.round(width * dpr));
-    const pixelHeight = Math.max(1, Math.round(height * dpr));
-    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
-      canvas.width = pixelWidth;
-      canvas.height = pixelHeight;
+  private refreshDevicePixelRatio(): void {
+    let renderMask = 0;
+    if (resizeCanvasSurface(this.waveSurface, this.waveSurface.width, this.waveSurface.height)) {
+      renderMask |= RENDER_WAVEFORM;
     }
-    const context = canvas.getContext('2d', { alpha: false })!;
-    const scaleX = pixelWidth / width;
-    const scaleY = pixelHeight / height;
-    context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
-    context.imageSmoothingEnabled = false;
-    context.globalAlpha = 1;
-    context.globalCompositeOperation = 'source-over';
-    context.filter = 'none';
-    return { context, width, height, pixelWidth, pixelHeight, scaleX, scaleY };
+    if (
+      resizeCanvasSurface(
+        this.waveOverlaySurface,
+        this.waveOverlaySurface.width,
+        this.waveOverlaySurface.height,
+      )
+    ) {
+      renderMask |= RENDER_WAVEFORM_OVERLAY;
+    }
+    if (
+      resizeCanvasSurface(this.spectralSurface, this.spectralSurface.width, this.spectralSurface.height)
+    ) {
+      renderMask |= RENDER_SPECTROGRAM;
+    }
+    if (
+      resizeCanvasSurface(
+        this.spectralOverlaySurface,
+        this.spectralOverlaySurface.width,
+        this.spectralOverlaySurface.height,
+      )
+    ) {
+      renderMask |= RENDER_SPECTROGRAM_OVERLAY;
+    }
+    if (resizeCanvasSurface(this.spectrumSurface, this.spectrumSurface.width, this.spectrumSurface.height)) {
+      this.requestAnalyzerRender();
+    }
+    if (renderMask) {
+      this.showPlayhead(this.cursorTime);
+      this.requestRender(renderMask);
+    }
   }
 
-  private drawWaveform(): void {
-    const canvas = this.waveCanvas;
-    const surface = this.prepareCanvas(canvas);
+  private drawWaveform(surface = this.waveSurface): void {
+    prepareCanvasSurface(surface);
     const {
       context,
       width,
@@ -982,6 +1141,7 @@ export class AudioVisualizer {
       context.imageSmoothingEnabled = false;
       context.globalAlpha = 1;
       context.fillStyle = this.signalColor;
+      context.beginPath();
       for (let pixel = 0; pixel < physicalWidth; pixel += 1) {
         const from = sampleStart + pixel * samplesPerPhysicalPixel;
         if (from >= this.availableSamples) continue;
@@ -991,104 +1151,93 @@ export class AudioVisualizer {
         );
         const top = Math.max(0, Math.min(physicalHeight - 1, Math.round(physicalMid - max * physicalHalfHeight)));
         const bottom = Math.max(top, Math.min(physicalHeight - 1, Math.round(physicalMid - min * physicalHalfHeight)));
-        context.fillRect(pixel, top, 1, Math.max(1, bottom - top + 1));
+        context.rect(pixel, top, 1, Math.max(1, bottom - top + 1));
       }
+      context.fill();
       context.restore();
     }
 
-    this.drawWaveformSelection(surface, plotRight);
-    this.drawWaveformBorder(surface, plotRight);
     context.fillStyle = light ? '#68747d' : '#74818d';
     context.font = '600 9px Inter, ui-sans-serif, system-ui, sans-serif';
     context.textAlign = 'left';
     context.fillText('L+R', 9, 14);
   }
 
+  private drawWaveformOverlay(surface = this.waveOverlaySurface): void {
+    prepareCanvasSurface(surface);
+    surface.context.clearRect(0, 0, surface.width, surface.height);
+    const plotRight = surface.width - AXIS_WIDTH;
+    this.drawWaveformSelection(surface, plotRight);
+    this.drawWaveformBorder(surface, plotRight);
+  }
+
   private drawSpectrogram(
-    canvas: HTMLCanvasElement = this.spectralCanvas,
-    includeSelectionTimeLabels = true,
-    dimensions?: { width: number; height: number },
+    surface = this.spectralSurface,
   ): void {
-    const surface = this.prepareCanvas(canvas, dimensions);
-    const { context, width, height, pixelWidth, pixelHeight, scaleX, scaleY } = surface;
+    prepareCanvasSurface(surface);
+    const { context, width, height, scaleX, scaleY } = surface;
     const plotRight = width - AXIS_WIDTH;
-    const plotBottom = height;
     const plotWidth = Math.max(1, plotRight);
-    const plotHeight = Math.max(1, plotBottom - SPECTRAL_RULER);
+    const plotHeight = Math.max(1, height - SPECTRAL_RULER);
     const isStreaming = Boolean(this.samples && this.availableSamples < this.samples.length);
     context.fillStyle = isStreaming ? '#000' : (this.isLightTheme ? '#fff' : '#000');
     context.fillRect(0, 0, width, height);
 
-    if (this.spectrogram) {
-      const pixelWidth = Math.max(1, Math.round(plotWidth * scaleX));
-      const pixelHeight = Math.max(1, Math.round(plotHeight * scaleY));
-      const image = context.createImageData(pixelWidth, pixelHeight);
-      const packed = new Uint32Array(image.data.buffer);
-      const { columns, rows, values, startTime, secondsPerColumn } = this.spectrogram;
-      const maxFrequency = this.sampleRate / 2;
-      const minFrequency = this.minimumFrequency;
-      const minNormalized = minFrequency / maxFrequency;
-      const rowMap = new Int32Array(pixelHeight);
-      const columnMap = new Int32Array(pixelWidth);
-      const availableTime = this.availableSamples / this.sampleRate;
-      const isCqt = this.spectrogram.mode === 'cqt';
-      const cqtFmin = this.spectrogram.cqtFmin ?? 32.703;
-      const cqtBinsPerOctave = this.spectrogram.cqtBinsPerOctave ?? 24;
+    const data = this.spectrogram;
+    const physicalPlotHeight = Math.max(1, Math.round(plotHeight * scaleY));
+    const raster = data ? this.getSpectrogramRaster(data, physicalPlotHeight) : null;
+    if (!data || !raster) return;
 
-      for (let y = 0; y < pixelHeight; y += 1) {
-        const scaled = 1 - y / Math.max(1, pixelHeight - 1);
-        const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
-        if (isCqt) {
-          // CQT rows are log-spaced bands: row = B * log2(f / fmin).
-          // Clamp to the nearest band at both edges: pixels below the
-          // lowest band center show the lowest band (which, with the DC
-          // bin included, collects all sub-band energy), mirroring how the
-          // FFT view's bottom row stretches down to 0 Hz.
-          const hertz = Math.max(frequency * maxFrequency, 1e-6);
-          const row = Math.round(cqtBinsPerOctave * Math.log2(hertz / cqtFmin));
-          rowMap[y] = Math.min(rows - 1, Math.max(0, row));
-          continue;
-        }
-        const row = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
-        rowMap[y] = Math.min(rows - 1, Math.max(0, Math.round(row * (rows - 1))));
-      }
+    const secondsPerColumn = Math.max(1e-9, data.secondsPerColumn);
+    const coverageStart = data.startTime - secondsPerColumn / 2;
+    const coverageEnd = coverageStart + data.columns * secondsPerColumn;
+    const viewEnd = this.viewStart + this.viewDuration;
+    const availableEnd = isStreaming
+      ? this.availableSamples / this.sampleRate
+      : Number.POSITIVE_INFINITY;
+    const drawStart = Math.max(this.viewStart, coverageStart);
+    const drawEnd = Math.min(viewEnd, coverageEnd, availableEnd);
+    if (drawEnd <= drawStart) return;
 
-      for (let x = 0; x < pixelWidth; x += 1) {
-        const time = this.viewStart + (x / Math.max(1, pixelWidth - 1)) * this.viewDuration;
-        if (isStreaming && time > availableTime) {
-          columnMap[x] = -1;
-          continue;
-        }
-        const columnFloat = (time - startTime) / secondsPerColumn;
-        columnMap[x] = Math.max(0, Math.min(columns - 1, Math.round(columnFloat)));
-      }
+    const sourceLeft = Math.max(0, Math.min(data.columns, (drawStart - coverageStart) / secondsPerColumn));
+    const sourceRight = Math.max(0, Math.min(data.columns, (drawEnd - coverageStart) / secondsPerColumn));
+    const sourceWidth = sourceRight - sourceLeft;
+    if (sourceWidth <= 0) return;
 
-      for (let y = 0; y < pixelHeight; y += 1) {
-        const row = rowMap[y];
-        const offset = y * pixelWidth;
-        for (let x = 0; x < pixelWidth; x += 1) {
-          const column = columnMap[x];
-          if (column < 0) {
-            packed[offset + x] = UNLOADED_SPECTROGRAM_COLOR;
-            continue;
-          }
-          // Rows outside the analysis band range (CQT) draw at the floor.
-          const db = row < 0 ? -this.spectralRangeDb : values[column * rows + row] / 10;
-          const normalized = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
-          const paletteIndex = Math.round(normalized * 255);
-          packed[offset + x] = this.colorLut[this.isLightTheme ? 255 - paletteIndex : paletteIndex];
-        }
-      }
-      context.setTransform(1, 0, 0, 1, 0, 0);
-      context.putImageData(image, 0, Math.round(SPECTRAL_RULER * scaleY));
-      context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
-    }
+    const physicalPlotWidth = Math.max(1, Math.round(plotWidth * scaleX));
+    const destinationLeft = ((drawStart - this.viewStart) / this.viewDuration) * physicalPlotWidth;
+    const destinationRight = ((drawEnd - this.viewStart) / this.viewDuration) * physicalPlotWidth;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.drawImage(
+      raster.canvas,
+      sourceLeft,
+      0,
+      sourceWidth,
+      raster.height,
+      destinationLeft,
+      Math.round(SPECTRAL_RULER * scaleY),
+      destinationRight - destinationLeft,
+      physicalPlotHeight,
+    );
+  }
+
+  private drawSpectrogramOverlay(
+    surface = this.spectralOverlaySurface,
+    includeSelectionTimeLabels = true,
+    clear = true,
+  ): void {
+    prepareCanvasSurface(surface);
+    const { context, width, height, pixelWidth, pixelHeight, scaleX, scaleY } = surface;
+    if (clear) context.clearRect(0, 0, width, height);
+    const plotRight = width - AXIS_WIDTH;
+    const plotBottom = height;
+    const plotWidth = Math.max(1, plotRight);
+    const plotHeight = Math.max(1, plotBottom - SPECTRAL_RULER);
 
     context.fillStyle = this.isLightTheme ? '#fff' : '#000';
     context.fillRect(plotRight, 0, AXIS_WIDTH, height);
-    context.fillStyle = this.isLightTheme ? '#fff' : '#000';
     context.fillRect(0, 0, plotWidth, SPECTRAL_RULER);
-
     this.drawTimeGrid(
       context,
       plotRight,
@@ -1114,10 +1263,77 @@ export class AudioVisualizer {
     );
   }
 
+  private getSpectrogramRaster(data: SpectrogramData, height: number): SpectrogramRaster | null {
+    if (data.columns <= 0 || data.rows <= 0 || data.values.length < data.columns * data.rows) {
+      return null;
+    }
+    const cached = this.spectrogramRaster;
+    if (
+      cached?.data === data &&
+      cached.colorLut === this.colorLut &&
+      cached.height === height &&
+      cached.scaleBlend === this.scaleBlend &&
+      cached.spectralRangeDb === this.spectralRangeDb &&
+      cached.theme === this.theme
+    ) {
+      return cached;
+    }
+
+    const canvas = cached?.canvas ?? document.createElement('canvas');
+    const context = cached?.context ?? canvas.getContext('2d', { alpha: false });
+    if (!context) return null;
+    canvas.width = data.columns;
+    canvas.height = height;
+    const image = context.createImageData(data.columns, height);
+    const packed = new Uint32Array(image.data.buffer);
+    const maxFrequency = data.sampleRate / 2;
+    const minFrequency = this.minimumFrequency;
+    const minNormalized = minFrequency / maxFrequency;
+    const isCqt = data.mode === 'cqt';
+    const cqtFmin = data.cqtFmin ?? 32.703;
+    const cqtBinsPerOctave = data.cqtBinsPerOctave ?? 24;
+
+    for (let y = 0; y < height; y += 1) {
+      const scaled = 1 - y / Math.max(1, height - 1);
+      const frequency = invertFrequencyScale(scaled, this.scaleBlend, maxFrequency, minFrequency);
+      let row: number;
+      if (isCqt) {
+        const hertz = Math.max(frequency * maxFrequency, 1e-6);
+        row = Math.round(cqtBinsPerOctave * Math.log2(hertz / cqtFmin));
+      } else {
+        const normalizedRow = (frequency - minNormalized) / Math.max(1e-9, 1 - minNormalized);
+        row = Math.round(normalizedRow * (data.rows - 1));
+      }
+      row = Math.min(data.rows - 1, Math.max(0, row));
+      const destinationOffset = y * data.columns;
+      for (let column = 0; column < data.columns; column += 1) {
+        const db = data.values[column * data.rows + row] / 10;
+        const normalized = Math.max(0, Math.min(1, (db + this.spectralRangeDb) / this.spectralRangeDb));
+        const paletteIndex = Math.round(normalized * 255);
+        packed[destinationOffset + column] = this.colorLut[
+          this.isLightTheme ? 255 - paletteIndex : paletteIndex
+        ];
+      }
+    }
+    context.putImageData(image, 0, 0);
+
+    const raster: SpectrogramRaster = {
+      canvas,
+      context,
+      data,
+      colorLut: this.colorLut,
+      height,
+      scaleBlend: this.scaleBlend,
+      spectralRangeDb: this.spectralRangeDb,
+      theme: this.theme,
+    };
+    this.spectrogramRaster = raster;
+    return raster;
+  }
+
   private drawSpectrumAnalyzer(): void {
     if (!this.spectrumAnalyzerOpen) return;
-    const canvas = this.spectrumCanvas;
-    const surface = this.prepareCanvas(canvas);
+    const surface = prepareCanvasSurface(this.spectrumSurface);
     const { context, width, height, pixelWidth: physicalWidth, pixelHeight: physicalHeight, scaleX, scaleY } = surface;
     context.imageSmoothingEnabled = false;
     const light = this.isLightTheme;
@@ -1860,14 +2076,16 @@ export class AudioVisualizer {
     type?: string,
     quality?: number,
   ): void {
-    const bounds = this.spectralCanvas.getBoundingClientRect();
-    if (bounds.width <= 0 || bounds.height <= 0) {
+    const { width, height } = this.spectralSurface;
+    if (width <= 1 || height <= 1) {
       this.nativeSpectralToBlob(callback, type, quality);
       return;
     }
 
     const exportCanvas = document.createElement('canvas');
-    this.drawSpectrogram(exportCanvas, false, bounds);
+    const exportSurface = createCanvasSurface(exportCanvas, false, { width, height });
+    this.drawSpectrogram(exportSurface);
+    this.drawSpectrogramOverlay(exportSurface, false, false);
     exportCanvas.toBlob(callback, type, quality);
   }
 

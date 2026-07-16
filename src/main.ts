@@ -238,10 +238,12 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <div class="editor-stack" id="editor">
         <section class="editor-panel wave-panel" aria-label="Waveform view">
           <canvas id="wave-canvas"></canvas>
+          <canvas id="wave-overlay-canvas" class="canvas-overlay" aria-hidden="true"></canvas>
         </section>
         <div class="panel-divider" id="panel-divider" role="separator" aria-label="Resize waveform and spectrogram panels" aria-orientation="horizontal" aria-valuemin="10" aria-valuemax="75" tabindex="0"><span></span></div>
         <section class="editor-panel spectral-panel" aria-label="Spectrogram view">
           <canvas id="spectral-canvas"></canvas>
+          <canvas id="spectral-overlay-canvas" class="canvas-overlay" aria-hidden="true"></canvas>
           <div class="spectrum-hover-frequency-mask" id="spectrum-hover-frequency-mask" aria-hidden="true"></div>
           <div class="spectrum-hover-frequency" id="spectrum-hover-frequency" aria-hidden="true"></div>
           <div class="frequency-axis-control" id="frequency-axis-control" role="slider" aria-label="Frequency scale blend" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100" aria-valuetext="Logarithmic" tabindex="0"></div>
@@ -289,7 +291,9 @@ const get = <T extends HTMLElement>(id: string): T => document.getElementById(id
 const engine = new AudioEngine();
 const editor = get<HTMLDivElement>('editor');
 const waveCanvas = get<HTMLCanvasElement>('wave-canvas');
+const waveOverlayCanvas = get<HTMLCanvasElement>('wave-overlay-canvas');
 const spectralCanvas = get<HTMLCanvasElement>('spectral-canvas');
+const spectralOverlayCanvas = get<HTMLCanvasElement>('spectral-overlay-canvas');
 const spectrumCanvas = get<HTMLCanvasElement>('spectrum-canvas');
 const playButton = get<HTMLButtonElement>('play-button');
 const currentTimeElement = get<HTMLSpanElement>('current-time');
@@ -406,6 +410,7 @@ let normalizeOutput = normalizeOutputToggle.checked;
 let themeMode: ThemeMode = themeToggle.checked ? 'light' : 'dark';
 let settingsPaneOpen = persistedSettings?.settingsPaneOpen === true;
 let lastPlaybackAnalysisCheck = 0;
+let playbackAnimationFrame = 0;
 
 document.documentElement.dataset.theme = themeMode;
 
@@ -414,7 +419,9 @@ const fftBins = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] as const
 const visualizer = new AudioVisualizer({
   editor,
   waveCanvas,
+  waveOverlayCanvas,
   spectralCanvas,
+  spectralOverlayCanvas,
   spectrumCanvas,
   spectrumHoverFrequencyLabel,
   spectrumHoverFrequencyMask,
@@ -439,10 +446,7 @@ const visualizer = new AudioVisualizer({
   },
 });
 
-engine.onEnded = () => {
-  updateTimecode(engine.currentTime);
-  updateTransportState();
-};
+engine.onEnded = updateTransportState;
 
 playButton.addEventListener('click', () => void togglePlayback());
 screenshotButton.addEventListener('click', downloadSpectrogramPng);
@@ -716,7 +720,11 @@ window.addEventListener('resize', () => {
   applySpectrumAnalyzerLayout();
   scheduleViewportAnalysis(90);
 });
-window.addEventListener('pagehide', persistSettings);
+window.addEventListener('pagehide', () => {
+  persistSettings();
+  stopPlaybackAnimation();
+});
+window.addEventListener('pageshow', updateTransportState);
 
 async function togglePlayback(): Promise<void> {
   if (!engine.hasAudio) return;
@@ -754,12 +762,17 @@ async function togglePlayback(): Promise<void> {
 }
 
 function updateTransportState(): void {
-  playButton.classList.toggle('is-playing', engine.isPlaying);
-  playButton.setAttribute('aria-label', engine.isPlaying ? 'Pause' : 'Play');
-  visualizer.setPlaybackState(engine.isPlaying, playbackFollowMode);
-  if (engine.isPlaying) {
+  const isPlaying = engine.isPlaying;
+  playButton.classList.toggle('is-playing', isPlaying);
+  playButton.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+  visualizer.setPlaybackState(isPlaying, playbackFollowMode);
+  if (isPlaying) {
+    startPlaybackAnimation();
     hideAnalysisOverlay();
     scheduleViewportAnalysis(0);
+  } else {
+    stopPlaybackAnimation();
+    updateTimecode();
   }
 }
 
@@ -768,16 +781,32 @@ function updateTimecode(time = engine.currentTime): void {
   visualizer.showPlayhead(time);
 }
 
-function animationLoop(): void {
+function startPlaybackAnimation(): void {
+  if (playbackAnimationFrame) return;
+  playbackAnimationFrame = requestAnimationFrame(playbackAnimationLoop);
+}
+
+function stopPlaybackAnimation(): void {
+  if (!playbackAnimationFrame) return;
+  cancelAnimationFrame(playbackAnimationFrame);
+  playbackAnimationFrame = 0;
+}
+
+function playbackAnimationLoop(): void {
+  playbackAnimationFrame = 0;
   const time = engine.currentTime;
-  if (engine.isPlaying) visualizer.follow(time);
+  if (!engine.isPlaying) {
+    updateTimecode(time);
+    return;
+  }
+  visualizer.follow(time);
   updateTimecode(time);
   const analysisCheckInterval = playbackAnalysisInterval();
-  if (engine.isPlaying && performance.now() - lastPlaybackAnalysisCheck >= analysisCheckInterval) {
+  if (performance.now() - lastPlaybackAnalysisCheck >= analysisCheckInterval) {
     lastPlaybackAnalysisCheck = performance.now();
     scheduleViewportAnalysis(analysisCheckInterval);
   }
-  requestAnimationFrame(animationLoop);
+  if (engine.isPlaying) playbackAnimationFrame = requestAnimationFrame(playbackAnimationLoop);
 }
 
 async function loadFile(file: File): Promise<void> {
@@ -1795,7 +1824,7 @@ function initialize(): void {
   updateSelectionDownloadState();
   updateDropOverlayState();
   requestAnimationFrame(applyPanelRatio);
-  requestAnimationFrame(animationLoop);
+  updateTimecode(0);
 }
 
 initialize();
