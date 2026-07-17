@@ -15,7 +15,7 @@ Open [http://vibecheck.local:5173/](http://vibecheck.local:5173/).
 
 ## Controls
 
-- Drop an audio file anywhere in the editor, or use the folder button.
+- Drop one or more audio files anywhere in the editor, or use the folder button. Use the stacked file buttons or the **Up/Down Arrow** keys to cycle through multiple files.
 - Click or drag to place and scrub the playback head.
 - Press **Space** to play or pause.
 - Pinch to zoom and two-finger drag to pan. Trackpad pinch and scrolling are supported too.

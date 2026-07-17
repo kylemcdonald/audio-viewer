@@ -370,6 +370,50 @@ select:focus-visible {
   padding: 0;
 }
 
+.file-navigation {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  border: 1px solid rgba(181, 207, 221, 0.2);
+  border-radius: 6px;
+  background: #000;
+}
+
+.file-navigation button {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 5px 5px 0 0;
+  color: #91a0a9;
+  background: transparent;
+  cursor: pointer;
+  place-items: center;
+}
+
+.file-navigation button + button {
+  border-top: 1px solid rgba(181, 207, 221, 0.2);
+  border-radius: 0 0 5px 5px;
+}
+
+.file-navigation svg {
+  width: 12px;
+  height: 12px;
+}
+
+.file-navigation button:hover:not(:disabled) {
+  color: #d9e5e0;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.file-navigation button:disabled {
+  opacity: 0.34;
+  cursor: default;
+}
+
 .header-icon-button {
   display: grid;
   padding: 0;
@@ -1122,6 +1166,7 @@ select:focus-visible {
 }
 
 :root[data-theme="light"] .open-button,
+:root[data-theme="light"] .file-navigation,
 :root[data-theme="light"] .header-icon-button {
   border-color: rgba(30, 39, 46, 0.32);
   color: #111417;
@@ -1136,6 +1181,19 @@ select:focus-visible {
 :root[data-theme="light"] .open-button:hover,
 :root[data-theme="light"] .header-icon-button:hover {
   border-color: rgba(21, 145, 99, 0.65);
+  color: #111417;
+  background: #f4f7f5;
+}
+
+:root[data-theme="light"] .file-navigation button {
+  color: #111417;
+}
+
+:root[data-theme="light"] .file-navigation button + button {
+  border-top-color: rgba(30, 39, 46, 0.32);
+}
+
+:root[data-theme="light"] .file-navigation button:hover:not(:disabled) {
   color: #111417;
   background: #f4f7f5;
 }

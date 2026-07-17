@@ -32,6 +32,8 @@ const playIcon = icon('<path d="M8 5.6v12.8c0 .8.9 1.3 1.6.8l9-6.4a1 1 0 0 0 0-1
 const pauseIcon = icon('<path d="M7 5.5h3.5v13H7v-13Zm6.5 0H17v13h-3.5v-13Z" fill="currentColor"/>');
 const folderIcon = icon('<path d="M3.5 7.5h6l1.7 2H20.5v8.8a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7V7.5Zm0 0V6.7A1.7 1.7 0 0 1 5.2 5h4l1.6 2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>');
 const importIcon = icon('<path d="M13.5 4H18a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4.5M4 12h11m-4-4 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"/>');
+const previousFileIcon = icon('<path d="m7 14 5-5 5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>');
+const nextFileIcon = icon('<path d="m7 10 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>');
 const spectrumIcon = icon('<path d="M3 17.5h18M4 15l2.3-5 2.2 3.2L11 6l2.2 8 2.3-5.6 1.8 4.2L20 5.5" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>');
 const gearIcon = icon('<path d="M12 8.3a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4Zm7.7 4.9v-2.4l-2-.7a6.3 6.3 0 0 0-.7-1.6l.9-1.9-1.7-1.7-1.9.9a6.3 6.3 0 0 0-1.6-.7l-.7-2h-2.4l-.7 2a6.3 6.3 0 0 0-1.6.7l-1.9-.9-1.7 1.7.9 1.9a6.3 6.3 0 0 0-.7 1.6l-2 .7v2.4l2 .7c.2.6.4 1.1.7 1.6l-.9 1.9 1.7 1.7 1.9-.9c.5.3 1 .6 1.6.7l.7 2H13l.7-2c.6-.2 1.1-.4 1.6-.7l1.9.9 1.7-1.7-.9-1.9c.3-.5.6-1 .7-1.6l2-.7Z" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>');
 const downloadIcon = icon('<path d="M12 3.5v11m-4-4 4 4 4-4M5 19.5h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>');
@@ -45,7 +47,11 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <label class="open-button icon-only" for="file-input" role="button" tabindex="0" aria-label="Import audio" title="Import audio">
           ${importIcon}
         </label>
-        <input id="file-input" type="file" accept="audio/*,video/mp4,.wav,.wave,.mp3,.m4a,.mp4,.aac,.flac,.ogg,.opus" hidden />
+        <input id="file-input" type="file" accept="audio/*,video/mp4,.wav,.wave,.mp3,.m4a,.mp4,.aac,.flac,.ogg,.opus" multiple hidden />
+        <div class="file-navigation" role="group" aria-label="Navigate files">
+          <button id="previous-file-button" type="button" aria-label="Previous file" title="Previous file (Up arrow)" disabled>${previousFileIcon}</button>
+          <button id="next-file-button" type="button" aria-label="Next file" title="Next file (Down arrow)" disabled>${nextFileIcon}</button>
+        </div>
         <div class="file-identity is-empty" id="file-identity">
           <strong id="file-name"></strong>
           <div class="file-meta-row">
@@ -276,7 +282,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <div class="drop-overlay is-visible is-empty" id="drop-overlay">
           <div class="drop-target">
             <div class="drop-icon">${folderIcon}</div>
-            <strong>Drop audio to open</strong>
+            <strong>Drop audio files to open</strong>
             <span>WAV, MP3, M4A, MP4, FLAC, OGG and more</span>
           </div>
         </div>
@@ -324,6 +330,8 @@ const analysisTitle = get<HTMLElement>('analysis-title');
 const analysisDetail = get<HTMLElement>('analysis-detail');
 const analysisProgress = get<HTMLElement>('analysis-progress');
 const fileInput = get<HTMLInputElement>('file-input');
+const previousFileButton = get<HTMLButtonElement>('previous-file-button');
+const nextFileButton = get<HTMLButtonElement>('next-file-button');
 const dropOverlay = get<HTMLElement>('drop-overlay');
 const formatStatus = get<HTMLElement>('format-status');
 const channelStatus = get<HTMLElement>('channel-status');
@@ -380,6 +388,8 @@ let analysisViewDuration = 1;
 let latestSpectrogram: SpectrogramData | null = null;
 let activeAnalysisRequest: AnalysisCoverage | null = null;
 let sourceFile: File | null = null;
+let sourceFiles: File[] = [];
+let activeSourceFileIndex = -1;
 let sourceWavHeader: WavHeader | null = null;
 let selection: SelectionRange | null = null;
 let toastTimer = 0;
@@ -719,10 +729,12 @@ spectrumDivider.addEventListener('keydown', (event) => {
 });
 
 fileInput.addEventListener('change', () => {
-  const file = fileInput.files?.[0];
-  if (file) void loadFile(file);
+  openFiles(fileInput.files);
   fileInput.value = '';
 });
+
+previousFileButton.addEventListener('click', () => navigateFiles(-1));
+nextFileButton.addEventListener('click', () => navigateFiles(1));
 
 document.querySelector<HTMLLabelElement>('.open-button')!.addEventListener('keydown', (event) => {
   if (event.key === 'Enter') fileInput.click();
@@ -740,6 +752,22 @@ window.addEventListener('keydown', (event) => {
   ) return;
   event.preventDefault();
   void togglePlayback();
+});
+
+window.addEventListener('keydown', (event) => {
+  if (
+    (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') ||
+    event.defaultPrevented ||
+    event.repeat ||
+    event.altKey ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.shiftKey ||
+    isInteractiveKeyTarget(event.target)
+  ) return;
+  if (sourceFiles.length < 2) return;
+  event.preventDefault();
+  navigateFiles(event.key === 'ArrowUp' ? -1 : 1);
 });
 
 window.addEventListener('dragenter', (event) => {
@@ -765,8 +793,7 @@ window.addEventListener('drop', (event) => {
   event.preventDefault();
   dragDepth = 0;
   updateDropOverlayState();
-  const file = event.dataTransfer?.files[0];
-  if (file) void loadFile(file);
+  openFiles(event.dataTransfer?.files);
 });
 
 window.addEventListener('resize', () => {
@@ -864,16 +891,6 @@ function playbackAnimationLoop(): void {
 }
 
 async function loadFile(file: File): Promise<void> {
-  if (
-    !file.type.startsWith('audio/') &&
-    file.type !== 'video/mp4' &&
-    file.type !== 'application/mp4' &&
-    !/\.(wav|wave|mp3|m4a|mp4|aac|flac|ogg|opus|webm)$/i.test(file.name)
-  ) {
-    showToast('That file does not look like browser-decodable audio.');
-    return;
-  }
-
   const loadId = ++fileLoadId;
   prepareFileLoad(file);
 
@@ -1655,6 +1672,59 @@ function downmix(buffer: AudioBuffer): Float32Array {
 
 function hasFiles(dataTransfer: DataTransfer | null): boolean {
   return Boolean(dataTransfer && [...dataTransfer.types].includes('Files'));
+}
+
+function openFiles(files: FileList | null | undefined): void {
+  if (!files?.length) return;
+  const candidates = [...files];
+  const supportedFiles = candidates.filter(isSupportedAudioFile);
+  if (!supportedFiles.length) {
+    showToast(candidates.length === 1
+      ? 'That file does not look like browser-decodable audio.'
+      : 'None of those files look like browser-decodable audio.');
+    return;
+  }
+
+  sourceFiles = supportedFiles;
+  activeSourceFileIndex = 0;
+  updateFileNavigationState();
+  void loadFile(sourceFiles[activeSourceFileIndex]);
+
+  const skipped = candidates.length - supportedFiles.length;
+  if (skipped > 0) {
+    showToast(`Skipped ${skipped} unsupported ${skipped === 1 ? 'file' : 'files'}.`);
+  }
+}
+
+function isSupportedAudioFile(file: File): boolean {
+  return file.type.startsWith('audio/') ||
+    file.type === 'video/mp4' ||
+    file.type === 'application/mp4' ||
+    /\.(wav|wave|mp3|m4a|mp4|aac|flac|ogg|opus|webm)$/i.test(file.name);
+}
+
+function navigateFiles(direction: -1 | 1): void {
+  if (sourceFiles.length < 2 || activeSourceFileIndex < 0) return;
+  activeSourceFileIndex = (
+    activeSourceFileIndex + direction + sourceFiles.length
+  ) % sourceFiles.length;
+  updateFileNavigationState();
+  void loadFile(sourceFiles[activeSourceFileIndex]);
+}
+
+function updateFileNavigationState(): void {
+  const canNavigate = sourceFiles.length > 1 && activeSourceFileIndex >= 0;
+  previousFileButton.disabled = !canNavigate;
+  nextFileButton.disabled = !canNavigate;
+  const position = canNavigate ? ` (${activeSourceFileIndex + 1} of ${sourceFiles.length})` : '';
+  previousFileButton.setAttribute('aria-label', `Previous file${position}`);
+  nextFileButton.setAttribute('aria-label', `Next file${position}`);
+}
+
+function isInteractiveKeyTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && Boolean(target.closest(
+    'input, textarea, select, button, [role="button"], [role="slider"], [role="separator"], [contenteditable="true"]',
+  ));
 }
 
 function updateDropOverlayState(): void {
