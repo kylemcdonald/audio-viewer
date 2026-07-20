@@ -444,6 +444,107 @@ select:focus-visible {
   padding: 19px 20px 28px;
 }
 
+.ambisonic-mix-section,
+.virtual-mic-controls {
+  display: grid;
+  gap: 13px;
+}
+
+.ambisonic-mix-section[hidden],
+.virtual-mic-controls[hidden] {
+  display: none;
+}
+
+.ambisonic-mix-control .control-heading output {
+  max-width: 145px;
+  overflow: hidden;
+  color: #76bfa3;
+  text-overflow: ellipsis;
+}
+
+.virtual-mic-pad {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 1;
+  overflow: hidden;
+  border: 1px solid rgba(181, 205, 219, 0.22);
+  border-radius: 6px;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(80, 224, 169, 0.08), transparent 42%),
+    repeating-linear-gradient(90deg, transparent 0 calc(25% - 1px), rgba(181, 205, 219, 0.055) 25%),
+    repeating-linear-gradient(0deg, transparent 0 calc(25% - 1px), rgba(181, 205, 219, 0.055) 25%);
+  box-shadow: inset 0 0 24px rgba(0, 0, 0, 0.32);
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.virtual-mic-pad:hover,
+.virtual-mic-pad:focus-visible,
+.virtual-mic-pad.is-dragging {
+  border-color: rgba(105, 235, 184, 0.55);
+  outline: none;
+}
+
+.virtual-mic-pad-equator,
+.virtual-mic-pad-meridian {
+  position: absolute;
+  background: rgba(181, 205, 219, 0.16);
+  pointer-events: none;
+}
+
+.virtual-mic-pad-equator {
+  top: 50%;
+  right: 0;
+  left: 0;
+  height: 1px;
+}
+
+.virtual-mic-pad-meridian {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+}
+
+.virtual-mic-dot {
+  position: absolute;
+  z-index: 2;
+  width: 13px;
+  height: 13px;
+  border: 2px solid #b5ffe0;
+  border-radius: 50%;
+  background: #38d79b;
+  box-shadow: 0 0 0 3px rgba(56, 215, 155, 0.16), 0 0 13px rgba(56, 215, 155, 0.6);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.virtual-mic-axis-labels {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  margin-top: 6px;
+  color: #59656f;
+  font-family: var(--mono);
+  font-size: 7px;
+  letter-spacing: 0.04em;
+}
+
+.virtual-mic-axis-labels span:nth-child(2) {
+  text-align: center;
+}
+
+.virtual-mic-axis-labels span:last-child {
+  text-align: right;
+}
+
+.virtual-mic-help {
+  margin: 8px 0 0;
+  color: #65717a;
+  font-family: var(--mono);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
 .settings-divider {
   height: 1px;
   background: rgba(184, 205, 219, 0.11);
@@ -1176,6 +1277,31 @@ select:focus-visible {
 
 :root[data-theme="light"] .palette-select-row::after {
   border-color: #56616a;
+}
+
+:root[data-theme="light"] .virtual-mic-pad {
+  border-color: rgba(30, 39, 46, 0.3);
+  background:
+    radial-gradient(circle at 50% 50%, rgba(32, 150, 106, 0.09), transparent 42%),
+    repeating-linear-gradient(90deg, transparent 0 calc(25% - 1px), rgba(30, 39, 46, 0.07) 25%),
+    repeating-linear-gradient(0deg, transparent 0 calc(25% - 1px), rgba(30, 39, 46, 0.07) 25%);
+  box-shadow: inset 0 0 18px rgba(32, 43, 49, 0.05);
+}
+
+:root[data-theme="light"] .virtual-mic-pad-equator,
+:root[data-theme="light"] .virtual-mic-pad-meridian {
+  background: rgba(30, 39, 46, 0.18);
+}
+
+:root[data-theme="light"] .virtual-mic-dot {
+  border-color: #fff;
+  background: #159568;
+  box-shadow: 0 0 0 3px rgba(21, 149, 104, 0.15), 0 1px 6px rgba(24, 62, 48, 0.35);
+}
+
+:root[data-theme="light"] .virtual-mic-axis-labels,
+:root[data-theme="light"] .virtual-mic-help {
+  color: #65717a;
 }
 
 :root[data-theme="light"] .range-input::-webkit-slider-runnable-track {

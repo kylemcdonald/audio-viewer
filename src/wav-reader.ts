@@ -1,3 +1,8 @@
+import {
+  detectAmbisonicInputFormat,
+  type AmbisonicInputFormat,
+} from './ambisonics';
+
 export type WavSampleFormat = 'pcm' | 'float';
 
 export type WavHeader = {
@@ -11,6 +16,10 @@ export type WavHeader = {
   dataSize: number;
   frameCount: number;
   duration: number;
+  /** Track labels recovered from BWF/iXML metadata, when present. */
+  trackNames?: readonly string[];
+  /** Four-channel layout inferred from explicit track labels. */
+  ambisonicFormat?: AmbisonicInputFormat;
 };
 
 export type DecodedWavChunk = {
@@ -18,6 +27,8 @@ export type DecodedWavChunk = {
   mono: Float32Array<ArrayBuffer>;
   frameCount: number;
 };
+
+export type DecodedWavMonoChunk = Omit<DecodedWavChunk, 'channels'>;
 
 type FormatChunk = Omit<WavHeader, 'dataOffset' | 'dataSize' | 'frameCount' | 'duration'>;
 
@@ -35,6 +46,7 @@ export async function parseWavHeader(file: File): Promise<WavHeader | null> {
   let dataOffset = -1;
   let dataSize = -1;
   let rf64DataSize: number | null = null;
+  const metadataTexts: string[] = [];
   let offset = 12;
 
   for (let chunkIndex = 0; chunkIndex < 10_000 && offset + 8 <= file.size; chunkIndex += 1) {
@@ -54,32 +66,49 @@ export async function parseWavHeader(file: File): Promise<WavHeader | null> {
     } else if (id === 'fmt ') {
       const bytes = await file.slice(payloadOffset, payloadOffset + Math.min(declaredSize, 64)).arrayBuffer();
       format = parseFormatChunk(bytes);
+    } else if (id === 'bext' || id === 'iXML' || id === 'axml') {
+      const bytes = await file.slice(
+        payloadOffset,
+        payloadOffset + Math.min(declaredSize, 1024 * 1024),
+      ).arrayBuffer();
+      metadataTexts.push(new TextDecoder().decode(bytes).replaceAll('\0', '\n'));
     } else if (id === 'data') {
       dataOffset = payloadOffset;
       const requestedSize = declaredSize === 0xffff_ffff && rf64DataSize !== null
         ? rf64DataSize
         : declaredSize;
       dataSize = Math.max(0, Math.min(requestedSize, file.size - dataOffset));
-      if (format) break;
     }
 
-    const nextOffset = payloadOffset + declaredSize + (declaredSize & 1);
+    // RF64 advertises the data chunk as 0xffffffff bytes and carries the
+    // real length in ds64. Use the resolved/clamped data length when hopping
+    // over it so metadata following a large data chunk remains reachable.
+    const payloadSize = id === 'data' && dataSize >= 0 ? dataSize : declaredSize;
+    const nextOffset = payloadOffset + payloadSize + (payloadSize & 1);
     if (!Number.isSafeInteger(nextOffset) || nextOffset <= offset || nextOffset > file.size) break;
     offset = nextOffset;
   }
 
   if (!format || dataOffset < 0 || dataSize < format.blockAlign) return null;
   const frameCount = Math.floor(dataSize / format.blockAlign);
+  const trackNames = extractTrackNames(metadataTexts);
+  const ambisonicFormat = detectAmbisonicInputFormat(trackNames);
   return {
     ...format,
     dataOffset,
     dataSize: frameCount * format.blockAlign,
     frameCount,
     duration: frameCount / format.sampleRate,
+    ...(trackNames ? { trackNames } : {}),
+    ...(ambisonicFormat ? { ambisonicFormat } : {}),
   };
 }
 
-export function decodeWavChunk(buffer: ArrayBuffer, header: WavHeader): DecodedWavChunk {
+export function decodeWavChunk(
+  buffer: ArrayBuffer,
+  header: WavHeader,
+  monoWeights?: readonly number[],
+): DecodedWavChunk {
   const frameCount = Math.floor(buffer.byteLength / header.blockAlign);
   const channelData: Array<Float32Array<ArrayBuffer>> = Array.from(
     { length: header.channels },
@@ -88,19 +117,41 @@ export function decodeWavChunk(buffer: ArrayBuffer, header: WavHeader): DecodedW
   const mono = new Float32Array(frameCount);
   const view = new DataView(buffer);
   const bytesPerSample = header.bitsPerSample / 8;
+  const defaultGain = 1 / Math.max(1, header.channels);
 
   for (let frame = 0; frame < frameCount; frame += 1) {
     const frameOffset = frame * header.blockAlign;
-    let sum = 0;
     for (let channel = 0; channel < header.channels; channel += 1) {
       const sample = readSample(view, frameOffset + channel * bytesPerSample, header);
       channelData[channel][frame] = sample;
-      sum += sample;
+      mono[frame] += sample * (monoWeights?.[channel] ?? defaultGain);
     }
-    mono[frame] = sum / header.channels;
   }
 
   return { channels: channelData, mono, frameCount };
+}
+
+/** Decodes only the weighted mono output, avoiding four throwaway channel arrays. */
+export function decodeWavMonoChunk(
+  buffer: ArrayBuffer,
+  header: WavHeader,
+  monoWeights?: readonly number[],
+): DecodedWavMonoChunk {
+  const frameCount = Math.floor(buffer.byteLength / header.blockAlign);
+  const mono = new Float32Array(frameCount);
+  const view = new DataView(buffer);
+  const bytesPerSample = header.bitsPerSample / 8;
+  const defaultGain = 1 / Math.max(1, header.channels);
+
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    const frameOffset = frame * header.blockAlign;
+    for (let channel = 0; channel < header.channels; channel += 1) {
+      mono[frame] += readSample(view, frameOffset + channel * bytesPerSample, header) *
+        (monoWeights?.[channel] ?? defaultGain);
+    }
+  }
+
+  return { mono, frameCount };
 }
 
 export function preferredWavChunkBytes(header: WavHeader): number {
@@ -178,4 +229,24 @@ function readSample(view: DataView, offset: number, header: WavHeader): number {
 
 function fourCc(bytes: Uint8Array, offset: number): string {
   return String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+}
+
+function extractTrackNames(metadataTexts: readonly string[]): readonly string[] | undefined {
+  if (metadataTexts.length === 0) return undefined;
+  const text = metadataTexts.join('\n');
+  const indexed = new Map<number, string>();
+
+  for (const match of text.matchAll(/zTRK\s*([1-9]\d*)\s*=\s*([A-Za-z0-9_-]+)/gi)) {
+    indexed.set(Number(match[1]) - 1, match[2]);
+  }
+
+  // Zoom and other BWF recorders also duplicate the labels in iXML. Keep
+  // this deliberately conservative: only names that identify one of the
+  // supported four-channel layouts participate in automatic detection.
+  const xmlNames = [...text.matchAll(/<NAME>\s*(W|X|Y|Z|FLU|FRD|BLD|BRU)\s*<\/NAME>/gi)]
+    .map((match) => match[1]);
+  if (indexed.size === 0 && xmlNames.length >= 4) return xmlNames.slice(0, 4);
+  if (indexed.size < 4) return undefined;
+  const names = Array.from({ length: 4 }, (_, index) => indexed.get(index));
+  return names.every((name): name is string => typeof name === 'string') ? names : undefined;
 }

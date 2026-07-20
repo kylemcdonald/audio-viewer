@@ -71,11 +71,18 @@ export function cqtBinsPerOctave(fftSize: number): number {
   return 24;
 }
 
+export function cqtBandCount(sampleRate: number, fftSize: number): number {
+  const binsPerOctave = cqtBinsPerOctave(fftSize);
+  const maximumFrequency = (sampleRate / 2) * 2 ** (-0.5 / binsPerOctave);
+  return 1 + Math.floor(
+    binsPerOctave * Math.log2(maximumFrequency / CQT_FMIN) + 1e-9,
+  );
+}
+
 export function buildCqtPlan(sampleRate: number, fftSize: number): CqtPlan {
   const L = cqtSegmentSize(fftSize);
   const B = cqtBinsPerOctave(fftSize);
-  const fMax = (sampleRate / 2) * 2 ** (-0.5 / B);
-  const nBands = 1 + Math.floor(B * Math.log2(fMax / CQT_FMIN) + 1e-9);
+  const nBands = cqtBandCount(sampleRate, fftSize);
   const halfBins = Math.floor(L / 2);
   const starts: number[] = [];
   const supports: number[] = [];

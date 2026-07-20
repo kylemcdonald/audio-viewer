@@ -1,6 +1,7 @@
 import FFT from 'fft.js';
 import { buildCqtPlan, cqtColumnFromSpectrum, type CqtPlan } from './cqt';
 import { createPaletteLut, type PaletteName } from './palettes';
+import { spectrogramCoverageBounds } from './spectrogram-cache';
 import type { AnalysisMode, SpectrogramData } from './types';
 
 const AXIS_WIDTH = 38;
@@ -17,10 +18,19 @@ export type SelectionRange = {
   end: number;
 };
 
+export type WaveformPreview = {
+  minimum: Float32Array;
+  maximum: Float32Array;
+  startTime: number;
+  duration: number;
+  exact: boolean;
+};
+
 type PeakLevel = {
   blockSize: number;
   min: Float32Array;
   max: Float32Array;
+  valid: Uint8Array;
 };
 
 type PointerPoint = { x: number; y: number; type: string };
@@ -107,6 +117,7 @@ export type VisualizerOptions = {
 
 class PeakPyramid {
   private levels: PeakLevel[] = [];
+  private writtenRanges: Array<readonly [start: number, end: number]> = [];
 
   constructor(private readonly samples: Float32Array, initialize = true) {
     if (!samples.length) return;
@@ -118,6 +129,7 @@ class PeakPyramid {
     const from = Math.max(0, Math.floor(start));
     const to = Math.min(this.samples.length, Math.ceil(end));
     if (to <= from) return;
+    this.addWrittenRange(from, to);
 
     for (let levelIndex = 0; levelIndex < this.levels.length; levelIndex += 1) {
       const level = this.levels[levelIndex];
@@ -129,20 +141,31 @@ class PeakPyramid {
         let low = 1;
         let high = -1;
         if (!previous) {
+          const sampleStart = block * level.blockSize;
           const sampleEnd = Math.min(this.samples.length, (block + 1) * level.blockSize);
-          for (let index = block * level.blockSize; index < sampleEnd; index += 1) {
-            const value = this.samples[index];
-            if (value < low) low = value;
-            if (value > high) high = value;
+          const firstRange = this.firstRangeEndingAfter(sampleStart);
+          for (let rangeIndex = firstRange; rangeIndex < this.writtenRanges.length; rangeIndex += 1) {
+            const range = this.writtenRanges[rangeIndex];
+            if (range[0] >= sampleEnd) break;
+            const rangeStart = Math.max(sampleStart, range[0]);
+            const rangeEnd = Math.min(sampleEnd, range[1]);
+            if (rangeEnd <= rangeStart) continue;
+            for (let index = rangeStart; index < rangeEnd; index += 1) {
+              const value = this.samples[index];
+              if (value < low) low = value;
+              if (value > high) high = value;
+            }
           }
         } else {
           const previousStart = block * 4;
           const previousEnd = Math.min(previous.min.length, previousStart + 4);
           for (let index = previousStart; index < previousEnd; index += 1) {
+            if (!previous.valid[index]) continue;
             if (previous.min[index] < low) low = previous.min[index];
             if (previous.max[index] > high) high = previous.max[index];
           }
         }
+        level.valid[block] = low <= high ? 1 : 0;
         level.min[block] = low <= high ? low : 0;
         level.max[block] = low <= high ? high : 0;
       }
@@ -163,10 +186,18 @@ class PeakPyramid {
     let min = 1;
     let max = -1;
     if (!selected) {
-      for (let i = from; i < to; i += 1) {
-        const value = this.samples[i];
-        if (value < min) min = value;
-        if (value > max) max = value;
+      const firstRange = this.firstRangeEndingAfter(from);
+      for (let rangeIndex = firstRange; rangeIndex < this.writtenRanges.length; rangeIndex += 1) {
+        const range = this.writtenRanges[rangeIndex];
+        if (range[0] >= to) break;
+        const rangeStart = Math.max(from, range[0]);
+        const rangeEnd = Math.min(to, range[1]);
+        if (rangeEnd <= rangeStart) continue;
+        for (let i = rangeStart; i < rangeEnd; i += 1) {
+          const value = this.samples[i];
+          if (value < min) min = value;
+          if (value > max) max = value;
+        }
       }
       return min <= max ? [min, max] : [0, 0];
     }
@@ -174,22 +205,83 @@ class PeakPyramid {
     const first = Math.floor(from / selected.blockSize);
     const last = Math.min(selected.min.length, Math.ceil(to / selected.blockSize));
     for (let i = first; i < last; i += 1) {
+      if (!selected.valid[i]) continue;
       if (selected.min[i] < min) min = selected.min[i];
       if (selected.max[i] > max) max = selected.max[i];
     }
     return min <= max ? [min, max] : [0, 0];
   }
 
+  intersects(start: number, end: number): boolean {
+    const range = this.writtenRanges[this.firstRangeEndingAfter(start)];
+    return Boolean(range && range[0] < end);
+  }
+
+  contains(start: number, end: number): boolean {
+    const from = Math.max(0, Math.floor(start));
+    const to = Math.min(this.samples.length, Math.ceil(end));
+    if (to <= from) return true;
+    const range = this.writtenRanges[this.firstRangeEndingAfter(from)];
+    return Boolean(range && range[0] <= from && range[1] >= to);
+  }
+
+  get contiguousEnd(): number {
+    return this.writtenRanges[0]?.[0] === 0 ? this.writtenRanges[0][1] : 0;
+  }
+
   private allocate(): void {
     let blockSize = 32;
     let count = Math.ceil(this.samples.length / blockSize);
-    this.levels.push({ blockSize, min: new Float32Array(count), max: new Float32Array(count) });
+    this.levels.push({
+      blockSize,
+      min: new Float32Array(count),
+      max: new Float32Array(count),
+      valid: new Uint8Array(count),
+    });
 
     while (count > 4) {
       blockSize *= 4;
       count = Math.ceil(count / 4);
-      this.levels.push({ blockSize, min: new Float32Array(count), max: new Float32Array(count) });
+      this.levels.push({
+        blockSize,
+        min: new Float32Array(count),
+        max: new Float32Array(count),
+        valid: new Uint8Array(count),
+      });
     }
+  }
+
+  private addWrittenRange(start: number, end: number): void {
+    let first = 0;
+    let last = this.writtenRanges.length;
+    while (first < last) {
+      const middle = (first + last) >>> 1;
+      if (this.writtenRanges[middle][1] < start) first = middle + 1;
+      else last = middle;
+    }
+    let mergedStart = start;
+    let mergedEnd = end;
+    let replaceEnd = first;
+    while (
+      replaceEnd < this.writtenRanges.length &&
+      this.writtenRanges[replaceEnd][0] <= mergedEnd
+    ) {
+      mergedStart = Math.min(mergedStart, this.writtenRanges[replaceEnd][0]);
+      mergedEnd = Math.max(mergedEnd, this.writtenRanges[replaceEnd][1]);
+      replaceEnd += 1;
+    }
+    this.writtenRanges.splice(first, replaceEnd - first, [mergedStart, mergedEnd]);
+  }
+
+  private firstRangeEndingAfter(sample: number): number {
+    let low = 0;
+    let high = this.writtenRanges.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (this.writtenRanges[middle][1] <= sample) low = middle + 1;
+      else high = middle;
+    }
+    return low;
   }
 }
 
@@ -209,8 +301,11 @@ export class AudioVisualizer {
   private colorLut = createPaletteLut('viridis');
   private resizeObserver: ResizeObserver;
   private samples: Float32Array | null = null;
+  private spectrumChannelSource: AudioBuffer | null = null;
+  private spectrumChannelWeights: readonly number[] | null = null;
   private availableSamples = 0;
   private peaks: PeakPyramid | null = null;
+  private waveformPreview: WaveformPreview | null = null;
   private spectrogram: SpectrogramData | null = null;
   private sampleRate = 48000;
   private duration = 0;
@@ -246,6 +341,7 @@ export class AudioVisualizer {
   private selectionRange: SelectionRange | null = null;
   private selectionDraft: SelectionRange | null = null;
   private selectionDrag: SelectionDrag | null = null;
+  private waveformLabel = 'L+R';
 
   constructor(options: VisualizerOptions) {
     this.editor = options.editor;
@@ -286,6 +382,7 @@ export class AudioVisualizer {
     this.realtimeCqtPlan = null; // band grid depends on the sample rate
     this.duration = duration;
     this.peaks = new PeakPyramid(samples);
+    this.waveformPreview = null;
     this.availableSamples = samples.length;
     this.viewStart = 0;
     this.viewDuration = Math.max(duration, 0.01);
@@ -296,7 +393,10 @@ export class AudioVisualizer {
   clearAudio(): void {
     this.setSelection(null);
     this.samples = null;
+    this.spectrumChannelSource = null;
+    this.spectrumChannelWeights = null;
     this.peaks = null;
+    this.waveformPreview = null;
     this.spectrogram = null;
     this.duration = 0;
     this.viewStart = 0;
@@ -306,6 +406,26 @@ export class AudioVisualizer {
     this.requestRender();
   }
 
+  /**
+   * Keeps the spectrum-at-cursor analyzer independent from the full mono
+   * render. Retaining the AudioBuffer lets a progressive decoder keep filling
+   * it and lets us reacquire channel views after playback starts.
+   */
+  setSpectrumChannelSource(buffer: AudioBuffer | null): void {
+    this.spectrumChannelSource = buffer;
+    this.requestAnalyzerRender();
+  }
+
+  /**
+   * Changes only the tiny FFT window mixed by the live analyzer. Calls are
+   * coalesced by requestAnalyzerRender, so pointer events may update this at
+   * display rate without queuing redundant FFTs.
+   */
+  setSpectrumChannelWeights(weights: readonly number[] | null): void {
+    this.spectrumChannelWeights = weights ? [...weights] : null;
+    this.requestAnalyzerRender();
+  }
+
   beginProgressiveAudio(samples: Float32Array, sampleRate: number, duration: number): void {
     this.setSelection(null);
     this.samples = samples;
@@ -313,6 +433,7 @@ export class AudioVisualizer {
     this.realtimeCqtPlan = null; // band grid depends on the sample rate
     this.duration = duration;
     this.peaks = new PeakPyramid(samples, false);
+    this.waveformPreview = null;
     this.availableSamples = 0;
     this.viewStart = 0;
     this.viewDuration = Math.max(duration, 0.01);
@@ -322,12 +443,28 @@ export class AudioVisualizer {
 
   updateProgressiveAudio(start: number, end: number): void {
     this.peaks?.update(start, end);
-    this.availableSamples = Math.max(this.availableSamples, Math.min(this.samples?.length ?? 0, end));
+    this.availableSamples = this.peaks?.contiguousEnd ?? 0;
+    this.requestRender();
+  }
+
+  setWaveformPreview(preview: WaveformPreview | null): void {
+    this.waveformPreview = preview;
     this.requestRender();
   }
 
   setSpectrogram(data: SpectrogramData | null): void {
     this.spectrogram = data;
+    if (data) {
+      this.spectralCanvas.dataset.timeColumns = String(data.columns);
+      this.spectralCanvas.dataset.coverageStart = String(data.startTime);
+      this.spectralCanvas.dataset.coverageEnd = String(data.endTime);
+      this.spectralCanvas.dataset.secondsPerColumn = String(data.secondsPerColumn);
+    } else {
+      delete this.spectralCanvas.dataset.timeColumns;
+      delete this.spectralCanvas.dataset.coverageStart;
+      delete this.spectralCanvas.dataset.coverageEnd;
+      delete this.spectralCanvas.dataset.secondsPerColumn;
+    }
     this.requestRender();
     this.requestAnalyzerRender();
   }
@@ -349,6 +486,12 @@ export class AudioVisualizer {
     this.spectralRangeDb = Math.max(60, Math.min(140, value));
     this.requestRender();
     this.requestAnalyzerRender();
+  }
+
+  setWaveformLabel(label: string): void {
+    if (label === this.waveformLabel) return;
+    this.waveformLabel = label;
+    this.requestRender();
   }
 
   setColorPalette(palette: PaletteName): void {
@@ -507,6 +650,12 @@ export class AudioVisualizer {
   get analysisColumnCount(): number {
     const dpr = window.devicePixelRatio || 1;
     return Math.max(1, Math.round(this.timelinePlotWidth * dpr));
+  }
+
+  get analysisRowCount(): number {
+    const dpr = window.devicePixelRatio || 1;
+    const height = this.spectralCanvas.getBoundingClientRect().height - SPECTRAL_RULER;
+    return Math.max(1, Math.round(height * dpr));
   }
 
   private get timelinePlotWidth(): number {
@@ -971,7 +1120,48 @@ export class AudioVisualizer {
     context.fillStyle = light ? '#65717a' : '#5d6974';
     context.fillText('-∞', plotRight + AXIS_LABEL_INSET, mid);
 
-    if (this.peaks && this.samples) {
+    const waveformPreview = this.waveformPreview;
+    const previewTolerance = Math.max(0.001, this.viewDuration * 0.001);
+    const previewCoversView = Boolean(
+      waveformPreview &&
+      waveformPreview.startTime <= this.viewStart + previewTolerance &&
+      waveformPreview.startTime + waveformPreview.duration >=
+        this.viewStart + this.viewDuration - previewTolerance,
+    );
+
+    if (previewCoversView && waveformPreview) {
+      const previewLength = Math.min(waveformPreview.minimum.length, waveformPreview.maximum.length);
+      const previewStart = waveformPreview.startTime;
+      const previewDuration = Math.max(1e-9, waveformPreview.duration);
+      const physicalWaveWidth = Math.max(1, Math.round(plotWidth * scaleX));
+      const physicalMid = physicalHeight / 2;
+      const physicalHalfHeight = physicalHeight / 2;
+      context.save();
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.imageSmoothingEnabled = false;
+      context.globalAlpha = 1;
+      context.fillStyle = this.signalColor;
+      for (let pixel = 0; pixel < physicalWaveWidth; pixel += 1) {
+        const time = this.viewStart + (pixel + 0.5) / physicalWaveWidth * this.viewDuration;
+        const previewIndex = Math.max(0, Math.min(
+          previewLength - 1,
+          Math.floor((time - previewStart) / previewDuration * previewLength),
+        ));
+        if (previewIndex < 0 || previewLength === 0) continue;
+        const low = waveformPreview.minimum[previewIndex];
+        const high = waveformPreview.maximum[previewIndex];
+        const top = Math.max(0, Math.min(
+          physicalHeight - 1,
+          Math.round(physicalMid - high * physicalHalfHeight),
+        ));
+        const bottom = Math.max(top, Math.min(
+          physicalHeight - 1,
+          Math.round(physicalMid - low * physicalHalfHeight),
+        ));
+        context.fillRect(pixel, top, 1, Math.max(1, bottom - top + 1));
+      }
+      context.restore();
+    } else if (this.peaks && this.samples) {
       const physicalWidth = Math.max(1, Math.round(plotWidth * scaleX));
       const physicalMid = physicalHeight / 2;
       const physicalHalfHeight = physicalHeight / 2;
@@ -984,10 +1174,11 @@ export class AudioVisualizer {
       context.fillStyle = this.signalColor;
       for (let pixel = 0; pixel < physicalWidth; pixel += 1) {
         const from = sampleStart + pixel * samplesPerPhysicalPixel;
-        if (from >= this.availableSamples) continue;
+        const to = from + samplesPerPhysicalPixel;
+        if (!this.peaks.intersects(from, to)) continue;
         const [min, max] = this.peaks.range(
           from,
-          Math.min(this.availableSamples, from + samplesPerPhysicalPixel),
+          to,
         );
         const top = Math.max(0, Math.min(physicalHeight - 1, Math.round(physicalMid - max * physicalHalfHeight)));
         const bottom = Math.max(top, Math.min(physicalHeight - 1, Math.round(physicalMid - min * physicalHalfHeight)));
@@ -1001,7 +1192,7 @@ export class AudioVisualizer {
     context.fillStyle = light ? '#68747d' : '#74818d';
     context.font = '600 9px Inter, ui-sans-serif, system-ui, sans-serif';
     context.textAlign = 'left';
-    context.fillText('L+R', 9, 14);
+    context.fillText(this.waveformLabel, 9, 14);
   }
 
   private drawSpectrogram(
@@ -1030,10 +1221,14 @@ export class AudioVisualizer {
       const minNormalized = minFrequency / maxFrequency;
       const rowMap = new Int32Array(pixelHeight);
       const columnMap = new Int32Array(pixelWidth);
-      const availableTime = this.availableSamples / this.sampleRate;
       const isCqt = this.spectrogram.mode === 'cqt';
       const cqtFmin = this.spectrogram.cqtFmin ?? 32.703;
       const cqtBinsPerOctave = this.spectrogram.cqtBinsPerOctave ?? 24;
+      const [coverageStart, coverageEnd] = spectrogramCoverageBounds(
+        startTime,
+        this.spectrogram.endTime,
+        secondsPerColumn,
+      );
 
       for (let y = 0; y < pixelHeight; y += 1) {
         const scaled = 1 - y / Math.max(1, pixelHeight - 1);
@@ -1055,7 +1250,7 @@ export class AudioVisualizer {
 
       for (let x = 0; x < pixelWidth; x += 1) {
         const time = this.viewStart + (x / Math.max(1, pixelWidth - 1)) * this.viewDuration;
-        if (isStreaming && time > availableTime) {
+        if (time < coverageStart || time > coverageEnd) {
           columnMap[x] = -1;
           continue;
         }
@@ -1587,7 +1782,8 @@ export class AudioVisualizer {
   }
 
   private computeRealtimeSpectrum(): Float32Array | null {
-    if (!this.samples || this.availableSamples <= 0 || this.cursorTime < 0 || this.cursorTime > this.duration) {
+    if (!this.samples || !this.peaks || this.cursorTime < 0 || this.cursorTime > this.duration) {
+      this.spectrumCanvas.dataset.analysisState = 'no-audio';
       return null;
     }
     this.prepareRealtimeFft();
@@ -1595,12 +1791,40 @@ export class AudioVisualizer {
     const frameSize = fft.size;
     const center = Math.round(this.cursorTime * this.sampleRate);
     const start = center - Math.floor(frameSize / 2);
-    if (center >= this.availableSamples + frameSize / 2) return null;
+    if (!this.peaks.contains(start, start + frameSize)) {
+      this.spectrumCanvas.dataset.analysisState = 'unavailable';
+      return null;
+    }
 
-    for (let index = 0; index < frameSize; index += 1) {
-      const source = start + index;
-      const sample = source >= 0 && source < this.availableSamples ? this.samples[source] : 0;
-      this.realtimeInput[index] = sample * this.realtimeWindow[index];
+    const channelBuffer = this.spectrumChannelSource;
+    const weights = this.spectrumChannelWeights;
+    const channelCount = Math.min(channelBuffer?.numberOfChannels ?? 0, weights?.length ?? 0);
+    // Firefox may replace previously returned getChannelData() views when an
+    // AudioBufferSourceNode acquires the buffer for playback. Reacquiring the
+    // zero-copy views here keeps the analyzer valid across play/seek/restart.
+    const channels = channelBuffer && channelCount > 0
+      ? Array.from({ length: channelCount }, (_, channel) => channelBuffer.getChannelData(channel))
+      : null;
+    this.spectrumCanvas.dataset.analysisState = 'ready';
+    this.spectrumCanvas.dataset.analysisSource = channelCount > 0 ? `${channelCount}-channel-mix` : 'mono';
+    this.spectrumCanvas.dataset.analysisCursorTime = this.cursorTime.toFixed(6);
+    if (channels && weights && channelCount > 0) {
+      for (let index = 0; index < frameSize; index += 1) {
+        const source = start + index;
+        let sample = 0;
+        if (source >= 0 && source < this.samples.length) {
+          for (let channel = 0; channel < channelCount; channel += 1) {
+            sample += (channels[channel][source] ?? 0) * weights[channel];
+          }
+        }
+        this.realtimeInput[index] = sample * this.realtimeWindow[index];
+      }
+    } else {
+      for (let index = 0; index < frameSize; index += 1) {
+        const source = start + index;
+        const sample = source >= 0 && source < this.samples.length ? this.samples[source] : 0;
+        this.realtimeInput[index] = sample * this.realtimeWindow[index];
+      }
     }
     fft.realTransform(this.realtimeComplex, this.realtimeInput);
     if (this.realtimeCqtPlan) {

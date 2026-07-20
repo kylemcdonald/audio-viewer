@@ -6,7 +6,10 @@ const RANGE_EPSILON = 0.0005;
 export class AudioEngine {
   private context: AudioContext | null = null;
   private source: AudioBufferSourceNode | null = null;
+  private sourceSplitter: ChannelSplitterNode | null = null;
+  private sourceMixGains: GainNode[] = [];
   private gain: GainNode | null = null;
+  private channelMixWeights: number[] | null = null;
   private media: HTMLAudioElement | null = null;
   private mediaUrl: string | null = null;
   private mediaDuration = 0;
@@ -46,6 +49,29 @@ export class AudioEngine {
 
   setBuffer(buffer: AudioBuffer): void {
     this.replaceBuffer(buffer, false, buffer.duration);
+  }
+
+  /**
+   * Installs a discrete channel-to-mono matrix for AudioBuffer playback.
+   * Existing playback gain nodes update in place, so steering a virtual
+   * microphone does not restart or move the playhead.
+   */
+  setChannelMix(weights: readonly number[] | null): void {
+    this.channelMixWeights = weights ? [...weights] : null;
+    const source = this.source;
+    const buffer = this.buffer;
+    if (!source || !buffer) return;
+
+    if (this.sourceMixGains.length === (weights?.length ?? -1)) {
+      const now = this.context?.currentTime ?? 0;
+      for (let channel = 0; channel < this.sourceMixGains.length; channel += 1) {
+        const parameter = this.sourceMixGains[channel].gain;
+        parameter.cancelScheduledValues(now);
+        parameter.setTargetAtTime(weights?.[channel] ?? 0, now, 0.008);
+      }
+      return;
+    }
+    this.connectBufferSource(source, buffer.numberOfChannels);
   }
 
   /**
@@ -156,6 +182,7 @@ export class AudioEngine {
     this.availableBufferDuration = 0;
     this.waitingForBuffer = false;
     this.activePlaybackRange = null;
+    this.channelMixWeights = null;
     this.stopMediaRangeMonitor();
   }
 
@@ -321,7 +348,7 @@ export class AudioEngine {
     const duration = playableEnd - startOffset;
     const sourceEnd = Math.min(buffer.duration, startOffset + duration);
     source.buffer = buffer;
-    source.connect(this.gain!);
+    this.connectBufferSource(source, buffer.numberOfChannels);
     source.onended = () => {
       if (this.source !== source) return;
       this.source = null;
@@ -330,6 +357,7 @@ export class AudioEngine {
       this.offset = sourceEnd;
       this.sourceEndOffset = sourceEnd;
       source.disconnect();
+      this.disconnectSourceMix();
       if (this.offset >= this.bufferPlaybackEnd - RANGE_EPSILON) {
         this.finishBufferPlayback();
       } else if (this.offset < this.availableBufferPlaybackEnd) {
@@ -416,7 +444,40 @@ export class AudioEngine {
       // The source may already have completed naturally.
     }
     source.disconnect();
+    this.disconnectSourceMix();
     this.sourceEndOffset = this.offset;
+  }
+
+  private connectBufferSource(source: AudioBufferSourceNode, channels: number): void {
+    source.disconnect();
+    this.disconnectSourceMix();
+    const weights = this.channelMixWeights;
+    if (!weights || weights.length !== channels || channels < 1) {
+      source.connect(this.gain!);
+      return;
+    }
+
+    const context = this.getContext();
+    const splitter = context.createChannelSplitter(channels);
+    splitter.channelInterpretation = 'discrete';
+    const gains: GainNode[] = [];
+    source.connect(splitter);
+    for (let channel = 0; channel < channels; channel += 1) {
+      const channelGain = context.createGain();
+      channelGain.gain.value = weights[channel];
+      splitter.connect(channelGain, channel, 0);
+      channelGain.connect(this.gain!);
+      gains.push(channelGain);
+    }
+    this.sourceSplitter = splitter;
+    this.sourceMixGains = gains;
+  }
+
+  private disconnectSourceMix(): void {
+    this.sourceSplitter?.disconnect();
+    this.sourceSplitter = null;
+    for (const gain of this.sourceMixGains) gain.disconnect();
+    this.sourceMixGains = [];
   }
 
   private clearMedia(): void {

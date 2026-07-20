@@ -33,6 +33,15 @@ export type AnalysisAppend = {
   type: 'append';
   startSample: number;
   samples: ArrayBuffer;
+  /** The overlap contains the same source values and cannot stale cached frames. */
+  preserveCachedFrames?: boolean;
+  /** Finalizes unwritten stream gaps as silence and makes end-padded frames available. */
+  complete?: boolean;
+};
+
+export type AnalysisCancel = {
+  type: 'cancel';
+  id: number;
 };
 
 export type AnalysisRequest = {
@@ -78,5 +87,20 @@ export type AnalysisFailure = {
   message: string;
 };
 
-export type AnalysisInput = AnalysisInitialize | AnalysisStreamInitialize | AnalysisAppend | AnalysisRequest;
-export type AnalysisMessage = AnalysisBackend | AnalysisProgress | AnalysisPartial | AnalysisFailure;
+export type AnalysisUnavailable = {
+  type: 'unavailable';
+  id: number;
+};
+
+export type AnalysisInput =
+  | AnalysisInitialize
+  | AnalysisStreamInitialize
+  | AnalysisAppend
+  | AnalysisCancel
+  | AnalysisRequest;
+export type AnalysisMessage =
+  | AnalysisBackend
+  | AnalysisProgress
+  | AnalysisPartial
+  | AnalysisFailure
+  | AnalysisUnavailable;

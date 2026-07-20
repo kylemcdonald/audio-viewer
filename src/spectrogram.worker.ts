@@ -10,6 +10,13 @@ import {
   CQT_COLUMN_SHADER,
   type CqtPlan,
 } from './cqt';
+import {
+  createAlignedSpectrogramTicks,
+  MAX_FFT_SPECTROGRAM_ROWS,
+  MINIMUM_SPECTROGRAM_STEP_MS,
+  selectSpectrogramStepMs,
+  spectrogramCacheFrameCapacity,
+} from './spectrogram-cache';
 
 const worker = self as unknown as DedicatedWorkerGlobalScope;
 const WORKGROUP_SIZE = 256;
@@ -17,20 +24,21 @@ const MAX_COMPLEX_VALUES_PER_BATCH = 1_048_576;
 // CQT segments are up to 8x longer than FFT frames; a larger batch budget
 // keeps the frames-per-batch count (and per-batch overhead) comparable.
 const MAX_CQT_COMPLEX_VALUES_PER_BATCH = 4_194_304;
-const MAX_CACHE_VALUES = 32_000_000;
 const DB_QUANTIZATION = 10;
 const FLOOR_DB = -200;
 const INITIAL_COLUMN_TARGET = 64;
-const MINIMUM_TEMPORAL_STEP_MS = 1;
 
 let audioSamples: Float32Array | null = null;
 let audioSampleRate = 48000;
 let audioAvailableSamples = 0;
 let audioComplete = true;
+let audioWrittenRanges: Array<readonly [start: number, end: number]> = [];
 let latestJobId = -1;
+let latestAnalysisRequest: AnalysisRequest | null = null;
 let gpuContextPromise: Promise<GpuContext> | null = null;
-let cachedFftSize = 0;
+let cachedAnalysisKey = '';
 let cachedRows = 0;
+let cachedSegmentSize = 0;
 let maximumCachedFrames = 1;
 let frameCacheGeneration = 0;
 const frameCache = new Map<number, Int16Array>();
@@ -72,19 +80,28 @@ type FrameComputer = (
 worker.onmessage = (event: MessageEvent<AnalysisInput>) => {
   if (event.data.type === 'initialize') {
     latestJobId = -1;
+    latestAnalysisRequest = null;
     audioSamples = new Float32Array(event.data.samples);
     audioSampleRate = event.data.sampleRate;
     audioAvailableSamples = audioSamples.length;
     audioComplete = true;
+    audioWrittenRanges = audioSamples.length > 0 ? [[0, audioSamples.length]] : [];
     clearFrameCache();
     return;
   }
   if (event.data.type === 'initialize-stream') {
     latestJobId = -1;
-    audioSamples = new Float32Array(event.data.sampleLength);
+    latestAnalysisRequest = null;
+    // Direction changes retain this worker so its WebGPU context stays warm.
+    // Reuse the large backing array when the source length is unchanged; the
+    // written-range map prevents stale samples from participating in a frame.
+    if (!audioSamples || audioSamples.length !== event.data.sampleLength) {
+      audioSamples = new Float32Array(event.data.sampleLength);
+    }
     audioSampleRate = event.data.sampleRate;
     audioAvailableSamples = 0;
     audioComplete = audioSamples.length === 0;
+    audioWrittenRanges = [];
     clearFrameCache();
     return;
   }
@@ -93,35 +110,111 @@ worker.onmessage = (event: MessageEvent<AnalysisInput>) => {
     const incoming = new Float32Array(event.data.samples);
     const start = Math.max(0, Math.min(audioSamples.length, event.data.startSample));
     const count = Math.min(incoming.length, audioSamples.length - start);
+    const previousAvailableSamples = audioAvailableSamples;
     audioSamples.set(incoming.subarray(0, count), start);
-    audioAvailableSamples = Math.max(audioAvailableSamples, start + count);
-    audioComplete = audioAvailableSamples >= audioSamples.length;
+    if (count > 0) addAudioWrittenRange(start, start + count);
+    if (event.data.complete) {
+      audioAvailableSamples = audioSamples.length;
+      audioComplete = true;
+      audioWrittenRanges = audioSamples.length > 0 ? [[0, audioSamples.length]] : [];
+    } else {
+      audioAvailableSamples = contiguousAudioEnd();
+      audioComplete = audioAvailableSamples >= audioSamples.length;
+    }
+
+    // Sequential appends begin at the previous frontier and cannot change a
+    // cached frame: incomplete streams only analyze windows ending before
+    // that frontier. An overlapping append is a correction, though, and can
+    // otherwise leave both cached and in-flight columns stale.
+    if (count > 0 && start < previousAvailableSamples && !event.data.preserveCachedFrames) {
+      invalidateFramesOverlappingSamples(start, start + count);
+      const request = latestAnalysisRequest;
+      if (request?.id === latestJobId) void analyzeViewport(request);
+    }
+    return;
+  }
+  if (event.data.type === 'cancel') {
+    latestJobId = event.data.id;
+    latestAnalysisRequest = null;
     return;
   }
   latestJobId = event.data.id;
+  latestAnalysisRequest = event.data;
   void analyzeViewport(event.data);
 };
 
+function addAudioWrittenRange(start: number, end: number): void {
+  if (end <= start) return;
+  let first = 0;
+  let last = audioWrittenRanges.length;
+  while (first < last) {
+    const middle = (first + last) >>> 1;
+    if (audioWrittenRanges[middle][1] < start) first = middle + 1;
+    else last = middle;
+  }
+  let mergedStart = start;
+  let mergedEnd = end;
+  let replaceEnd = first;
+  while (
+    replaceEnd < audioWrittenRanges.length &&
+    audioWrittenRanges[replaceEnd][0] <= mergedEnd
+  ) {
+    mergedStart = Math.min(mergedStart, audioWrittenRanges[replaceEnd][0]);
+    mergedEnd = Math.max(mergedEnd, audioWrittenRanges[replaceEnd][1]);
+    replaceEnd += 1;
+  }
+  audioWrittenRanges.splice(
+    first,
+    replaceEnd - first,
+    [mergedStart, mergedEnd],
+  );
+}
+
+function contiguousAudioEnd(): number {
+  let end = 0;
+  for (const range of audioWrittenRanges) {
+    if (range[0] > end) break;
+    end = Math.max(end, range[1]);
+  }
+  return end;
+}
+
+function postUnavailable(id: number): void {
+  if (id === latestJobId) worker.postMessage({ type: 'unavailable', id });
+}
+
 async function analyzeViewport(request: AnalysisRequest): Promise<void> {
-  if (!audioSamples) return;
+  if (!audioSamples) {
+    postUnavailable(request.id);
+    return;
+  }
   const mode: AnalysisMode = request.analysisMode === 'cqt' ? 'cqt' : 'fft';
   const cqtPlan = mode === 'cqt' ? getCqtPlan(audioSampleRate, request.fftSize) : null;
   // The analysis segment per column: the FFT frame, or the (longer) CQT one.
   const segmentSize = cqtPlan ? cqtPlan.L : request.fftSize;
   // FFT rows follow the transform size so higher resolution settings reach
   // the image (previously capped at 1024, which max-pooled away all bin
-  // detail beyond the 1,024-bin setting). Larger frames shrink the LRU
-  // cache's column count correspondingly (MAX_CACHE_VALUES is unchanged).
+  // detail beyond the 1,024-bin setting). Larger frames shrink the shared
+  // value-budgeted LRU's column capacity correspondingly.
   const layout: AnalysisLayout = cqtPlan
     ? { bins: cqtPlan.nBands, rows: cqtPlan.nBands }
-    : { bins: request.fftSize / 2, rows: Math.min(request.fftSize / 2, 8192) };
-  // Negative key namespaces CQT cache entries away from FFT sizes.
-  const cacheGeneration = prepareFrameCache(cqtPlan ? -cqtPlan.L : request.fftSize, layout.rows);
+    : {
+      bins: request.fftSize / 2,
+      rows: Math.min(request.fftSize / 2, MAX_FFT_SPECTROGRAM_ROWS),
+    };
+  const analysisKey = cqtPlan
+    ? `cqt:${audioSampleRate}:${cqtPlan.L}:${cqtPlan.binsPerOctave}:${cqtPlan.fMin}:${layout.rows}`
+    : `fft:${audioSampleRate}:${request.fftSize}:${layout.rows}`;
+  const cacheGeneration = prepareFrameCache(analysisKey, layout.rows, segmentSize);
   const plan = createAnalysisPlan(request, segmentSize);
-  if (plan.targetTicks.length === 0) return;
+  if (plan.targetTicks.length === 0) {
+    postUnavailable(request.id);
+    return;
+  }
   const fullyCached = plan.targetTicks.every((tick) => frameCache.has(tick));
 
   if (fullyCached) {
+    touchCachedFrames(plan.targetTicks);
     postViewport(request, layout, plan, plan.targetStepMs, 0, true, 0, plan.targetTicks.length, cqtPlan);
     await yieldToWorker();
     if (request.id !== latestJobId) return;
@@ -185,17 +278,18 @@ async function analyzeViewport(request: AnalysisRequest): Promise<void> {
 }
 
 function createAnalysisPlan(request: AnalysisRequest, segmentSize: number): AnalysisPlan {
-  const minimumStepMs = Math.max(
-    MINIMUM_TEMPORAL_STEP_MS,
-    Math.round(request.minimumSecondsPerColumn * 1000),
+  const targetStepMs = selectSpectrogramStepMs(
+    request.startTime,
+    request.viewDuration,
+    request.columns,
+    request.minimumSecondsPerColumn,
+    maximumCachedFrames,
   );
-  const desiredStepMs = Math.max(
-    minimumStepMs,
-    (request.viewDuration * 1000) / Math.max(1, Math.round(request.columns)),
-  );
-  const exponent = Math.max(0, Math.floor(Math.log2(desiredStepMs / minimumStepMs)));
-  const targetStepMs = minimumStepMs * 2 ** exponent;
-  const targetTicks = createAlignedTicks(request.startTime, request.viewDuration, targetStepMs)
+  const targetTicks = createAlignedSpectrogramTicks(
+    request.startTime,
+    request.viewDuration,
+    targetStepMs,
+  )
     .filter((tick) => isFrameAvailable(tick, segmentSize));
   const stages: number[] = [];
   if (request.intermediateResults) {
@@ -226,7 +320,11 @@ async function computeCachedViewport(
       if (request.id !== latestJobId) return;
       touchCachedFrames(plan.targetTicks);
       const stageStepMs = plan.stages[level];
-      const stageTicks = createAlignedTicks(request.startTime, request.viewDuration, stageStepMs)
+      const stageTicks = createAlignedSpectrogramTicks(
+        request.startTime,
+        request.viewDuration,
+        stageStepMs,
+      )
         .filter((tick) => isFrameAvailable(tick, segmentSize));
       const missingTicks = stageTicks.filter((tick) => !frameCache.has(tick));
       const reusedColumns = countCachedFrames(plan.targetTicks);
@@ -287,9 +385,13 @@ async function prefetchFinerLevels(
   segmentSize: number,
   compute: FrameComputer,
 ): Promise<void> {
-  for (let stepMs = targetStepMs / 2; stepMs >= MINIMUM_TEMPORAL_STEP_MS; stepMs /= 2) {
+  for (
+    let stepMs = targetStepMs / 2;
+    stepMs >= MINIMUM_SPECTROGRAM_STEP_MS;
+    stepMs /= 2
+  ) {
     if (request.id !== latestJobId) return;
-    const ticks = createAlignedTicks(request.startTime, request.viewDuration, stepMs)
+    const ticks = createAlignedSpectrogramTicks(request.startTime, request.viewDuration, stepMs)
       .filter((tick) => isFrameAvailable(tick, segmentSize));
     if (ticks.length > maximumCachedFrames) return;
     touchCachedFrames(ticks);
@@ -393,17 +495,14 @@ function assembleViewport(
   return values;
 }
 
-function createAlignedTicks(startTime: number, viewDuration: number, stepMs: number): number[] {
-  const firstTick = Math.floor(Math.max(0, startTime * 1000) / stepMs) * stepMs;
-  const lastTick = Math.ceil(Math.max(0, (startTime + viewDuration) * 1000) / stepMs) * stepMs;
-  const count = Math.max(1, Math.round((lastTick - firstTick) / stepMs) + 1);
-  return Array.from({ length: count }, (_, index) => firstTick + index * stepMs);
-}
-
 function isFrameAvailable(tick: number, segmentSize: number): boolean {
   if (audioComplete) return true;
   const centerSample = Math.round((tick / 1000) * audioSampleRate);
-  return centerSample + segmentSize / 2 <= audioAvailableSamples;
+  const rawStart = Math.floor(centerSample - segmentSize / 2);
+  const frameStart = Math.max(0, rawStart);
+  const frameEnd = Math.min(audioSamples?.length ?? 0, Math.ceil(rawStart + segmentSize));
+  if (frameEnd <= frameStart) return true;
+  return audioWrittenRanges.some((range) => range[0] <= frameStart && range[1] >= frameEnd);
 }
 
 function createFrameStarts(ticks: readonly number[], sampleRate: number, fftSize: number): Int32Array {
@@ -430,22 +529,39 @@ function packFrameSamples(ticks: readonly number[], fftSize: number): Float32Arr
   return packed;
 }
 
-function prepareFrameCache(fftSize: number, rows: number): number {
-  if (cachedFftSize !== fftSize || cachedRows !== rows) {
+function prepareFrameCache(analysisKey: string, rows: number, segmentSize: number): number {
+  if (cachedAnalysisKey !== analysisKey || cachedRows !== rows) {
     clearFrameCache();
-    cachedFftSize = fftSize;
+    cachedAnalysisKey = analysisKey;
     cachedRows = rows;
+    cachedSegmentSize = segmentSize;
   }
-  maximumCachedFrames = Math.max(1, Math.floor(MAX_CACHE_VALUES / rows));
+  maximumCachedFrames = spectrogramCacheFrameCapacity(rows);
   return frameCacheGeneration;
 }
 
 function clearFrameCache(): void {
   frameCache.clear();
-  cachedFftSize = 0;
+  cachedAnalysisKey = '';
   cachedRows = 0;
+  cachedSegmentSize = 0;
   maximumCachedFrames = 1;
   frameCacheGeneration += 1;
+}
+
+function invalidateFramesOverlappingSamples(startSample: number, endSample: number): void {
+  // Invalidate outstanding CPU/GPU batches even when none of their frames
+  // have reached the map yet.
+  frameCacheGeneration += 1;
+  if (cachedSegmentSize <= 0 || endSample <= startSample) return;
+
+  const halfWindow = cachedSegmentSize / 2;
+  for (const tick of frameCache.keys()) {
+    const centerSample = Math.round((tick / 1000) * audioSampleRate);
+    const frameStart = centerSample - halfWindow;
+    const frameEnd = frameStart + cachedSegmentSize;
+    if (frameStart < endSample && frameEnd > startSample) frameCache.delete(tick);
+  }
 }
 
 function cacheFrame(tick: number, frame: Int16Array, generation: number): boolean {

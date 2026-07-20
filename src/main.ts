@@ -1,9 +1,45 @@
 import './style.css';
 import { AudioEngine } from './audio-engine';
-import { cqtBinsPerOctave, cqtSegmentSize } from './cqt';
+import {
+  clampElevation,
+  fourChannelMixWeights,
+  inferAmbisonicInputFormat,
+  mixChannelData,
+  type AmbisonicInputFormat,
+  type FourChannelWeights,
+  type MonoMixMode,
+} from './ambisonics';
+import type {
+  AmbisonicRemixInput,
+  AmbisonicRemixMessage,
+  RemixPriorityTier,
+  RemixSampleRange,
+} from './ambisonic-remix.types';
+import { prepareRemixRanges, progressiveRemixColumnCounts } from './ambisonic-remix';
+import { CQT_FMIN, cqtBandCount, cqtBinsPerOctave, cqtSegmentSize } from './cqt';
+import type {
+  DirectionalCompositionConfigure,
+  DirectionalCompositionDirection,
+  DirectionalCompositionResult,
+} from './directional-composition.types';
+import type {
+  DirectionalSpectralInput,
+  DirectionalSpectralMessage,
+  DirectionalWaveInput,
+  DirectionalWaveMessage,
+} from './directional-display.types';
 import { isPaletteName, type PaletteName } from './palettes';
+import {
+  availableSpectrogramEndTime,
+  createAlignedSpectrogramTicks,
+  decideSpectrogramCoverage,
+  MAX_FFT_SPECTROGRAM_ROWS,
+  selectSpectrogramStepMs,
+  spectrogramCacheFrameCapacity,
+} from './spectrogram-cache';
 import type {
   AnalysisAppend,
+  AnalysisCancel,
   AnalysisInitialize,
   AnalysisMessage,
   AnalysisMode,
@@ -78,6 +114,62 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 
     <aside class="settings-pane" id="settings-pane" aria-label="Settings" hidden>
       <div class="settings-controls">
+        <div class="ambisonic-mix-section" id="ambisonic-mix-section" hidden>
+          <div class="control-group ambisonic-mix-control">
+            <div class="control-heading">
+              <label for="mono-mix-select">Four-channel mono mix</label>
+              <output id="mono-mix-status" aria-live="polite"></output>
+            </div>
+            <div class="palette-select-row">
+              <select id="mono-mix-select" class="palette-select" aria-label="Four-channel mono mix">
+                <option value="sum" selected>Add channels (normalized)</option>
+                <option value="first">First channel only</option>
+                <option value="directional">Directional virtual microphone</option>
+              </select>
+            </div>
+          </div>
+          <div class="virtual-mic-controls" id="virtual-mic-controls" hidden>
+            <div class="control-group ambisonic-format-control">
+              <div class="control-heading">
+                <label for="ambisonic-format-select">Channel layout</label>
+              </div>
+              <div class="palette-select-row">
+                <select id="ambisonic-format-select" class="palette-select" aria-label="Ambisonic channel layout">
+                  <option value="ambix" selected>AmbiX B-format · W Y Z X</option>
+                  <option value="fuma">FuMa B-format · W X Y Z</option>
+                  <option value="a-format">Tetrahedral A-format · FLU FRD BLD BRU</option>
+                </select>
+              </div>
+              <p class="virtual-mic-help ambisonic-format-note" id="ambisonic-format-note" hidden>Uses an ideal scalar tetrahedral matrix. A manufacturer-calibrated A→B converter may be more accurate.</p>
+            </div>
+            <div class="control-group virtual-mic-direction-control">
+              <div class="control-heading">
+                <label id="virtual-mic-direction-label">Virtual microphone direction</label>
+                <output id="virtual-mic-direction-output">0° az · 0° el</output>
+              </div>
+              <div
+                class="virtual-mic-pad"
+                id="virtual-mic-pad"
+                role="slider"
+                aria-labelledby="virtual-mic-direction-label"
+                aria-valuemin="-180"
+                aria-valuemax="180"
+                aria-valuenow="0"
+                aria-valuetext="0 degrees azimuth, 0 degrees elevation"
+                tabindex="0"
+              >
+                <span class="virtual-mic-pad-equator" aria-hidden="true"></span>
+                <span class="virtual-mic-pad-meridian" aria-hidden="true"></span>
+                <span class="virtual-mic-dot" id="virtual-mic-dot" aria-hidden="true"></span>
+              </div>
+              <div class="virtual-mic-axis-labels" aria-hidden="true">
+                <span>−180°</span><span>0° FRONT</span><span>+180°</span>
+              </div>
+              <p class="virtual-mic-help">+90° azimuth points left; elevation runs +90° up to −90° down. Max-DI has a small rear lobe.</p>
+            </div>
+          </div>
+          <div class="settings-divider" aria-hidden="true"></div>
+        </div>
         <div class="control-group analysis-mode-control">
           <div class="control-heading">
             <label for="analysis-mode-select">Spectrogram analysis</label>
@@ -314,6 +406,15 @@ const playbackFollowSelect = get<HTMLSelectElement>('playback-follow-select');
 const outputFormatSelect = get<HTMLSelectElement>('output-format-select');
 const normalizeOutputToggle = get<HTMLInputElement>('normalize-output-toggle');
 const themeToggle = get<HTMLInputElement>('theme-toggle');
+const ambisonicMixSection = get<HTMLElement>('ambisonic-mix-section');
+const monoMixSelect = get<HTMLSelectElement>('mono-mix-select');
+const monoMixStatus = get<HTMLOutputElement>('mono-mix-status');
+const virtualMicControls = get<HTMLElement>('virtual-mic-controls');
+const ambisonicFormatSelect = get<HTMLSelectElement>('ambisonic-format-select');
+const ambisonicFormatNote = get<HTMLElement>('ambisonic-format-note');
+const virtualMicPad = get<HTMLElement>('virtual-mic-pad');
+const virtualMicDot = get<HTMLElement>('virtual-mic-dot');
+const virtualMicDirectionOutput = get<HTMLOutputElement>('virtual-mic-direction-output');
 const analysisOverlay = get<HTMLElement>('analysis-overlay');
 const analysisTitle = get<HTMLElement>('analysis-title');
 const analysisDetail = get<HTMLElement>('analysis-detail');
@@ -359,6 +460,12 @@ outputFormatSelect.value = isDownloadOutputFormat(persistedSettings?.downloadFor
   : 'auto';
 normalizeOutputToggle.checked = persistedSettings?.normalizeOutput === true;
 themeToggle.checked = isThemeMode(persistedSettings?.theme) && persistedSettings.theme === 'light';
+monoMixSelect.value = isMonoMixMode(persistedSettings?.monoMixMode)
+  ? persistedSettings.monoMixMode
+  : 'sum';
+ambisonicFormatSelect.value = isAmbisonicInputFormat(persistedSettings?.ambisonicFormat)
+  ? persistedSettings.ambisonicFormat
+  : 'ambix';
 
 let monoSamples: Float32Array | null = null;
 let audioSampleRate = 48000;
@@ -372,6 +479,7 @@ let lastViewportAnalysisAt = 0;
 let analysisViewStart = 0;
 let analysisViewDuration = 1;
 let latestSpectrogram: SpectrogramData | null = null;
+let latestSpectrogramComplete = false;
 let activeAnalysisRequest: AnalysisCoverage | null = null;
 let sourceFile: File | null = null;
 let sourceWavHeader: WavHeader | null = null;
@@ -406,6 +514,85 @@ let normalizeOutput = normalizeOutputToggle.checked;
 let themeMode: ThemeMode = themeToggle.checked ? 'light' : 'dark';
 let settingsPaneOpen = persistedSettings?.settingsPaneOpen === true;
 let lastPlaybackAnalysisCheck = 0;
+let sourceChannelCount = 0;
+let fourChannelMixSource: 'wav' | 'buffer' | null = null;
+let monoMixMode = monoMixSelect.value as MonoMixMode;
+let ambisonicInputFormat = ambisonicFormatSelect.value as AmbisonicInputFormat;
+let virtualMicAzimuth = clampNumber(persistedSettings?.virtualMicAzimuth, 0, -180, 180);
+let virtualMicElevation = clampElevation(clampNumber(persistedSettings?.virtualMicElevation, 0, -90, 90));
+let virtualMicPointer: number | null = null;
+let ambisonicRemixWorker: Worker | null = null;
+let ambisonicRemixId = 0;
+let ambisonicRemixActive = false;
+let ambisonicRemixTimer = 0;
+let lastAmbisonicRemixAt = 0;
+let ambisonicPriorityTimer = 0;
+let remixTierToken = 0;
+const remixTierColumns = new Map<number, number>();
+let remixAnalysisQueue: number[] = [];
+let remixAnalysisRequest: { id: number; columns: number } | null = null;
+let remixAnalysisFrame = 0;
+let decodedBufferRemixId = 0;
+let directionalWaveWorker: Worker | null = null;
+let directionalSpectralWorker: Worker | null = null;
+let directionalWaveReady = false;
+let directionalViewVersion = 0;
+let directionalWaveRequestId = 0;
+let directionalSpectralGeneration = 0;
+let directionalSpectralDirectionId = 0;
+let directionalSpectralRenderedDirectionId = 0;
+let directionalSpectralDirectionStartedAt = 0;
+let directionalDisplayQueued = false;
+let directionalViewportTimer = 0;
+let directionalSpectralTier = 0;
+let directionalSpectralTierTargets: number[] = [];
+let directionalSpectralDisplayCache: {
+  generation: number;
+  ticks: number[];
+  binsPerCell: number;
+  rows: number;
+  fftSize: number;
+  sampleRate: number;
+  duration: number;
+  mode: AnalysisMode;
+} | null = null;
+let directionalCompositionWorkers: Worker[] = [];
+let directionalCompositionActiveWorkers = 0;
+let directionalCompositionActiveId = 0;
+let directionalCompositionQueuedWeights: FourChannelWeights | null = null;
+let directionalCompositionPending: {
+  id: number;
+  generation: number;
+  values: Int16Array<ArrayBuffer>;
+  received: Uint8Array;
+} | null = null;
+let directionalSpectralViewport: {
+  generation: number;
+  startTime: number;
+  duration: number;
+  segmentSize: number;
+  fftSize: number;
+  rows: number;
+  mode: AnalysisMode;
+  sourceViewStart: number;
+  sourceViewDuration: number;
+} | null = null;
+let directionalSpectralPendingTier: {
+  generation: number;
+  tier: number;
+  segmentSize: number;
+  targetTicks: number[];
+  missingTicks: number[] | null;
+  cursor: number;
+  batch: number;
+  buffer: AudioBuffer;
+} | null = null;
+let directionalStreamingRefreshPending = false;
+const DIRECTIONAL_WAVE_BLOCK_SIZE = 64;
+const MAX_RAW_DIRECTIONAL_WAVE_SAMPLES = 262_144;
+const MAX_DIRECTIONAL_FFT_ROWS = 1024;
+const MAX_DIRECTIONAL_WAVE_BLOCKS = 524_288;
+const MAX_DIRECTIONAL_SPECTRAL_BATCH_VALUES = 2_097_152;
 
 document.documentElement.dataset.theme = themeMode;
 
@@ -430,6 +617,9 @@ const visualizer = new AudioVisualizer({
   onViewChange: (start, duration) => {
     analysisViewStart = start;
     analysisViewDuration = duration;
+    directionalViewVersion += 1;
+    scheduleDirectionalViewportPreparation(engine.isPlaying ? 90 : 0);
+    scheduleAmbisonicViewportPriority();
     scheduleViewportAnalysis(engine.isPlaying ? playbackAnalysisInterval() : 24);
   },
   onSelectionChange: (nextSelection) => {
@@ -467,6 +657,8 @@ settingsButton.addEventListener('click', () => {
 fftSlider.addEventListener('input', () => {
   updateFftControl();
   scheduleSettingsSave();
+  invalidateSpectrogramAnalysis();
+  prepareDirectionalSpectralViewportOnly(true);
   window.clearTimeout(fftDebounce);
   fftDebounce = window.setTimeout(() => analyzeCurrentAudio(), 220);
 });
@@ -476,6 +668,8 @@ analysisModeSelect.addEventListener('change', () => {
   updateSpectrumFftControl();
   visualizer.setAnalysisMode(analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft');
   scheduleSettingsSave();
+  invalidateSpectrogramAnalysis();
+  prepareDirectionalSpectralViewportOnly(true);
   analyzeCurrentAudio({ force: true });
 });
 
@@ -540,6 +734,68 @@ themeToggle.addEventListener('change', () => {
   themeMode = themeToggle.checked ? 'light' : 'dark';
   applyTheme();
   scheduleSettingsSave();
+});
+
+monoMixSelect.addEventListener('change', () => {
+  if (!isMonoMixMode(monoMixSelect.value)) return;
+  monoMixMode = monoMixSelect.value;
+  updateAmbisonicMixControls();
+  applyFourChannelMixWeights();
+  updateDirectionalDisplayMode();
+  scheduleSettingsSave();
+  scheduleAmbisonicRemix(true);
+});
+
+ambisonicFormatSelect.addEventListener('change', () => {
+  if (!isAmbisonicInputFormat(ambisonicFormatSelect.value)) return;
+  ambisonicInputFormat = ambisonicFormatSelect.value;
+  updateAmbisonicMixControls();
+  applyFourChannelMixWeights();
+  scheduleDirectionalDisplayUpdate();
+  scheduleSettingsSave();
+  scheduleAmbisonicRemix(true);
+});
+
+virtualMicPad.addEventListener('pointerdown', (event) => {
+  if (event.button > 0) return;
+  event.preventDefault();
+  virtualMicPointer = event.pointerId;
+  virtualMicPad.setPointerCapture(event.pointerId);
+  virtualMicPad.classList.add('is-dragging');
+  setVirtualMicDirectionFromPointer(event, false);
+});
+
+virtualMicPad.addEventListener('pointermove', (event) => {
+  if (virtualMicPointer !== event.pointerId) return;
+  event.preventDefault();
+  setVirtualMicDirectionFromPointer(event, false);
+});
+
+const finishVirtualMicDrag = (event: PointerEvent) => {
+  if (virtualMicPointer !== event.pointerId) return;
+  event.preventDefault();
+  virtualMicPointer = null;
+  virtualMicPad.classList.remove('is-dragging');
+  scheduleAmbisonicRemix(true);
+};
+
+virtualMicPad.addEventListener('pointerup', finishVirtualMicDrag);
+virtualMicPad.addEventListener('pointercancel', finishVirtualMicDrag);
+virtualMicPad.addEventListener('keydown', (event) => {
+  if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home'].includes(event.key)) return;
+  event.preventDefault();
+  if (event.key === 'Home') {
+    setVirtualMicDirection(0, 0, true);
+    return;
+  }
+  const step = event.shiftKey ? 1 : 5;
+  const azimuth = virtualMicAzimuth + (
+    event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0
+  );
+  const elevation = virtualMicElevation + (
+    event.key === 'ArrowUp' ? step : event.key === 'ArrowDown' ? -step : 0
+  );
+  setVirtualMicDirection(azimuth, elevation, true);
 });
 
 frequencyAxisControl.addEventListener('pointerdown', (event) => {
@@ -714,6 +970,8 @@ window.addEventListener('drop', (event) => {
 window.addEventListener('resize', () => {
   applyPanelRatio();
   applySpectrumAnalyzerLayout();
+  directionalViewVersion += 1;
+  scheduleDirectionalViewportPreparation(45);
   scheduleViewportAnalysis(90);
 });
 window.addEventListener('pagehide', persistSettings);
@@ -844,10 +1102,12 @@ async function loadFile(file: File): Promise<void> {
     activeMp4Session = null;
     sourceFile = null;
     sourceWavHeader = null;
+    clearFourChannelMixSource();
     engine.clear();
     analysisWorker?.terminate();
     analysisWorker = null;
     latestSpectrogram = null;
+    latestSpectrogramComplete = false;
     updateDownloadState();
     activeAnalysisRequest = null;
     visualizer.clearAudio();
@@ -864,12 +1124,14 @@ function prepareFileLoad(file: File): void {
   hasLoadedAudio = true;
   sourceFile = file;
   sourceWavHeader = null;
+  clearFourChannelMixSource();
   selection = null;
   updateSelectionDownloadState();
   availableAudioSamples = 0;
   audioDuration = 0;
   monoSamples = null;
   latestSpectrogram = null;
+  latestSpectrogramComplete = false;
   updateDownloadState();
   activeAnalysisRequest = null;
   activeMp4Session?.dispose();
@@ -896,11 +1158,13 @@ async function loadProgressiveWav(file: File, header: WavHeader, loadId: number)
   audioDuration = header.duration;
   availableAudioSamples = 0;
   setFileFormat(header.sampleRate, header.channels);
+  configureFourChannelMix(file, header.channels, header.ambisonicFormat ?? null, 'wav');
   totalTimeElement.textContent = formatClock(header.duration);
 
   monoSamples = new Float32Array(header.frameCount);
   visualizer.beginProgressiveAudio(monoSamples, header.sampleRate, header.duration);
   initializeStreamingAnalysisWorker(header.frameCount, header.sampleRate);
+  if (header.channels === 4) initializeDirectionalDisplay(header.frameCount, header.sampleRate);
   await nextPaint();
   if (loadId !== fileLoadId) return;
 
@@ -909,6 +1173,7 @@ async function loadProgressiveWav(file: File, header: WavHeader, loadId: number)
   // scheduled by AudioEngine, allowing users to play (or queue playback for)
   // the decoded prefix while the remainder streams in from disk.
   engine.setProgressiveBuffer(playbackBuffer);
+  installFourChannelSpectrumSource(playbackBuffer);
   updateTransportState();
   const chunkBytes = preferredWavChunkBytes(header);
   let processedBytes = 0;
@@ -923,10 +1188,17 @@ async function loadProgressiveWav(file: File, header: WavHeader, loadId: number)
     ).arrayBuffer();
     if (loadId !== fileLoadId) return;
 
-    const decoded = decodeWavChunk(encoded, header);
+    const decoded = decodeWavChunk(
+      encoded,
+      header,
+      header.channels === 4 ? currentFourChannelWeights() ?? undefined : undefined,
+    );
     monoSamples.set(decoded.mono, frameStart);
     for (let channel = 0; channel < decoded.channels.length; channel += 1) {
       playbackBuffer.copyToChannel(decoded.channels[channel], channel, frameStart);
+    }
+    if (decoded.channels.length === 4) {
+      appendDirectionalWaveSource(frameStart, decoded.channels);
     }
     visualizer.updateProgressiveAudio(frameStart, frameStart + decoded.frameCount);
     availableAudioSamples = frameStart + decoded.frameCount;
@@ -942,15 +1214,18 @@ async function loadProgressiveWav(file: File, header: WavHeader, loadId: number)
     processedBytes += decoded.frameCount * header.blockAlign;
     frameStart += decoded.frameCount;
     updateFileReadProgress(file, processedBytes / header.dataSize);
+    scheduleDirectionalViewportPreparation(frameStart === decoded.frameCount ? 0 : 90);
     scheduleViewportAnalysis(90);
   }
 
   if (loadId !== fileLoadId) return;
   availableAudioSamples = header.frameCount;
+  completeDirectionalWaveSource(header.frameCount);
   engine.completeProgressiveBuffer();
   isReadingFile = false;
   fileSizeElement.textContent = formatFileSize(file.size);
   updateTransportState();
+  scheduleDirectionalViewportPreparation(0, true);
   analyzeCurrentAudio({ stableUpdate: true, force: true });
 }
 
@@ -960,6 +1235,7 @@ async function loadProgressiveMp4(file: File, session: Mp4AudioSession, loadId: 
   audioDuration = session.duration;
   availableAudioSamples = 0;
   setFileFormat(session.sampleRate, session.channels);
+  configureFourChannelMix(file, session.channels, null, null);
   totalTimeElement.textContent = formatClock(session.duration);
 
   monoSamples = new Float32Array(session.frameCount);
@@ -1016,6 +1292,7 @@ async function loadProgressiveMp4(file: File, session: Mp4AudioSession, loadId: 
       type: 'append',
       startSample: session.frameCount,
       samples: new ArrayBuffer(0),
+      complete: true,
     };
     analysisWorker?.postMessage(complete, [complete.samples]);
     isReadingFile = false;
@@ -1050,12 +1327,18 @@ async function loadWithBrowserDecoder(file: File, loadId: number): Promise<void>
   const buffer = await engine.decode(encoded);
   if (loadId !== fileLoadId) return;
 
+  configureFourChannelMix(file, buffer.numberOfChannels, null, 'buffer');
   engine.setBuffer(buffer);
-  monoSamples = downmix(buffer);
+  engine.setChannelMix(buffer.numberOfChannels === 4 ? currentFourChannelWeights() : null);
+  monoSamples = downmix(
+    buffer,
+    buffer.numberOfChannels === 4 ? currentFourChannelWeights() ?? undefined : undefined,
+  );
   audioSampleRate = buffer.sampleRate;
   audioDuration = buffer.duration;
   availableAudioSamples = monoSamples.length;
   latestSpectrogram = null;
+  latestSpectrogramComplete = false;
   updateDownloadState();
   activeAnalysisRequest = null;
   visualizer.setSpectrogram(null);
@@ -1067,6 +1350,11 @@ async function loadWithBrowserDecoder(file: File, loadId: number): Promise<void>
   isReadingFile = false;
   fileSizeElement.textContent = formatFileSize(file.size);
   initializeAnalysisWorker();
+  if (buffer.numberOfChannels === 4) {
+    initializeDirectionalDisplay(buffer.length, buffer.sampleRate);
+    scheduleDirectionalViewportPreparation(0, true);
+    void preprocessDecodedDirectionalSource(buffer, loadId);
+  }
 }
 
 async function readFileWithProgress(file: File, loadId: number): Promise<ArrayBuffer> {
@@ -1132,17 +1420,44 @@ function initializeStreamingAnalysisWorker(sampleLength: number, sampleRate: num
   worker.postMessage(initialize);
 }
 
+function restartStreamingAnalysisWorker(sampleLength: number, sampleRate: number): void {
+  const worker = analysisWorker;
+  if (!worker) {
+    initializeStreamingAnalysisWorker(sampleLength, sampleRate);
+    return;
+  }
+
+  // Ignore any result from the previous mono direction immediately, while
+  // retaining the worker's initialized WebGPU device and CQT plans.
+  analysisId += 1;
+  activeAnalysisRequest = null;
+  const initialize: AnalysisStreamInitialize = {
+    type: 'initialize-stream',
+    sampleLength,
+    sampleRate,
+  };
+  worker.postMessage(initialize);
+}
+
 function resetAnalysisWorker(): Worker {
   analysisWorker?.terminate();
   analysisId += 1;
   activeAnalysisRequest = null;
-  analysisWorker = new Worker(new URL('./spectrogram.worker.ts', import.meta.url), { type: 'module' });
-  analysisWorker.onmessage = handleAnalysisMessage;
-  analysisWorker.onerror = () => {
+  const worker = new Worker(new URL('./spectrogram.worker.ts', import.meta.url), { type: 'module' });
+  analysisWorker = worker;
+  worker.onmessage = (event) => {
+    if (analysisWorker === worker) handleAnalysisMessage(event);
+  };
+  worker.onerror = () => {
+    if (analysisWorker !== worker) return;
+    analysisId += 1;
+    activeAnalysisRequest = null;
+    analysisWorker = null;
+    worker.terminate();
     hideAnalysisOverlay();
     showToast('The spectral analysis worker stopped unexpectedly.');
   };
-  return analysisWorker;
+  return worker;
 }
 
 function scheduleViewportAnalysis(interval = 24): void {
@@ -1165,47 +1480,101 @@ function playbackAnalysisInterval(): number {
   return Math.max(16, Math.min(120, analysisViewDuration * 250));
 }
 
-function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean } = {}): void {
-  if (!analysisWorker || audioDuration <= 0) return;
+function cancelSpectrogramAnalysis(): void {
+  activeAnalysisRequest = null;
+  if (!analysisWorker) return;
+  analysisId += 1;
+  const cancel: AnalysisCancel = { type: 'cancel', id: analysisId };
+  analysisWorker.postMessage(cancel);
+  hideAnalysisOverlay();
+}
+
+function invalidateSpectrogramAnalysis(): void {
+  const preserveVisibleSpectrogram = directionalDisplayOwnsSpectrogram();
+  cancelSpectrogramAnalysis();
+  latestSpectrogram = null;
+  latestSpectrogramComplete = false;
+  if (!preserveVisibleSpectrogram) visualizer.setSpectrogram(null);
+  updateDownloadState();
+}
+
+function analyzeCurrentAudio(options: {
+  stableUpdate?: boolean;
+  force?: boolean;
+  columns?: number;
+  visibleOnly?: boolean;
+  suppressOverlay?: boolean;
+} = {}): number | null {
+  if (!analysisWorker || audioDuration <= 0) return null;
+  if (directionalDisplayOwnsSpectrogram()) return null;
+  if (!options.force && (remixAnalysisRequest || remixAnalysisQueue.length > 0)) return null;
   window.clearTimeout(fftDebounce);
   window.clearTimeout(viewportAnalysisTimer);
   viewportAnalysisTimer = 0;
   const bins = fftBins[Number(fftSlider.value)];
   const fftSize = bins * 2;
   const analysisMode: AnalysisMode = analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft';
-  const visibleColumns = visualizer.analysisColumnCount;
+  const visibleColumns = options.columns ?? visualizer.analysisColumnCount;
   const viewDuration = Math.max(0.001, analysisViewDuration);
   let requestStart = analysisViewStart;
   let requestEnd = analysisViewStart + viewDuration;
   let requiredEnd = requestEnd;
 
-  if (isReadingFile) {
-    const safeEnd = Math.max(0, (availableAudioSamples - fftSize / 2) / audioSampleRate);
+  if (isReadingFile && !(options.visibleOnly && ambisonicRemixActive)) {
+    const segmentSize = analysisMode === 'cqt' ? cqtSegmentSize(fftSize) : fftSize;
+    const safeEnd = availableSpectrogramEndTime(
+      availableAudioSamples,
+      audioSampleRate,
+      segmentSize,
+    );
     requestEnd = Math.min(requestEnd, safeEnd);
     requiredEnd = requestEnd;
-  } else if (engine.isPlaying) {
+  } else if (engine.isPlaying && !options.visibleOnly) {
     const requestedScreens = playbackFollowMode === 'page' ? 3 : 2;
     const requiredScreens = playbackFollowMode === 'page' ? 2.75 : 1.55;
     requestEnd = Math.min(audioDuration, requestStart + viewDuration * requestedScreens);
     requiredEnd = Math.min(audioDuration, requestStart + viewDuration * requiredScreens);
   }
 
-  if (requestEnd <= requestStart) return;
+  if (requestEnd <= requestStart) return null;
   const requestDuration = requestEnd - requestStart;
   const requestColumns = Math.max(1, Math.round(visibleColumns * (requestDuration / viewDuration)));
-  const secondsPerColumn = analysisTargetStep(requestDuration, requestColumns);
+  const secondsPerColumn = analysisTargetStep(
+    requestStart,
+    requestDuration,
+    requestColumns,
+    fftSize,
+    analysisMode,
+  );
 
-  if (!options.force && (
-    coverageIncludes(latestSpectrogram, requestStart, requiredEnd, fftSize, secondsPerColumn, analysisMode) ||
-    coverageIncludes(activeAnalysisRequest, requestStart, requiredEnd, fftSize, secondsPerColumn, analysisMode)
-  )) return;
+  if (!options.force) {
+    const coverageDecision = decideSpectrogramCoverage(
+      latestSpectrogram,
+      latestSpectrogramComplete,
+      activeAnalysisRequest,
+      {
+        fftSize,
+        mode: analysisMode,
+        startTime: requestStart,
+        endTime: requiredEnd,
+        secondsPerColumn,
+      },
+    );
+    if (coverageDecision === 'reuse-latest-and-cancel-active') {
+      // A pan can return to the last completed view while a request for the
+      // abandoned view is still running. Ignore/cancel that request so its
+      // eventual result cannot overwrite the valid map now on screen.
+      cancelSpectrogramAnalysis();
+      return null;
+    }
+    if (coverageDecision !== 'request') return null;
+  }
 
   lastViewportAnalysisAt = performance.now();
   analysisId += 1;
-  if (!isReadingFile && !engine.isPlaying) {
-    beginDelayedOverlay('Preparing spectral map', 'Computing visible columns…');
-    analysisProgress.style.width = '2%';
-  }
+  // Analysis is deliberately non-modal. The previous pixels remain visible
+  // until an intermediate or completed replacement is ready.
+  if (!isReadingFile && !engine.isPlaying && !options.suppressOverlay) analysisProgress.style.width = '2%';
 
   const request: AnalysisRequest = {
     type: 'analyze',
@@ -1216,7 +1585,7 @@ function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean 
     viewDuration: requestDuration,
     columns: requestColumns,
     minimumSecondsPerColumn: 0.001,
-    intermediateResults: !isReadingFile && !options.stableUpdate,
+    intermediateResults: options.columns === undefined && !isReadingFile && !options.stableUpdate,
     prefetchFiner: !isReadingFile,
   };
   activeAnalysisRequest = {
@@ -1228,6 +1597,7 @@ function analyzeCurrentAudio(options: { stableUpdate?: boolean; force?: boolean 
     secondsPerColumn,
   };
   analysisWorker.postMessage(request);
+  return request.id;
 }
 
 function handleAnalysisMessage(event: MessageEvent<AnalysisMessage>): void {
@@ -1248,8 +1618,24 @@ function handleAnalysisMessage(event: MessageEvent<AnalysisMessage>): void {
   }
   if (message.type === 'error') {
     if (activeAnalysisRequest?.id === message.id) activeAnalysisRequest = null;
+    finishRemixSpectrogramAnalysis(message.id);
     hideAnalysisOverlay();
     showToast(`Spectral analysis failed: ${message.message}`);
+    return;
+  }
+  if (message.type === 'unavailable') {
+    if (activeAnalysisRequest?.id === message.id) activeAnalysisRequest = null;
+    finishRemixSpectrogramAnalysis(message.id);
+    hideAnalysisOverlay();
+    return;
+  }
+
+  if (directionalDisplayOwnsSpectrogram()) {
+    if (message.complete) {
+      if (activeAnalysisRequest?.id === message.id) activeAnalysisRequest = null;
+      finishRemixSpectrogramAnalysis(message.id);
+    }
+    hideAnalysisOverlay();
     return;
   }
 
@@ -1268,33 +1654,36 @@ function handleAnalysisMessage(event: MessageEvent<AnalysisMessage>): void {
     cqtBinsPerOctave: message.data.cqtBinsPerOctave,
   };
   latestSpectrogram = data;
+  latestSpectrogramComplete = message.complete;
   updateDownloadState();
   visualizer.setSpectrogram(data);
   if (message.complete) {
     analysisProgress.style.width = '100%';
     if (activeAnalysisRequest?.id === message.id) activeAnalysisRequest = null;
+    finishRemixSpectrogramAnalysis(message.id);
   }
   hideAnalysisOverlay();
 }
 
-function analysisTargetStep(duration: number, columns: number): number {
-  const desiredMs = Math.max(1, (duration * 1000) / Math.max(1, Math.round(columns)));
-  return 2 ** Math.max(0, Math.floor(Math.log2(desiredMs))) / 1000;
-}
-
-function coverageIncludes(
-  coverage: Pick<SpectrogramData, 'fftSize' | 'mode' | 'startTime' | 'endTime' | 'secondsPerColumn'> | AnalysisCoverage | null,
+function analysisTargetStep(
   startTime: number,
-  endTime: number,
+  duration: number,
+  columns: number,
   fftSize: number,
-  secondsPerColumn: number,
   mode: AnalysisMode,
-): boolean {
-  if (!coverage || coverage.fftSize !== fftSize || coverage.mode !== mode) return false;
-  const tolerance = Math.max(0.001, coverage.secondsPerColumn * 1.1);
-  return coverage.secondsPerColumn <= secondsPerColumn * 1.01 &&
-    coverage.startTime <= startTime + tolerance &&
-    coverage.endTime >= endTime - tolerance;
+  minimumSecondsPerColumn = 0.001,
+  rowCount?: number,
+): number {
+  const rows = rowCount ?? (mode === 'cqt'
+    ? cqtBandCount(audioSampleRate, fftSize)
+    : Math.min(fftSize / 2, MAX_FFT_SPECTROGRAM_ROWS));
+  return selectSpectrogramStepMs(
+    startTime,
+    duration,
+    columns,
+    minimumSecondsPerColumn,
+    spectrogramCacheFrameCapacity(rows),
+  ) / 1000;
 }
 
 function cqtSettingLabel(fftSize: number): string {
@@ -1393,7 +1782,7 @@ type AnalysisCoverage = {
 };
 
 type PersistedSettings = {
-  version: 7;
+  version: 8;
   paneRatio: number;
   frequencyScale: number;
   fftIndex: number;
@@ -1410,30 +1799,37 @@ type PersistedSettings = {
   settingsPaneOpen?: boolean;
   downloadFormat?: DownloadOutputFormat;
   normalizeOutput?: boolean;
+  monoMixMode?: MonoMixMode;
+  ambisonicFormat?: AmbisonicInputFormat;
+  virtualMicAzimuth?: number;
+  virtualMicElevation?: number;
 };
 
 function readPersistedSettings(): PersistedSettings | null {
   try {
     const value = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) ?? 'null') as Partial<PersistedSettings> | null;
-    if (value?.version === 7) return value as PersistedSettings;
+    if (value?.version === 8) return value as PersistedSettings;
+    if ((value?.version as number | undefined) === 7) {
+      return { ...value, version: 8 } as PersistedSettings;
+    }
     if ((value?.version as number | undefined) === 6) {
       return {
         ...value,
-        version: 7,
+        version: 8,
         spectrumDrawStyle: value?.spectrumDrawStyle === 'lines' ? 'points' : value?.spectrumDrawStyle,
       } as PersistedSettings;
     }
     if ((value?.version as number | undefined) === 5) {
       return {
         ...value,
-        version: 7,
+        version: 8,
         theme: 'dark',
       } as PersistedSettings;
     }
     if ((value?.version as number | undefined) === 4) {
       return {
         ...value,
-        version: 7,
+        version: 8,
         spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 8),
         spectrumDrawStyle: 'filled',
         spectrumInterpolation: 'nearest',
@@ -1443,7 +1839,7 @@ function readPersistedSettings(): PersistedSettings | null {
     if ((value?.version as number | undefined) === 3) {
       return {
         ...value,
-        version: 7,
+        version: 8,
         spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 8),
         spectrumDrawStyle: 'filled',
         spectrumInterpolation: 'nearest',
@@ -1455,7 +1851,7 @@ function readPersistedSettings(): PersistedSettings | null {
     if ((value?.version as number | undefined) === 2) {
       return {
         ...value,
-        version: 7,
+        version: 8,
         spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 8),
         spectrumDrawStyle: 'filled',
         spectrumInterpolation: 'nearest',
@@ -1468,7 +1864,7 @@ function readPersistedSettings(): PersistedSettings | null {
     if ((value?.version as number | undefined) === 1) {
       return {
         ...value,
-        version: 7,
+        version: 8,
         spectrumFftIndex: clampNumber(value?.fftIndex, 2, 0, 8),
         spectrumDrawStyle: 'filled',
         spectrumInterpolation: 'nearest',
@@ -1493,7 +1889,7 @@ function scheduleSettingsSave(): void {
 function persistSettings(): void {
   window.clearTimeout(settingsSaveTimer);
   const settings: PersistedSettings = {
-    version: 7,
+    version: 8,
     paneRatio: wavePanelRatio,
     frequencyScale: frequencyScaleBlend,
     fftIndex: Number(fftSlider.value),
@@ -1512,6 +1908,10 @@ function persistSettings(): void {
     settingsPaneOpen,
     downloadFormat,
     normalizeOutput,
+    monoMixMode,
+    ambisonicFormat: ambisonicInputFormat,
+    virtualMicAzimuth,
+    virtualMicElevation,
   };
   try {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
@@ -1526,6 +1926,14 @@ function isPlaybackFollowMode(value: unknown): value is PlaybackFollowMode {
 
 function isDownloadOutputFormat(value: unknown): value is DownloadOutputFormat {
   return value === 'auto' || value === 'wav' || value === 'mp3';
+}
+
+function isMonoMixMode(value: unknown): value is MonoMixMode {
+  return value === 'sum' || value === 'first' || value === 'directional';
+}
+
+function isAmbisonicInputFormat(value: unknown): value is AmbisonicInputFormat {
+  return value === 'ambix' || value === 'fuma' || value === 'a-format';
 }
 
 function isSpectrumDrawStyle(value: unknown): value is SpectrumDrawStyle {
@@ -1546,13 +1954,1361 @@ function clampNumber(value: unknown, fallback: number, minimum: number, maximum:
     : fallback;
 }
 
-function downmix(buffer: AudioBuffer): Float32Array {
-  const mono = new Float32Array(buffer.length);
-  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
-    const source = buffer.getChannelData(channel);
-    for (let i = 0; i < source.length; i += 1) mono[i] += source[i] / buffer.numberOfChannels;
+function configureFourChannelMix(
+  file: File,
+  channels: number,
+  detectedFormat: AmbisonicInputFormat | null,
+  sourceKind: 'wav' | 'buffer' | null,
+): void {
+  sourceChannelCount = channels;
+  fourChannelMixSource = channels === 4 ? sourceKind : null;
+  const inferredFormat = detectedFormat ?? inferAmbisonicInputFormat(file.name);
+  if (channels === 4 && inferredFormat) {
+    ambisonicInputFormat = inferredFormat;
+    ambisonicFormatSelect.value = inferredFormat;
   }
-  return mono;
+  ambisonicMixSection.hidden = channels !== 4 || !fourChannelMixSource;
+  updateAmbisonicMixControls();
+  visualizer.setWaveformLabel(
+    channels === 4 && fourChannelMixSource
+      ? monoMixMode === 'sum' ? 'SUM 4' : monoMixMode === 'first' ? 'CH 1' : 'VMIC'
+      : channels === 1 ? 'MONO' : 'L+R',
+  );
+  applyFourChannelMixWeights();
+}
+
+function clearFourChannelMixSource(): void {
+  sourceChannelCount = 0;
+  fourChannelMixSource = null;
+  ambisonicRemixActive = false;
+  ambisonicRemixId += 1;
+  decodedBufferRemixId += 1;
+  window.clearTimeout(ambisonicRemixTimer);
+  window.clearTimeout(ambisonicPriorityTimer);
+  ambisonicRemixTimer = 0;
+  ambisonicPriorityTimer = 0;
+  remixTierColumns.clear();
+  clearRemixAnalysisQueue();
+  ambisonicRemixWorker?.terminate();
+  ambisonicRemixWorker = null;
+  disposeDirectionalDisplay();
+  ambisonicMixSection.hidden = true;
+  monoMixStatus.value = '';
+  visualizer.setSpectrumChannelSource(null);
+  visualizer.setSpectrumChannelWeights(null);
+  engine.setChannelMix(null);
+}
+
+function initializeDirectionalDisplay(sampleLength: number, sampleRate: number): void {
+  disposeDirectionalDisplay();
+  if (sourceChannelCount !== 4 || !fourChannelMixSource) return;
+
+  const waveWorker = new Worker(new URL('./directional-waveform.worker.ts', import.meta.url), {
+    type: 'module',
+  });
+  waveWorker.onmessage = (event: MessageEvent<DirectionalWaveMessage>) => {
+    if (directionalWaveWorker !== waveWorker) return;
+    handleDirectionalWaveMessage(event.data);
+  };
+  waveWorker.onerror = () => {
+    if (directionalWaveWorker !== waveWorker) return;
+    directionalWaveWorker = null;
+    directionalWaveReady = false;
+    visualizer.setWaveformPreview(null);
+    waveWorker.terminate();
+  };
+  directionalWaveWorker = waveWorker;
+  const initializeWave: DirectionalWaveInput = {
+    type: 'initialize',
+    sampleLength,
+    sampleRate,
+    blockSize: directionalWaveBlockSize(sampleLength),
+  };
+  waveWorker.postMessage(initializeWave);
+
+  const spectralWorker = new Worker(new URL('./directional-spectrogram.worker.ts', import.meta.url), {
+    type: 'module',
+  });
+  spectralWorker.onmessage = (event: MessageEvent<DirectionalSpectralMessage>) => {
+    if (directionalSpectralWorker !== spectralWorker) return;
+    handleDirectionalSpectralMessage(event.data);
+  };
+  spectralWorker.onerror = () => {
+    if (directionalSpectralWorker !== spectralWorker) return;
+    directionalSpectralWorker = null;
+    spectralWorker.terminate();
+    // The ordinary mono analysis worker remains alive as a compatibility
+    // fallback. Its next completed result may take over without blanking the
+    // directional image already on screen.
+    analyzeCurrentAudio({ force: true, suppressOverlay: true });
+  };
+  directionalSpectralWorker = spectralWorker;
+  initializeDirectionalCompositionWorkers();
+  const buffer = engine.buffer;
+  if (buffer) installFourChannelSpectrumSource(buffer);
+  updateDirectionalDisplayMode();
+}
+
+function initializeDirectionalCompositionWorkers(): void {
+  for (const worker of directionalCompositionWorkers) worker.terminate();
+  directionalCompositionWorkers = [];
+  directionalCompositionActiveWorkers = 0;
+  directionalCompositionActiveId = 0;
+  directionalCompositionQueuedWeights = null;
+  directionalCompositionPending = null;
+  const hardwareThreads = navigator.hardwareConcurrency || 4;
+  const workerCount = Math.max(1, Math.min(8, hardwareThreads - 1));
+  for (let index = 0; index < workerCount; index += 1) {
+    const worker = new Worker(new URL('./directional-composition.worker.ts', import.meta.url), {
+      type: 'module',
+    });
+    worker.onmessage = (event: MessageEvent<DirectionalCompositionResult>) => {
+      if (!directionalCompositionWorkers.includes(worker)) return;
+      handleDirectionalCompositionResult(event.data);
+    };
+    worker.onerror = () => {
+      if (!directionalCompositionWorkers.includes(worker)) return;
+      for (const activeWorker of directionalCompositionWorkers) activeWorker.terminate();
+      directionalCompositionWorkers = [];
+      directionalCompositionActiveWorkers = 0;
+      directionalCompositionActiveId = 0;
+      directionalCompositionQueuedWeights = null;
+      directionalCompositionPending = null;
+    };
+    directionalCompositionWorkers.push(worker);
+  }
+}
+
+function disposeDirectionalDisplay(): void {
+  window.clearTimeout(directionalViewportTimer);
+  directionalViewportTimer = 0;
+  directionalDisplayQueued = false;
+  directionalViewVersion += 1;
+  directionalWaveRequestId += 1;
+  directionalSpectralGeneration += 1;
+  directionalSpectralDirectionId += 1;
+  directionalSpectralRenderedDirectionId = directionalSpectralDirectionId;
+  directionalWaveReady = false;
+  directionalSpectralTier = 0;
+  directionalSpectralTierTargets = [];
+  directionalSpectralDisplayCache = null;
+  directionalSpectralViewport = null;
+  directionalSpectralPendingTier = null;
+  directionalStreamingRefreshPending = false;
+  directionalCompositionPending = null;
+  directionalCompositionActiveWorkers = 0;
+  directionalCompositionActiveId = 0;
+  directionalCompositionQueuedWeights = null;
+  for (const worker of directionalCompositionWorkers) worker.terminate();
+  directionalCompositionWorkers = [];
+  directionalWaveWorker?.terminate();
+  directionalSpectralWorker?.terminate();
+  directionalWaveWorker = null;
+  directionalSpectralWorker = null;
+  visualizer.setWaveformPreview(null);
+}
+
+function directionalWaveBlockSize(sampleLength: number): number {
+  let blockSize = DIRECTIONAL_WAVE_BLOCK_SIZE;
+  while (Math.ceil(Math.max(0, sampleLength) / blockSize) > MAX_DIRECTIONAL_WAVE_BLOCKS) {
+    blockSize *= 4;
+  }
+  return blockSize;
+}
+
+function appendDirectionalWaveSource(
+  startSample: number,
+  channels: readonly Float32Array<ArrayBuffer>[],
+): void {
+  const worker = directionalWaveWorker;
+  if (!worker || channels.length < 4) return;
+  const buffers = channels.slice(0, 4).map((channel) => channel.buffer);
+  const append: DirectionalWaveInput = {
+    type: 'append',
+    startSample,
+    channels: buffers,
+  };
+  worker.postMessage(append, buffers);
+}
+
+function completeDirectionalWaveSource(startSample: number): void {
+  const complete: DirectionalWaveInput = {
+    type: 'append',
+    startSample,
+    channels: [],
+    complete: true,
+  };
+  directionalWaveWorker?.postMessage(complete);
+}
+
+async function preprocessDecodedDirectionalSource(buffer: AudioBuffer, loadId: number): Promise<void> {
+  const worker = directionalWaveWorker;
+  if (!worker || buffer.numberOfChannels !== 4) return;
+  const chunkFrames = 262_144;
+  for (let start = 0; start < buffer.length; start += chunkFrames) {
+    if (loadId !== fileLoadId || directionalWaveWorker !== worker) return;
+    const end = Math.min(buffer.length, start + chunkFrames);
+    const channels = Array.from(
+      { length: 4 },
+      (_, channel) => buffer.getChannelData(channel).slice(start, end),
+    );
+    appendDirectionalWaveSource(start, channels);
+    await yieldToMainThread();
+  }
+  if (loadId !== fileLoadId || directionalWaveWorker !== worker) return;
+  completeDirectionalWaveSource(buffer.length);
+}
+
+function isDirectionalDisplaySelected(): boolean {
+  return monoMixMode === 'directional' && sourceChannelCount === 4 && Boolean(fourChannelMixSource);
+}
+
+function directionalDisplayOwnsWaveform(): boolean {
+  return isDirectionalDisplaySelected() && directionalWaveWorker !== null;
+}
+
+function directionalDisplayOwnsSpectrogram(): boolean {
+  return isDirectionalDisplaySelected() && directionalSpectralWorker !== null;
+}
+
+function directionalDisplayOwnsVisuals(): boolean {
+  return directionalDisplayOwnsWaveform() || directionalDisplayOwnsSpectrogram();
+}
+
+function updateDirectionalDisplayMode(): void {
+  if (!isDirectionalDisplaySelected()) {
+    window.clearTimeout(directionalViewportTimer);
+    directionalViewportTimer = 0;
+    directionalDisplayQueued = false;
+    visualizer.setWaveformPreview(null);
+    return;
+  }
+  hideAnalysisOverlay();
+  directionalViewVersion += 1;
+  scheduleDirectionalViewportPreparation(0, true);
+  scheduleDirectionalDisplayUpdate();
+}
+
+function scheduleDirectionalViewportPreparation(delay = 0, force = false): void {
+  if (!isDirectionalDisplaySelected() || (!directionalWaveWorker && !directionalSpectralWorker)) return;
+  if (force || delay <= 0) {
+    if (force) directionalSpectralViewport = null;
+    window.clearTimeout(directionalViewportTimer);
+    directionalViewportTimer = 0;
+    prepareDirectionalViewport();
+    return;
+  }
+  if (directionalViewportTimer) return;
+  directionalViewportTimer = window.setTimeout(() => {
+    directionalViewportTimer = 0;
+    prepareDirectionalViewport();
+  }, delay);
+}
+
+function prepareDirectionalViewport(): void {
+  if (!isDirectionalDisplaySelected()) return;
+  const buffer = engine.buffer;
+  if (!buffer || buffer.numberOfChannels !== 4 || audioDuration <= 0) return;
+
+  prepareDirectionalWaveViewport(buffer);
+  prepareDirectionalSpectralViewport(buffer);
+  scheduleDirectionalDisplayUpdate();
+}
+
+function prepareDirectionalSpectralViewportOnly(force = false): void {
+  if (!isDirectionalDisplaySelected() || !directionalSpectralWorker) return;
+  const buffer = engine.buffer;
+  if (!buffer || buffer.numberOfChannels !== 4 || audioDuration <= 0) return;
+  if (force) directionalSpectralViewport = null;
+  prepareDirectionalSpectralViewport(buffer);
+}
+
+function prepareDirectionalWaveViewport(buffer: AudioBuffer): void {
+  const worker = directionalWaveWorker;
+  if (!worker) return;
+  const startSample = Math.max(0, Math.floor(analysisViewStart * buffer.sampleRate));
+  const requestedEnd = Math.min(
+    buffer.length,
+    Math.ceil((analysisViewStart + analysisViewDuration) * buffer.sampleRate),
+  );
+  const availableEnd = isReadingFile ? Math.min(buffer.length, availableAudioSamples) : buffer.length;
+  const canUseRaw = requestedEnd > startSample && requestedEnd <= availableEnd &&
+    requestedEnd - startSample <= MAX_RAW_DIRECTIONAL_WAVE_SAMPLES;
+  if (!canUseRaw) {
+    const clear: DirectionalWaveInput = {
+      type: 'clear-raw-view',
+      viewVersion: directionalViewVersion,
+    };
+    worker.postMessage(clear);
+    return;
+  }
+
+  const channels = Array.from(
+    { length: 4 },
+    (_, channel) => buffer.getChannelData(channel).slice(startSample, requestedEnd),
+  );
+  const buffers = channels.map((channel) => channel.buffer);
+  const raw: DirectionalWaveInput = {
+    type: 'raw-view',
+    viewVersion: directionalViewVersion,
+    startSample,
+    channels: buffers,
+  };
+  worker.postMessage(raw, buffers);
+}
+
+function prepareDirectionalSpectralViewport(buffer: AudioBuffer): void {
+  const worker = directionalSpectralWorker;
+  if (!worker) return;
+  const fftSize = fftBins[Number(fftSlider.value)] * 2;
+  const mode: AnalysisMode = analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft';
+  const rows = mode === 'cqt'
+    ? cqtBandCount(buffer.sampleRate, fftSize)
+    : Math.min(fftSize / 2, MAX_DIRECTIONAL_FFT_ROWS, visualizer.analysisRowCount);
+  const segmentSize = mode === 'cqt' ? cqtSegmentSize(fftSize) : fftSize;
+  const visibleStart = Math.max(0, analysisViewStart);
+  const maximumEnd = isReadingFile
+    ? Math.min(
+      audioDuration,
+      availableSpectrogramEndTime(availableAudioSamples, buffer.sampleRate, segmentSize),
+    )
+    : audioDuration;
+  const visibleEnd = Math.min(
+    maximumEnd,
+    visibleStart + Math.max(0.001, analysisViewDuration),
+  );
+  if (visibleEnd <= visibleStart) return;
+
+  const existingViewport = directionalSpectralViewport;
+  const sameSourceView = Boolean(
+    existingViewport && existingViewport.fftSize === fftSize && existingViewport.rows === rows &&
+    existingViewport.mode === mode &&
+    Math.abs(existingViewport.sourceViewStart - analysisViewStart) < 1e-6 &&
+    Math.abs(existingViewport.sourceViewDuration - analysisViewDuration) < 1e-6,
+  );
+  const spectralWorkInProgress = Boolean(
+    directionalSpectralPendingTier ||
+    directionalSpectralTier < directionalSpectralTierTargets.length,
+  );
+  if (isReadingFile && sameSourceView && spectralWorkInProgress) {
+    // Sequential WAV chunks expand the available right edge very quickly.
+    // Let the current sparse tier reach the screen before replanning that
+    // larger extent; otherwise every chunk cancels the same four transforms.
+    directionalStreamingRefreshPending = true;
+    return;
+  }
+  if (
+    engine.isPlaying && existingViewport && existingViewport.fftSize === fftSize &&
+    existingViewport.rows === rows && existingViewport.mode === mode
+  ) {
+    const desiredAhead = Math.min(
+      Math.max(0, maximumEnd - visibleEnd),
+      analysisViewDuration * 0.5,
+    );
+    const tolerance = Math.max(0.001, analysisViewDuration * 0.01);
+    if (
+      existingViewport.startTime <= visibleStart + tolerance &&
+      existingViewport.startTime + existingViewport.duration >= visibleEnd + desiredAhead - tolerance
+    ) return;
+  }
+
+  const viewStart = visibleStart;
+  let viewEnd = visibleEnd;
+  if (engine.isPlaying) {
+    viewEnd = Math.min(maximumEnd, visibleEnd + analysisViewDuration * 1.25);
+  }
+
+  // Match the physical canvas density. During a sequential load the covered
+  // time range is only a fraction of the full viewport, so request the same
+  // fraction of its pixels; this keeps every tick on the final global grid.
+  const targetColumns = Math.max(1, Math.round(
+    visualizer.analysisColumnCount *
+    ((viewEnd - viewStart) / Math.max(0.001, analysisViewDuration)),
+  ));
+  const generation = ++directionalSpectralGeneration;
+  directionalSpectralTier = 0;
+  directionalSpectralTierTargets = directionalSpectralTargetsForViewport(
+    viewStart,
+    viewEnd - viewStart,
+    targetColumns,
+    fftSize,
+    mode,
+    rows,
+  );
+  directionalSpectralPendingTier = null;
+  directionalStreamingRefreshPending = false;
+  directionalSpectralViewport = {
+    generation,
+    startTime: viewStart,
+    duration: viewEnd - viewStart,
+    segmentSize,
+    fftSize,
+    rows,
+    mode,
+    sourceViewStart: analysisViewStart,
+    sourceViewDuration: analysisViewDuration,
+  };
+  monoMixStatus.value = 'Refining viewport…';
+  const configure: DirectionalSpectralInput = {
+    type: 'configure',
+    generation,
+    sampleRate: buffer.sampleRate,
+    duration: audioDuration,
+    fftSize,
+    mode,
+    rows,
+  };
+  worker.postMessage(configure);
+  prepareNextDirectionalSpectralTier(
+    buffer,
+    viewStart,
+    viewEnd - viewStart,
+    segmentSize,
+    rows,
+    generation,
+  );
+}
+
+function directionalSpectralTargetsForViewport(
+  viewStart: number,
+  viewDuration: number,
+  targetColumns: number,
+  fftSize: number,
+  mode: AnalysisMode,
+  rows: number,
+): number[] {
+  const candidates = progressiveRemixColumnCounts(targetColumns);
+  const visible = latestSpectrogram;
+  const compatibleVisibleCache = Boolean(
+    visible && visible.mode === mode && visible.fftSize === fftSize &&
+    visible.sampleRate === audioSampleRate && visible.secondsPerColumn > 0 &&
+    visible.endTime >= viewStart - visible.secondsPerColumn &&
+    visible.startTime <= viewStart + viewDuration + visible.secondsPerColumn,
+  );
+  const visibleStep = compatibleVisibleCache ? visible!.secondsPerColumn : Number.POSITIVE_INFINITY;
+  const targets: number[] = [];
+  let previousStep = Number.POSITIVE_INFINITY;
+
+  for (const columns of candidates) {
+    const step = analysisTargetStep(
+      viewStart,
+      viewDuration,
+      columns,
+      fftSize,
+      mode,
+      0.00025,
+      rows,
+    );
+    // A new generation must never replace the visible map with a coarser
+    // one. This is what made streaming loads and pans appear to rebuild from
+    // scratch even though their FFT frames were already in the worker LRU.
+    if (step >= visibleStep * (1 - 1e-6)) continue;
+    // Several nominal column targets can select the same power-of-two time
+    // level. Request that shared grid once instead of repainting it twice.
+    if (step >= previousStep * (1 - 1e-6)) continue;
+    targets.push(columns);
+    previousStep = step;
+  }
+
+  // Equal-resolution pans and streaming extensions still need a request so
+  // the worker can assemble cached overlap plus only the missing edge ticks.
+  return targets.length > 0 ? targets : [candidates.at(-1) ?? targetColumns];
+}
+
+function prepareNextDirectionalSpectralTier(
+  buffer: AudioBuffer,
+  viewStart: number,
+  viewDuration: number,
+  segmentSize: number,
+  rows: number,
+  generation: number,
+): void {
+  const worker = directionalSpectralWorker;
+  if (
+    !worker || generation !== directionalSpectralGeneration ||
+    directionalSpectralTier >= directionalSpectralTierTargets.length
+  ) return;
+  const tier = directionalSpectralTier;
+  const columns = directionalSpectralTierTargets[tier];
+  const fftSize = fftBins[Number(fftSlider.value)] * 2;
+  const mode: AnalysisMode = analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft';
+  const stepSeconds = analysisTargetStep(
+    viewStart,
+    viewDuration,
+    columns,
+    fftSize,
+    mode,
+    0.00025,
+    rows,
+  );
+  const maximumTick = isReadingFile
+    ? availableSpectrogramEndTime(availableAudioSamples, buffer.sampleRate, segmentSize) * 1000
+    : Number.POSITIVE_INFINITY;
+  const targetTicks = createAlignedSpectrogramTicks(viewStart, viewDuration, stepSeconds * 1000)
+    .filter((tick) => tick <= maximumTick + 1e-6);
+  if (targetTicks.length === 0) return;
+  directionalSpectralPendingTier = {
+    generation,
+    tier,
+    segmentSize,
+    targetTicks,
+    missingTicks: null,
+    cursor: 0,
+    batch: 0,
+    buffer,
+  };
+  const plan: DirectionalSpectralInput = {
+    type: 'plan',
+    generation,
+    tier,
+    targetTicks,
+  };
+  worker.postMessage(plan);
+}
+
+function sendNextDirectionalSpectralBatch(): void {
+  const pending = directionalSpectralPendingTier;
+  const worker = directionalSpectralWorker;
+  if (
+    !pending || !worker || !pending.missingTicks ||
+    pending.generation !== directionalSpectralGeneration ||
+    pending.tier !== directionalSpectralTier
+  ) return;
+  const maximumFrames = Math.max(
+    1,
+    Math.floor(MAX_DIRECTIONAL_SPECTRAL_BATCH_VALUES / (4 * pending.segmentSize)),
+  );
+  const end = Math.min(pending.missingTicks.length, pending.cursor + maximumFrames);
+  const ticks = pending.missingTicks.slice(pending.cursor, end);
+  if (ticks.length === 0) return;
+  const batch = pending.batch;
+  pending.batch += 1;
+  pending.cursor = end;
+  const availableEnd = isReadingFile
+    ? Math.min(pending.buffer.length, availableAudioSamples)
+    : pending.buffer.length;
+  const samples = packDirectionalSpectralFrames(
+    pending.buffer,
+    ticks,
+    pending.segmentSize,
+    availableEnd,
+  );
+  const frames: DirectionalSpectralInput = {
+    type: 'frames',
+    generation: pending.generation,
+    tier: pending.tier,
+    batch,
+    completeTier: end >= pending.missingTicks.length,
+    segmentSize: pending.segmentSize,
+    ticks,
+    samples: samples.buffer,
+  };
+  worker.postMessage(frames, [frames.samples]);
+}
+
+function packDirectionalSpectralFrames(
+  buffer: AudioBuffer,
+  ticks: readonly number[],
+  segmentSize: number,
+  availableEnd: number,
+): Float32Array<ArrayBuffer> {
+  const packed = new Float32Array(ticks.length * 4 * segmentSize);
+  for (let frame = 0; frame < ticks.length; frame += 1) {
+    const center = Math.round((ticks[frame] / 1000) * buffer.sampleRate);
+    const windowStart = center - Math.floor(segmentSize / 2);
+    const sourceStart = Math.max(0, windowStart);
+    const sourceEnd = Math.min(buffer.length, availableEnd, windowStart + segmentSize);
+    if (sourceEnd <= sourceStart) continue;
+    const destinationInset = sourceStart - windowStart;
+    for (let channel = 0; channel < 4; channel += 1) {
+      const destination = (frame * 4 + channel) * segmentSize + destinationInset;
+      packed.set(buffer.getChannelData(channel).subarray(sourceStart, sourceEnd), destination);
+    }
+  }
+  return packed;
+}
+
+function scheduleDirectionalDisplayUpdate(): void {
+  if (!isDirectionalDisplaySelected()) return;
+  if (directionalDisplayQueued) return;
+  directionalDisplayQueued = true;
+  queueMicrotask(() => {
+    directionalDisplayQueued = false;
+    publishDirectionalDisplayUpdate();
+  });
+}
+
+function publishDirectionalDisplayUpdate(): void {
+  const weights = currentFourChannelWeights();
+  if (!weights || !isDirectionalDisplaySelected()) return;
+  const waveformPreview = createImmediateDirectionalWaveform(weights);
+  if (waveformPreview) visualizer.setWaveformPreview(waveformPreview);
+  const waveWorker = directionalWaveWorker;
+  if (waveWorker && directionalWaveReady) {
+    const query: DirectionalWaveInput = {
+      type: 'query',
+      id: ++directionalWaveRequestId,
+      viewVersion: directionalViewVersion,
+      startTime: analysisViewStart,
+      duration: analysisViewDuration,
+      pixels: visualizer.analysisColumnCount,
+      weights: [...weights],
+    };
+    waveWorker.postMessage(query);
+  }
+  publishDirectionalSpectralDisplayUpdate(weights);
+}
+
+function publishDirectionalSpectralDisplayUpdate(weights: FourChannelWeights): void {
+  directionalCompositionQueuedWeights = [...weights] as FourChannelWeights;
+  pumpDirectionalComposition();
+}
+
+function pumpDirectionalComposition(): void {
+  const weights = directionalCompositionQueuedWeights;
+  if (!weights || directionalCompositionActiveId) return;
+  directionalCompositionQueuedWeights = null;
+  const id = ++directionalSpectralDirectionId;
+  directionalCompositionActiveId = id;
+  directionalSpectralDirectionStartedAt = performance.now();
+  requestDirectionalComposition(weights, id);
+  const spectralWorker = directionalSpectralWorker;
+  const requestSpectralWorker = Boolean(
+    spectralWorker && (directionalCompositionActiveWorkers === 0 || navigator.gpu),
+  );
+  // Race the parallel CPU pool with the existing WebGPU path. Avoid running
+  // the spectral worker's serial CPU fallback at the same time as the pool.
+  if (spectralWorker && requestSpectralWorker) {
+    const direction: DirectionalSpectralInput = {
+      type: 'direction',
+      id,
+      generation: directionalSpectralGeneration,
+      weights: [...weights],
+    };
+    spectralWorker.postMessage(direction);
+  }
+  if (!directionalCompositionPending && !requestSpectralWorker) {
+    directionalCompositionActiveId = 0;
+  }
+}
+
+function installDirectionalCompositionBasis(
+  cache: NonNullable<typeof directionalSpectralDisplayCache>,
+  basisBuffer: ArrayBuffer,
+): void {
+  const workers = directionalCompositionWorkers;
+  const activeWorkers = Math.min(workers.length, cache.ticks.length);
+  directionalCompositionActiveWorkers = activeWorkers;
+  directionalCompositionActiveId = 0;
+  directionalCompositionQueuedWeights = null;
+  directionalCompositionPending = null;
+  if (activeWorkers === 0) return;
+  const basis = new Float32Array(basisBuffer);
+  const valuesPerColumn = cache.rows * cache.binsPerCell * 8;
+
+  for (let part = 0; part < activeWorkers; part += 1) {
+    const startColumn = Math.floor(part * cache.ticks.length / activeWorkers);
+    const endColumn = Math.floor((part + 1) * cache.ticks.length / activeWorkers);
+    const partBasis = basis.slice(
+      startColumn * valuesPerColumn,
+      endColumn * valuesPerColumn,
+    );
+    const configure: DirectionalCompositionConfigure = {
+      type: 'configure',
+      generation: cache.generation,
+      part,
+      startColumn,
+      columns: endColumn - startColumn,
+      rows: cache.rows,
+      binsPerCell: cache.binsPerCell,
+      fftSize: cache.fftSize,
+      mode: cache.mode,
+      basis: partBasis.buffer,
+    };
+    workers[part].postMessage(configure, [configure.basis]);
+  }
+}
+
+function requestDirectionalComposition(weights: FourChannelWeights, id: number): void {
+  const cache = directionalSpectralDisplayCache;
+  const activeWorkers = directionalCompositionActiveWorkers;
+  if (!cache || activeWorkers === 0) return;
+  directionalCompositionPending = {
+    id,
+    generation: cache.generation,
+    values: new Int16Array(cache.ticks.length * cache.rows),
+    received: new Uint8Array(activeWorkers),
+  };
+  const direction: DirectionalCompositionDirection = {
+    type: 'direction',
+    id,
+    generation: cache.generation,
+    weights: [...weights],
+  };
+  for (let part = 0; part < activeWorkers; part += 1) {
+    directionalCompositionWorkers[part].postMessage(direction);
+  }
+}
+
+function handleDirectionalCompositionResult(message: DirectionalCompositionResult): void {
+  const pending = directionalCompositionPending;
+  const cache = directionalSpectralDisplayCache;
+  if (
+    !pending || !cache || message.id !== pending.id || message.id !== directionalCompositionActiveId ||
+    message.generation !== pending.generation || message.generation !== cache.generation ||
+    message.part >= pending.received.length || pending.received[message.part]
+  ) return;
+  pending.values.set(new Int16Array(message.values), message.startColumn * cache.rows);
+  pending.received[message.part] = 1;
+  for (const received of pending.received) {
+    if (!received) return;
+  }
+  directionalCompositionPending = null;
+  finishDirectionalComposition(
+    message.id,
+    directionalSpectrogramFromValues(cache, pending.values),
+    cache.generation === directionalSpectralGeneration ? 'parallel CPU' : 'cached CPU',
+  );
+}
+
+function finishDirectionalComposition(id: number, data: SpectrogramData, backend: string): void {
+  if (id !== directionalCompositionActiveId || id <= directionalSpectralRenderedDirectionId) return;
+  directionalSpectralRenderedDirectionId = id;
+  directionalCompositionActiveId = 0;
+  directionalCompositionPending = null;
+  spectralCanvas.dataset.directionComposeMs = (
+    performance.now() - directionalSpectralDirectionStartedAt
+  ).toFixed(2);
+  publishDirectionalSpectrogram(data, backend);
+  pumpDirectionalComposition();
+}
+
+function createImmediateDirectionalWaveform(
+  weights: FourChannelWeights,
+): {
+  minimum: Float32Array<ArrayBuffer>;
+  maximum: Float32Array<ArrayBuffer>;
+  startTime: number;
+  duration: number;
+  exact: boolean;
+} | null {
+  const buffer = engine.buffer;
+  if (!buffer || buffer.numberOfChannels !== 4) return null;
+  const startTime = Math.max(0, analysisViewStart);
+  const duration = Math.max(0.001, Math.min(audioDuration - startTime, analysisViewDuration));
+  const startSample = Math.max(0, Math.floor(startTime * buffer.sampleRate));
+  const endSample = Math.min(buffer.length, Math.ceil((startTime + duration) * buffer.sampleRate));
+  const availableEnd = isReadingFile ? Math.min(buffer.length, availableAudioSamples) : buffer.length;
+  if (endSample <= startSample || endSample > availableEnd) return null;
+  const pixels = Math.max(1, visualizer.analysisColumnCount);
+  const minimum = new Float32Array(pixels);
+  const maximum = new Float32Array(pixels);
+  const channels = Array.from({ length: 4 }, (_, channel) => buffer.getChannelData(channel));
+  let exact = true;
+
+  for (let pixel = 0; pixel < pixels; pixel += 1) {
+    const from = Math.max(startSample, Math.floor(startSample + pixel * (endSample - startSample) / pixels));
+    const to = Math.min(endSample, Math.max(from + 1, Math.ceil(startSample + (pixel + 1) * (endSample - startSample) / pixels)));
+    const count = Math.max(1, to - from);
+    const stride = Math.max(1, Math.ceil(count / 64));
+    const approximate = stride > 1;
+    if (approximate) exact = false;
+    let low = Number.POSITIVE_INFINITY;
+    let high = Number.NEGATIVE_INFINITY;
+    let squared = 0;
+    let sampled = 0;
+    for (let sample = from + Math.floor((stride - 1) / 2); sample < to; sample += stride) {
+      const value = channels[0][sample] * weights[0] + channels[1][sample] * weights[1] +
+        channels[2][sample] * weights[2] + channels[3][sample] * weights[3];
+      low = Math.min(low, value);
+      high = Math.max(high, value);
+      squared += value * value;
+      sampled += 1;
+    }
+    if (!sampled) continue;
+    if (approximate) {
+      const rmsEnvelope = Math.sqrt(squared / sampled) * Math.SQRT2;
+      low = Math.min(low, -rmsEnvelope);
+      high = Math.max(high, rmsEnvelope);
+    }
+    minimum[pixel] = Number.isFinite(low) ? low : 0;
+    maximum[pixel] = Number.isFinite(high) ? high : 0;
+  }
+  return { minimum, maximum, startTime, duration, exact };
+}
+
+function directionalSpectrogramFromValues(
+  cache: NonNullable<typeof directionalSpectralDisplayCache>,
+  values: Int16Array<ArrayBuffer>,
+): SpectrogramData {
+  const columns = cache.ticks.length;
+  const rows = cache.rows;
+  const secondsPerColumn = columns > 1
+    ? (cache.ticks[columns - 1] - cache.ticks[0]) / 1000 / (columns - 1)
+    : Math.max(0.001, cache.duration);
+  return {
+    values,
+    columns,
+    rows,
+    fftSize: cache.fftSize,
+    sampleRate: cache.sampleRate,
+    duration: cache.duration,
+    startTime: cache.ticks[0] / 1000,
+    endTime: cache.ticks[columns - 1] / 1000,
+    secondsPerColumn,
+    mode: cache.mode,
+    cqtFmin: cache.mode === 'cqt' ? CQT_FMIN : undefined,
+    cqtBinsPerOctave: cache.mode === 'cqt' ? cqtBinsPerOctave(cache.fftSize) : undefined,
+  };
+}
+
+function publishDirectionalSpectrogram(data: SpectrogramData, backend: string): void {
+  latestSpectrogram = data;
+  latestSpectrogramComplete = directionalSpectralTier >= directionalSpectralTierTargets.length;
+  visualizer.setSpectrogram(data);
+  spectralCanvas.dataset.directionBackend = backend;
+  spectralCanvas.dataset.directionColumns = String(data.columns);
+  updateDownloadState();
+  if (latestSpectrogramComplete) monoMixStatus.value = `Viewport ready · ${backend}`;
+}
+
+function handleDirectionalWaveMessage(message: DirectionalWaveMessage): void {
+  if (message.type === 'wave-ready') {
+    directionalWaveReady = true;
+    scheduleDirectionalDisplayUpdate();
+    return;
+  }
+  if (
+    !directionalDisplayOwnsWaveform() || message.id !== directionalWaveRequestId ||
+    message.viewVersion !== directionalViewVersion
+  ) return;
+  visualizer.setWaveformPreview({
+    minimum: new Float32Array(message.minimum),
+    maximum: new Float32Array(message.maximum),
+    startTime: message.startTime,
+    duration: message.duration,
+    exact: message.exact,
+  });
+}
+
+function handleDirectionalSpectralMessage(message: DirectionalSpectralMessage): void {
+  if (message.generation !== directionalSpectralGeneration) return;
+  if (message.type === 'error') {
+    directionalSpectralPendingTier = null;
+    console.warn(`Directional spectral cache: ${message.message}`);
+    return;
+  }
+  if (message.type === 'missing') {
+    const pending = directionalSpectralPendingTier;
+    if (!pending || message.tier !== pending.tier) return;
+    pending.missingTicks = message.ticks;
+    pending.cursor = 0;
+    pending.batch = 0;
+    sendNextDirectionalSpectralBatch();
+    return;
+  }
+  if (message.type === 'batch-complete') {
+    const pending = directionalSpectralPendingTier;
+    if (
+      !pending || message.tier !== pending.tier ||
+      message.batch !== pending.batch - 1
+    ) return;
+    sendNextDirectionalSpectralBatch();
+    return;
+  }
+  if (message.type === 'prepared') {
+    if (message.tier !== directionalSpectralTier) return;
+    directionalSpectralPendingTier = null;
+    spectralCanvas.dataset.directionalGeneration = String(message.generation);
+    spectralCanvas.dataset.directionalTier = String(message.tier);
+    spectralCanvas.dataset.computedFrames = String(message.computedFrames);
+    spectralCanvas.dataset.reusedFrames = String(message.reusedFrames);
+    spectralCanvas.dataset.generationComputedFrames = String(message.generationComputedFrames);
+    spectralCanvas.dataset.generationReusedFrames = String(message.generationReusedFrames);
+    spectralCanvas.dataset.cachedFrames = String(message.cachedFrames);
+    const fftSize = fftBins[Number(fftSlider.value)] * 2;
+    const mode: AnalysisMode = analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft';
+    const displayCache: NonNullable<typeof directionalSpectralDisplayCache> = {
+      generation: message.generation,
+      ticks: message.ticks,
+      binsPerCell: message.previewBinsPerCell,
+      rows: message.rows,
+      fftSize,
+      sampleRate: audioSampleRate,
+      duration: audioDuration,
+      mode,
+    };
+    directionalSpectralDisplayCache = displayCache;
+    installDirectionalCompositionBasis(displayCache, message.basis);
+    directionalSpectralTier += 1;
+    const weights = currentFourChannelWeights();
+    if (weights) publishDirectionalSpectralDisplayUpdate(weights);
+    const generation = message.generation;
+    const buffer = engine.buffer;
+    const viewport = directionalSpectralViewport;
+    const refreshStreamingViewport = isReadingFile && directionalStreamingRefreshPending;
+    directionalStreamingRefreshPending = false;
+    window.requestAnimationFrame(() => {
+      if (!buffer || !viewport || viewport.generation !== generation) return;
+      if (refreshStreamingViewport) {
+        // More of a sequentially decoded file became available while this
+        // tier was running. Preserve the tier we just painted, then extend
+        // the viewport. configure() keeps matching cached timeline frames.
+        directionalSpectralViewport = null;
+        prepareDirectionalSpectralViewport(buffer);
+        return;
+      }
+      prepareNextDirectionalSpectralTier(
+        buffer,
+        viewport.startTime,
+        viewport.duration,
+        viewport.segmentSize,
+        viewport.rows,
+        generation,
+      );
+    });
+    return;
+  }
+  if (
+    !directionalDisplayOwnsSpectrogram() || message.id !== directionalCompositionActiveId ||
+    message.id <= directionalSpectralRenderedDirectionId
+  ) return;
+  const data: SpectrogramData = {
+    ...message.data,
+    values: new Int16Array(message.data.values),
+  };
+  finishDirectionalComposition(message.id, data, message.backend === 'webgpu' ? 'GPU' : 'CPU');
+}
+
+function currentFourChannelWeights(): FourChannelWeights | null {
+  if (sourceChannelCount !== 4) return null;
+  return fourChannelMixWeights({
+    mode: monoMixMode,
+    format: ambisonicInputFormat,
+    azimuth: virtualMicAzimuth,
+    elevation: virtualMicElevation,
+  });
+}
+
+function applyFourChannelMixWeights(): FourChannelWeights | null {
+  const weights = currentFourChannelWeights();
+  engine.setChannelMix(weights);
+  visualizer.setSpectrumChannelWeights(weights);
+  return weights;
+}
+
+function installFourChannelSpectrumSource(buffer: AudioBuffer): void {
+  if (sourceChannelCount !== 4 || buffer.numberOfChannels !== 4) {
+    visualizer.setSpectrumChannelSource(null);
+    return;
+  }
+  visualizer.setSpectrumChannelSource(buffer);
+  visualizer.setSpectrumChannelWeights(currentFourChannelWeights());
+}
+
+function updateAmbisonicMixControls(): void {
+  monoMixSelect.value = monoMixMode;
+  ambisonicFormatSelect.value = ambisonicInputFormat;
+  ambisonicFormatNote.hidden = ambisonicInputFormat !== 'a-format';
+  virtualMicControls.hidden = monoMixMode !== 'directional';
+  if (sourceChannelCount === 4 && fourChannelMixSource) {
+    visualizer.setWaveformLabel(
+      monoMixMode === 'sum' ? 'SUM 4' : monoMixMode === 'first' ? 'CH 1' : 'VMIC',
+    );
+  }
+  const horizontal = ((virtualMicAzimuth + 180) / 360) * 100;
+  const vertical = ((90 - virtualMicElevation) / 180) * 100;
+  virtualMicDot.style.left = `${horizontal}%`;
+  virtualMicDot.style.top = `${vertical}%`;
+  const azimuth = Math.round(virtualMicAzimuth);
+  const elevation = Math.round(virtualMicElevation);
+  virtualMicDirectionOutput.value = `${formatSignedAngle(azimuth)} az · ${formatSignedAngle(elevation)} el`;
+  virtualMicPad.setAttribute('aria-valuenow', azimuth.toString());
+  virtualMicPad.setAttribute(
+    'aria-valuetext',
+    `${azimuth} degrees azimuth, ${elevation} degrees elevation`,
+  );
+}
+
+function setVirtualMicDirectionFromPointer(event: PointerEvent, rebuildBackground = true): void {
+  const rect = virtualMicPad.getBoundingClientRect();
+  const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
+  const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / Math.max(1, rect.height)));
+  setVirtualMicDirection(x * 360 - 180, 90 - y * 180, rebuildBackground);
+}
+
+function setVirtualMicDirection(
+  azimuth: number,
+  elevation: number,
+  rebuildBackground = true,
+): void {
+  virtualMicAzimuth = Math.max(-180, Math.min(180, Number.isFinite(azimuth) ? azimuth : 0));
+  virtualMicElevation = clampElevation(elevation);
+  updateAmbisonicMixControls();
+  applyFourChannelMixWeights();
+  scheduleDirectionalDisplayUpdate();
+  scheduleSettingsSave();
+  if (rebuildBackground) scheduleAmbisonicRemix();
+}
+
+function formatSignedAngle(value: number): string {
+  if (value > 0) return `+${value}°`;
+  if (value < 0) return `−${Math.abs(value)}°`;
+  return '0°';
+}
+
+function scheduleAmbisonicRemix(immediate = false): void {
+  if (!fourChannelMixSource || sourceChannelCount !== 4 || !monoSamples) return;
+  // Pointer events can arrive faster than paint. Coalesce them to roughly one
+  // remix per frame without adding the perceptible 90 ms steering lag that
+  // the original background-oriented scheduler used.
+  const interval = 16;
+  const remaining = interval - (performance.now() - lastAmbisonicRemixAt);
+  if (immediate || remaining <= 0) {
+    window.clearTimeout(ambisonicRemixTimer);
+    ambisonicRemixTimer = 0;
+    startAmbisonicRemix();
+    return;
+  }
+  if (ambisonicRemixTimer) return;
+  ambisonicRemixTimer = window.setTimeout(() => {
+    ambisonicRemixTimer = 0;
+    startAmbisonicRemix();
+  }, remaining);
+}
+
+function startAmbisonicRemix(): void {
+  const weights = currentFourChannelWeights();
+  if (!weights || !monoSamples || !fourChannelMixSource) return;
+  lastAmbisonicRemixAt = performance.now();
+  const id = ++ambisonicRemixId;
+  decodedBufferRemixId = id;
+  ambisonicRemixActive = true;
+  remixTierColumns.clear();
+  clearRemixAnalysisQueue();
+  const displayOwnsViewport = directionalDisplayOwnsVisuals();
+  monoMixStatus.value = displayOwnsViewport ? 'Updating audio in background…' : 'Updating viewport…';
+
+  // Keep the previous waveform and spectral pixels on screen. The mono array
+  // is updated in place and its peak pyramid is refreshed range-by-range, so
+  // untouched regions remain a useful stale image instead of flashing black.
+  hideAnalysisOverlay();
+  if (!displayOwnsViewport) restartStreamingAnalysisWorker(monoSamples.length, audioSampleRate);
+  let priorityTiers = displayOwnsViewport ? [] : createRemixPriorityTiers();
+  const sourceBuffer = engine.buffer;
+  const previewTier = priorityTiers[0];
+  if (
+    previewTier &&
+    sourceBuffer?.numberOfChannels === 4 &&
+    (fourChannelMixSource === 'buffer' || previewTier.ranges.every(
+      (range) => range.endSample <= availableAudioSamples,
+    ))
+  ) {
+    // AudioBuffer already contains the decoded source channels. Mixing only
+    // the handful of first-tier analysis windows here avoids a file read and
+    // lets the waveform change on the next paint while the warm analysis
+    // worker builds the four-column spectral preview.
+    publishDecodedBufferTier(sourceBuffer, weights, previewTier);
+    priorityTiers = priorityTiers.slice(1);
+    handleAmbisonicRemixMessage({ type: 'tier-complete', id, token: previewTier.token });
+  }
+
+  if (fourChannelMixSource === 'wav' && sourceFile && sourceWavHeader) {
+    const worker = ensureAmbisonicRemixWorker();
+    const chunkFrames = Math.max(
+      1,
+      Math.floor(preferredWavChunkBytes(sourceWavHeader) / sourceWavHeader.blockAlign),
+    );
+    const request: AmbisonicRemixInput = {
+      type: 'start',
+      id,
+      file: sourceFile,
+      header: sourceWavHeader,
+      weights: [...weights],
+      chunkFrames,
+      priorityTiers,
+    };
+    worker.postMessage(request);
+    return;
+  }
+
+  const buffer = engine.buffer;
+  if (fourChannelMixSource === 'buffer' && buffer?.numberOfChannels === 4) {
+    void remixDecodedBuffer(buffer, weights, id, priorityTiers);
+    return;
+  }
+
+  ambisonicRemixActive = false;
+}
+
+function ensureAmbisonicRemixWorker(): Worker {
+  if (ambisonicRemixWorker) return ambisonicRemixWorker;
+  const worker = new Worker(new URL('./ambisonic-remix.worker.ts', import.meta.url), { type: 'module' });
+  worker.onmessage = (event: MessageEvent<AmbisonicRemixMessage>) => {
+    if (ambisonicRemixWorker === worker) handleAmbisonicRemixMessage(event.data);
+  };
+  worker.onerror = () => {
+    if (ambisonicRemixWorker !== worker) return;
+    ambisonicRemixWorker = null;
+    ambisonicRemixActive = false;
+    worker.terminate();
+    monoMixStatus.value = 'Remix failed';
+    showToast('The four-channel remix worker stopped unexpectedly.');
+  };
+  ambisonicRemixWorker = worker;
+  return worker;
+}
+
+function handleAmbisonicRemixMessage(message: AmbisonicRemixMessage): void {
+  if (message.id !== ambisonicRemixId) return;
+  if (message.type === 'chunk') {
+    publishRemixedSamples(message.startSample, new Float32Array(message.samples));
+    return;
+  }
+  if (message.type === 'tier-complete') {
+    const columns = remixTierColumns.get(message.token);
+    remixTierColumns.delete(message.token);
+    if (columns === undefined) return;
+    monoMixStatus.value = columns < visualizer.analysisColumnCount
+      ? 'Refining viewport…'
+      : 'Viewport ready';
+    queueRemixSpectrogramAnalysis(columns);
+    return;
+  }
+  if (message.type === 'progress') {
+    const percent = Math.round(Math.max(0, Math.min(1, message.progress)) * 100);
+    if (remixTierColumns.size === 0) monoMixStatus.value = `Background ${percent}%`;
+    return;
+  }
+  if (message.type === 'complete') {
+    finishAmbisonicRemix(message.id);
+    return;
+  }
+  ambisonicRemixActive = false;
+  monoMixStatus.value = 'Remix failed';
+  showToast(`Could not update the mono mix: ${message.message}`);
+}
+
+function publishRemixedSamples(startSample: number, samples: Float32Array<ArrayBuffer>): void {
+  if (!monoSamples || samples.length === 0) return;
+  const start = Math.max(0, Math.min(monoSamples.length, Math.floor(startSample)));
+  const count = Math.min(samples.length, monoSamples.length - start);
+  if (count <= 0) return;
+  const usable = count === samples.length ? samples : samples.subarray(0, count);
+  monoSamples.set(usable, start);
+  visualizer.updateProgressiveAudio(start, start + count);
+  if (directionalDisplayOwnsVisuals()) return;
+  const analysisSamples = usable.byteOffset === 0 && usable.byteLength === usable.buffer.byteLength
+    ? usable
+    : usable.slice();
+  const append: AnalysisAppend = {
+    type: 'append',
+    startSample: start,
+    samples: analysisSamples.buffer,
+    preserveCachedFrames: true,
+  };
+  analysisWorker?.postMessage(append, [append.samples]);
+}
+
+function finishAmbisonicRemix(id: number): void {
+  if (id !== ambisonicRemixId) return;
+  ambisonicRemixActive = false;
+  if (!directionalDisplayOwnsVisuals()) {
+    const complete: AnalysisAppend = {
+      type: 'append',
+      startSample: monoSamples?.length ?? 0,
+      samples: new ArrayBuffer(0),
+      complete: true,
+    };
+    analysisWorker?.postMessage(complete, [complete.samples]);
+  }
+  monoMixStatus.value = remixAnalysisRequest || remixAnalysisQueue.length > 0
+    ? 'Refining viewport…'
+    : 'Ready';
+}
+
+function queueRemixSpectrogramAnalysis(columns: number): void {
+  const target = Math.max(1, Math.floor(columns));
+  if (
+    remixAnalysisRequest?.columns === target ||
+    remixAnalysisQueue.includes(target)
+  ) return;
+  remixAnalysisQueue.push(target);
+  remixAnalysisQueue.sort((left, right) => left - right);
+  pumpRemixSpectrogramAnalysis();
+}
+
+function pumpRemixSpectrogramAnalysis(): void {
+  if (remixAnalysisRequest || remixAnalysisQueue.length === 0) return;
+  const columns = remixAnalysisQueue.shift()!;
+  const id = analyzeCurrentAudio({
+    force: true,
+    stableUpdate: true,
+    columns,
+    visibleOnly: true,
+    suppressOverlay: true,
+  });
+  if (id === null) {
+    pumpRemixSpectrogramAnalysis();
+    return;
+  }
+  remixAnalysisRequest = { id, columns };
+}
+
+function finishRemixSpectrogramAnalysis(id: number): void {
+  if (remixAnalysisRequest?.id !== id) return;
+  const columns = remixAnalysisRequest.columns;
+  remixAnalysisRequest = null;
+  monoMixStatus.value = columns < visualizer.analysisColumnCount
+    ? 'Refining viewport…'
+    : 'Viewport ready';
+
+  // setSpectrogram() has already queued its render. Registering this callback
+  // afterwards guarantees the coarse map gets a paint before the next worker
+  // request can replace it.
+  window.cancelAnimationFrame(remixAnalysisFrame);
+  remixAnalysisFrame = window.requestAnimationFrame(() => {
+    remixAnalysisFrame = 0;
+    pumpRemixSpectrogramAnalysis();
+  });
+}
+
+function clearRemixAnalysisQueue(): void {
+  remixAnalysisQueue = [];
+  remixAnalysisRequest = null;
+  window.cancelAnimationFrame(remixAnalysisFrame);
+  remixAnalysisFrame = 0;
+}
+
+function createRemixPriorityTiers(): RemixPriorityTier[] {
+  const fullColumns = visualizer.analysisColumnCount;
+  return progressiveRemixColumnCounts(fullColumns).map((columns) => {
+    const token = ++remixTierToken;
+    remixTierColumns.set(token, columns);
+    return { token, ranges: createRemixRanges(columns) };
+  });
+}
+
+function createRemixRanges(columns: number): RemixSampleRange[] {
+  const bins = fftBins[Number(fftSlider.value)];
+  const fftSize = bins * 2;
+  const mode: AnalysisMode = analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft';
+  const segmentSize = mode === 'cqt' ? cqtSegmentSize(fftSize) : fftSize;
+  const startTime = Math.max(0, analysisViewStart);
+  const duration = Math.max(0.001, Math.min(audioDuration - startTime, analysisViewDuration));
+  const stepSeconds = analysisTargetStep(startTime, duration, columns, fftSize, mode);
+  const ticks = createAlignedSpectrogramTicks(startTime, duration, stepSeconds * 1000);
+  const ranges: RemixSampleRange[] = [];
+
+  const halfWindow = segmentSize / 2;
+  for (const tick of ticks) {
+    const center = Math.round((tick / 1000) * audioSampleRate);
+    ranges.push({
+      startSample: Math.max(0, Math.floor(center - halfWindow)),
+      endSample: Math.min(monoSamples?.length ?? 0, Math.ceil(center + halfWindow)),
+    });
+  }
+  return ranges.filter((range) => range.endSample > range.startSample);
+}
+
+function scheduleAmbisonicViewportPriority(): void {
+  if (
+    directionalDisplayOwnsVisuals() || !ambisonicRemixActive ||
+    fourChannelMixSource !== 'wav' || !ambisonicRemixWorker
+  ) return;
+  window.clearTimeout(ambisonicPriorityTimer);
+  ambisonicPriorityTimer = window.setTimeout(() => {
+    ambisonicPriorityTimer = 0;
+    if (!ambisonicRemixActive || !ambisonicRemixWorker) return;
+    const priorityTiers = createRemixPriorityTiers();
+    const request: AmbisonicRemixInput = {
+      type: 'prioritize',
+      id: ambisonicRemixId,
+      priorityTiers,
+    };
+    ambisonicRemixWorker.postMessage(request);
+  }, 45);
+}
+
+async function remixDecodedBuffer(
+  buffer: AudioBuffer,
+  weights: FourChannelWeights,
+  id: number,
+  tiers: RemixPriorityTier[],
+): Promise<void> {
+  const chunkFrames = Math.max(4096, Math.floor((2 * 1024 * 1024) / (4 * Float32Array.BYTES_PER_ELEMENT)));
+  const totalChunks = Math.ceil(buffer.length / chunkFrames);
+
+  for (const tier of tiers) {
+    const ranges = prepareRemixRanges(tier.ranges, buffer.length, chunkFrames);
+    for (const range of ranges) {
+      if (id !== decodedBufferRemixId) return;
+      publishDecodedBufferRange(buffer, weights, range.startSample, range.endSample);
+      await yieldToMainThread();
+    }
+    if (id !== decodedBufferRemixId) return;
+    handleAmbisonicRemixMessage({ type: 'tier-complete', id, token: tier.token });
+  }
+
+  for (let chunk = 0; chunk < totalChunks; chunk += 1) {
+    if (id !== decodedBufferRemixId) return;
+    publishDecodedBufferChunk(buffer, weights, chunk, chunkFrames);
+    if (chunk % 4 === 0) {
+      handleAmbisonicRemixMessage({ type: 'progress', id, progress: chunk / Math.max(1, totalChunks) });
+      await yieldToMainThread();
+    }
+  }
+  if (id === decodedBufferRemixId) finishAmbisonicRemix(id);
+}
+
+function publishDecodedBufferChunk(
+  buffer: AudioBuffer,
+  weights: FourChannelWeights,
+  chunk: number,
+  chunkFrames: number,
+): void {
+  const start = chunk * chunkFrames;
+  const end = Math.min(buffer.length, start + chunkFrames);
+  publishDecodedBufferRange(buffer, weights, start, end);
+}
+
+function publishDecodedBufferTier(
+  buffer: AudioBuffer,
+  weights: FourChannelWeights,
+  tier: RemixPriorityTier,
+): void {
+  const maximumRangeLength = Math.max(
+    4096,
+    Math.floor((2 * 1024 * 1024) / (4 * Float32Array.BYTES_PER_ELEMENT)),
+  );
+  for (const range of prepareRemixRanges(tier.ranges, buffer.length, maximumRangeLength)) {
+    publishDecodedBufferRange(buffer, weights, range.startSample, range.endSample);
+  }
+}
+
+function publishDecodedBufferRange(
+  buffer: AudioBuffer,
+  weights: FourChannelWeights,
+  start: number,
+  end: number,
+): void {
+  const channels = Array.from(
+    { length: buffer.numberOfChannels },
+    (_, channel) => buffer.getChannelData(channel).subarray(start, end),
+  );
+  publishRemixedSamples(start, mixChannelData(channels, weights));
+}
+
+function yieldToMainThread(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
+}
+
+function downmix(buffer: AudioBuffer, weights?: readonly number[]): Float32Array {
+  const channels = Array.from(
+    { length: buffer.numberOfChannels },
+    (_, channel) => buffer.getChannelData(channel),
+  );
+  return mixChannelData(channels, weights);
 }
 
 function hasFiles(dataTransfer: DataTransfer | null): boolean {
@@ -1582,17 +3338,6 @@ function showToast(message: string): void {
   toast.classList.add('is-visible');
   window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => toast.classList.remove('is-visible'), 4800);
-}
-
-function beginDelayedOverlay(title: string, detail: string): void {
-  const token = ++overlayToken;
-  window.clearTimeout(overlayTimer);
-  analysisOverlay.classList.remove('is-active');
-  analysisTitle.textContent = title;
-  analysisDetail.textContent = detail;
-  overlayTimer = window.setTimeout(() => {
-    if (token === overlayToken) analysisOverlay.classList.add('is-active');
-  }, 1000);
 }
 
 function hideAnalysisOverlay(): void {
@@ -1774,6 +3519,7 @@ function triggerDownload(blob: Blob, fileName: string): void {
 
 function initialize(): void {
   applyTheme();
+  updateAmbisonicMixControls();
   updateFftControl();
   updateSpectrumFftControl();
   visualizer.setAnalysisMode(analysisModeSelect.value === 'cqt' ? 'cqt' : 'fft');
